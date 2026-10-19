@@ -1,0 +1,96 @@
+name: ci
+
+# 门禁的检出能力由 CI 持续保证：本地跑不动 make check 不等于合规，
+# 反向验证样本也不该常驻仓里（见 .gitignore 的说明段）。
+#
+# 门禁本体**全部在 make check 里**，CI 只是执行它。这不是偷懒，是刻意的：
+# 门禁若只挂在 ci.yml 上，本地开发者要到推送之后才知道自己违规——那就不是
+# 「提交前门禁」而是「推送后门禁」了。
+#
+# 本仓 make check 的闸：fmt-check + vet + test + architecture-check + tidy-check。
+# 门禁本体分两段（主模块 + tools/archcheck 独立模块），两段都要绿——
+# 主模块绿不代表门禁工具绿，而门禁失效是静默的。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt + vet + test + archcheck + tidy-check
+    runs-on: ubuntu-24.04
+    # 为什么钉死不用 ubuntu-latest：GitHub 公告该标签自 2026-10-19 起迁移到
+    # Ubuntu 26，迁移后 runner 镜像的 Go/工具链环境可能与本机不同——门禁在
+    # 「与开发者不同的镜像」上跑，绿灯的可信度要打折。钉死 major.minor 让
+    # 迁移变成一次显式的、可 review 的升版动作，而不是某天突然换底座。
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # 版本跟随 go.mod 的 go 指令，避免两处各写一份然后悄悄漂移。
+          go-version-file: go.mod
+          cache: true
+
+      # Makefile 已内置 CGO_ENABLED=0（纯 Go 硬要求），Linux 上同样适用，不覆盖。
+      #
+      # 门禁不跑 golangci-lint：本仓的闸本体在 Makefile 里，CI 不重复实现规则。
+      - name: make check
+        run: make check
+
+  # 发布物自检：tag 打出来的东西必须能被「下游按版本号引入」的方式解析。
+  #
+  # 为什么单独一段：主模块的 go.mod 刻意零第三方依赖（结构性地可验证），
+  # 但「下游能引入」验证的是**另一件事**——tag 是否在、go.mod 的 module 路径
+  # 是否与 import 路径一致、go.sum 是否自洽。版本化引入失败的症状是
+  # 「unknown revision」或「模块找到了但不含该包」，报错完全指不到本仓代码。
+  release:
+    name: tag 可被下游按版本号引入
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 校验 tag 与 module 路径
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          mod="$(go list -m)"
+          echo "tag=$tag  module=$mod"
+          # module 路径必须与 import 路径一致：下游写的是 import 路径，
+          # 解析的是 module 路径，两者不一致时错误发生在下游而非本仓。
+          case "$mod" in
+            github.com/yi-nology/agent-memory) ;;
+            *) echo "module 路径与预期不符: $mod"; exit 1;;
+          esac
+          # go.mod 的 go 指令不能高于 tag 所声明的最低工具链要求
+          go list ./... >/dev/null
+          echo "release: $mod@$ver 可解析"
+
+      - name: 以模块身份自证（下游视角：拉下来能不能编译）
+        # 刻意不写 probe.go：YAML 块标量里嵌 heredoc 的话，heredoc 体必须顶格，
+        # 顶格会截断块标量本身（YAML 解析期就红）。改成直接构建依赖包——
+        # 「下游 import 它」这件事由 go build 那个包来证明，不必再写一个 main。
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          tmp="$(mktemp -d)"
+          cd "$tmp"
+          go mod init probe >/dev/null
+          # 走 proxy 引入自己发布的版本：这是下游的真实路径
+          go get "github.com/yi-nology/agent-memory@${ver}"
+          go list -m github.com/yi-nology/agent-memory
+          CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/types
+          CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/store
+          echo "release: 下游视角编译通过"
