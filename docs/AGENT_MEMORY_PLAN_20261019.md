@@ -199,7 +199,9 @@ lifecycle / operations 与 pipeline 平级
 | 包 | 非测试行 | 裁定 | 理由 |
 |---|---|---|---|
 | `budget` | 756 | ~~**借道**~~ → **实装改为：不借道，召回自带分桶配额器**（2026-10-19 M2 实弹推翻） | 原判据是「同一个分段账本，两个作用域」。**实现时发现两条都对**：① 两边词表不同——harness 的分段是 System/Tools/Conversation（prompt 组装面），召回的分桶是 atoms/quotes/headlines（选择面）；② 借道会同时撞破本仓两条门禁红线（`memory-no-harness-dependency` + `memory-core-stdlib-only`）。共享的是**纪律**（先计量、再在上限内分配），不是代码。`pipeline/recall` 自带 `allocate()`，计量走 `ports.TokenEstimator` 注入 |
-| `pii` | 827 | **接线（非下沉）** | octop 的 privacy 只有 `store_raw_content`/`store_tool_payloads` 两个开关式丢弃，**没有内容级打码**。记忆跨会话持久化 + 可导出成包 = 新增泄漏面。裁定：capture 管线挂 pii 处置面，**落库前打码**（不是注入前打码——落库后打码等于已泄漏）。这是本仓强于 octop 的一处 |
+| `pii` | 827 | ~~**接线**~~ → **实装改为：不借道，记忆自带 `ports.Redactor` 端口 + 结构性兵底**（2026-10-19 M3 实弹） | octop 的 privacy 只有 `store_raw_content`/`store_tool_payloads` 两个开关式丢弃，**没有内容级打码**。记忆跨会话持久化 + 可导出成包 = 新增泄漏面。裁定：capture 管线挂脱敏处置面，**落库前打码**（不是注入前打码——落库后打码等于已泄漏）。这是本仓强于 octop 的一处。
+
+**实弹（M3）**：与 budget 同理不借道——harness 的 pii 是「策略注册表 + 执行面」的完整平面，而记忆要的是一个「落库前必过一过」的窄接口，两者是不同形态，且借道撞破同样的两条门禁红线。改为 `ports.Redactor`（**必需依赖**，`capture.New` 传 nil 直接失败）+ `ports.PatternRedactor`（只认形态的兵底）。兵底的收录标准三条同时成立：① 不认识领域词；② 误报代价只是少几个字符；③ **漏报代价不可逆**（凭据一旦落库，要靠轮换补救，而轮换往往来不及） |
 | `reminder` | 30 | **接线（改引 guardx，不经本门面）** | recall 内容跨会话/跨用户/跨宿主 = **不可信内容**，直拼 prompt = 提示注入。核心 `injectband` 已在 guardx/tier 0，agent-memory **直接引 guardx**；`harness/reminder` 这个门面是为保扁鹊调用点稳定而存在的，不是给外仓用的出口 |
 | `pending` | 62 | **不合并，只抄机制** | octop 的 `thread_active_entities` 回答「『那个』指谁」= 召回期代词消解栈；pending 是「上一轮问了什么」= 跨轮挂起态载体。表面都是跨轮状态，**生命周期相反**（前者随召回滑动淘汰，后者等用户答复才结算）。同 AGENTS.md「意图两个 LLM 选路面不合并」的判据。但 thread_state 的 **LRU + pin-time + 重启存活**三条机制值得整体抄 |
 | `checkpoint` | 545 | **不下沉** | octop 把它与长期记忆同库，是因为它的宿主是 LangGraph。本仓 checkpoint 是跨进程 CAS + SeqGate，服务「续跑不重放」，记忆服务「记住事实」；且 AGENTS.md 已记本仓链是**含并行分支的 DAG**，`BuildPlan` 的线性连续前缀模型不成立。可共用同一个 SQLite 文件/连接池，但**表前缀独立、包不合并** |
@@ -213,6 +215,9 @@ lifecycle / operations 与 pipeline 平级
 ---
 
 ## 四、我们比 octop 强 / 必须补的三处
+
+> 三处偏离全部有「不接会怎样」的用例钉住。其中两处（转义借 guardx、脱敏兵底的形态
+> 覆盖）在实现期间各被用例打穿过一次，过程与结论记在 §4.3 与 ports/redact.go。
 
 | 处 | octop 现状 | 本仓要求 |
 |---|---|---|
@@ -287,7 +292,13 @@ band；拿它守 `<memory-context>` 时，一句 `</memory-context>` 原样穿�
 
 ## 七、风险与未决
 
-### 7.1 现存缺陷（建议单列一批，不等新模块）
+### 7.1 现存缺陷（**宿主侧，仍未修**）
+
+> ⚠️ **本仓（M3）已把接线点做出来了，但宿主那条路还是通的。**
+> `capture.Capture` 会先打码再落库——**前提是宿主把事件交给 capture**。
+> 宿主现有的蒸馏路径（`internal/service/memory_svc.go`）仍然把断言与逐字引用
+> 原样落库，那条路径上没有任何脱敏接线。**改本仓不会自动修好它**，
+> 需要在宿主侧单列一批把蒸馏产物改走 capture。
 
 **记忆面没有接 pii**。证据：`internal/service/memory_svc.go` 的 import 面只有
 `runner`/`llm`/`model`/`repo`/eino/`gorm`，**无 pii**。会话终稿蒸馏出的

@@ -25,7 +25,10 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 | PostgreSQL 后端 | ⏳ M6 | `storage/postgres/` —— 接线位就位，**实现未落，行为一致性未验证** |
 | 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测 |
 | 注入防伪 | ✅ | `ports.MemoryBand` —— 转义全部 `<`，9 条攻击载荷用例钉住 |
-| 提炼/晋升/页面/情节 | ⏳ M3–M4 | `pipeline/` |
+| 捕获面 | ✅ | `pipeline/capture/` —— **落库前打码**（Redactor 必需）、运行期错误拒收 |
+| 提炼面 | ✅ | `pipeline/extractor/` —— 防稀释校验、非法枚举硬拒、无模型显式失败 |
+| 晋升面 | ✅ | `pipeline/promotion/` —— 五检查（价值/证据/实体/重复/矛盾），送人工是默认姿态 |
+| 页面/情节 | ⏳ M4 | `pipeline/` |
 | 生命周期 | ⏳ M6 | `lifecycle/` |
 | 迁移包 / bridge / CLI | ⏳ M5 | `operations/` `adapters/` |
 
@@ -59,7 +62,12 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
    伪造的闭合标签原样穿过。集成与依赖一并撤掉，转义归本仓——门禁这关守的是
    **安全性质**，不是代码量。详见方案 §4.3。
 
-5. **判定面能换成结构就别拿文本匹配。** 两处刻意偏离上游：
+5. **脱敏是必需依赖，不是可选项。** 记忆是留存资产，一旦落库就能被导出复制。
+   `capture.New` 传 nil 直接失败——缺失的默认值不是宽容，是事故。兵底只认
+   **形态**（已知凭据前缀、URL 内嵌凭据、key=value、长十六进制、私钥块），
+   它是地板不是天花板，宿主必须叠自己的领域规则：凭据是唯一一类漏报即不可逆的。
+
+6. **判定面能换成结构就别拿文本匹配。** 两处刻意偏离上游：
    召回结果**不**直接拼 prompt（过 `guardx/injectband` 身份防伪，记忆是跨会话
    跨用户的不可信内容）；`Provenance` 做成**类型**而不是 payload 里的字符串键。
    这两条各配一个「不接会怎样」的用例钉住——否则后人会照着上游改回去。
