@@ -362,6 +362,55 @@ import 路径，仓库会停在「编译不过」，且报错（`cannot find mod
 package`）完全指不到真正成因（**包被拆了**，不是模块找不到）。已同批修掉并提交
 （宿主仓 `129c6c03`，每文件一行 import）。
 
+### 6.3 接缝自查发现的四条（2026-10-19，宿主侧）
+
+M7-b1/b3 落地后对适配层做了一轮逐行自查，查出四条**契约面**的问题。四条都在宿主
+侧修，但其中一条是**内核的契约空洞**，内核自己改不改要另行评估（本次不改）。
+
+1. **归属迁移是 `entity.Store` 的明文契约**。内核 `pipeline/entity` 的接口注释
+   写得很直白：「`SaveAtom` 写回事实卡（合并时要改归属）」，`entity.Resolver.Merge`
+   的实现就是改 `a.EntityID` 后 `SaveAtom` 回去。宿主适配器原本**只改内容不改归属**
+   ——后果是归一合并在宿主侧**静默失效**：卡留在旧实体上，症状是「两个实体各自
+   记着同一条事实」，在内容上完全看不出来。修：锚点变了要改
+   `(subject_kind, subject)`、按**存量口径**重算签名（签名含锚点，不重算则去重键
+   与归属对不上，同一条事实在新锚点下会多出一张卡）、实体投影跟着迁。
+
+2. **第三条内核契约空洞（本次新增记录）**：`store.AtomStore.SaveAtom` 的**退役
+   状态是「随卡写回」的**。内核 SQLite 实现是
+   `deprecated_at = excluded.deprecated_at, superseded_by = excluded.superseded_by`
+   （`storage/sqlite/atom.go`）——即**入卡不带退役信息，就会把退役清空**。内核自己
+   的读改写路径（晋升/生命周期）都带得全，但**跨宿主适配器一旦在映射时丢了退役
+   信息，已退役的事实就会被复活**。宿主形状尤其危险：它没有独立的「退役时刻」
+   列，只能拿 `updated_at` 代偿，而那一列**可能为零**（手工造的行、老库回填）。
+   宿主侧对策两条：映射时退役时刻必须有**非零兜底**（`updated_at` → `created_at`
+   → 纪元时刻——零值在 `Active()` 眼里就是「从未退役」）；写回时**状态只进不退**
+   （库里那份是权威，只有来件显式带退役信息才允许改状态）。
+
+   这条对**任何**接内核的宿主都成立，与宿主形状无关：读出来的卡**必须**带全退役
+   字段再写回去，否则就是复活。
+
+3. **宿主四态 ↔ 内核两态**（新增第四条刻意偏离）。宿主事实卡有四态
+   （`active` / `needs_review` / `superseded` / `deprecated`），内核事实卡只有两个
+   退役字段（`SupersededBy` + `DeprecatedAt`）。映射：`active`↔活跃；
+   `needs_review`↔`DeprecatedAt`（待裁决**不进召回集**，与退役同效——宿主侧的
+   召回只取 `active`，把它当活跃等于让待裁决的卡绕过人审直接进 prompt）；
+   `superseded`↔`SupersededBy`；`deprecated`↔`DeprecatedAt`。回写**不还原**
+   `needs_review`（内核形状里没有这一态），状态**只进不退**。
+   宿主侧单枚举列还表达不了内核的「既被推翻又被人工作废」两态组合——
+   内核那两列是独立的，宿主这一列只能存一个，取 `superseded` 优先（两者都非
+   活跃，取哪个都不影响「不参与召回」这个判断）。
+
+4. **来源性质的映射要双向可逆**。宿主 `created_by` 只有三档
+   （`distill` / `user` / `event`），内核 `Provenance.Origin` 有五档
+   （model / operator / user / external / tool）。宿主原本把内核写的卡一律记成
+   `event`（外部事件沉淀）——**审计链指错人**：内核写出的卡来自蒸馏/晋升链，应记
+   `distill`。修法是加 `createdByOf`（`originOf` 的**逆**映射），并让「没标来源」
+   按内核写卡的实际路径取 `distill`。
+   往返口径：`model`→`distill`→`model`、`operator`→`user`→`operator`、
+   `external`→`event`→`external` 三档**无损**；`user`→`user`→`operator`、
+   `tool`→`event`→`external` 两档**有损**（宿主无槽位，回读时归到相邻档）。
+   写明在这里，免得后来人以为宿主能无损承载来源性质。
+
 ---
 
 ## 七、风险与未决
