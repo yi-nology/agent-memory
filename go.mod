@@ -23,6 +23,11 @@ require modernc.org/sqlite v1.40.1
 // 下面三条是离线可解析的前提：modernc.org/sqlite 的 go.mod 钉的是更早的
 // 版本，本机模块缓存里没有那些精确版本，而 MVS 取「最大」——显式抬到缓存里
 // 存在的版本即可，不改任何行为面。
+//
+// ⚠️ 这里**没有** guardx。曾经的设想是「借 injectband.SanitizeBody 做转义」，
+// 实测它是写死的 tagRe、只认 <system-reminder> 家族：拿它守 <memory-context>
+// 这条数据区，伪造的闭合标签原样穿过——见 ports/band.go 与本文件
+// docs/AGENT_MEMORY_PLAN_20261019.md §四 的偏离记录。转义因此归本仓自己所有。
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect

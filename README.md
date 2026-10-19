@@ -23,7 +23,10 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 | SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑** |
 | 跨后端行为断言 | ✅ | `storage/parity/` —— 29 条断言，SQLite 已接上并全绿 |
 | PostgreSQL 后端 | ⏳ M6 | `storage/postgres/` —— 接线位就位，**实现未落，行为一致性未验证** |
-| 流水线五段 | ⏳ M2–M4 | `pipeline/` |
+| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测 |
+| 注入防伪 | ✅ | `ports.MemoryBand` —— 转义全部 `<`，9 条攻击载荷用例钉住 |
+| 提炼/晋升/页面/情节 | ⏳ M3–M4 | `pipeline/` |
+| 生命周期 | ⏳ M6 | `lifecycle/` |
 | 迁移包 / bridge / CLI | ⏳ M5 | `operations/` `adapters/` |
 
 > ⚠️ 上表里 PG 那行的 ⏳ 是有意的：它的测试是**跳过**的，而**跳过的用例不证明兼容**。
@@ -50,7 +53,13 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
    prompt」是召回层重排的职责。把 bm25 名次钉进跨后端断言，等于把实现细节写成
    产品契约——换个后端就假红，召回质量却一点没变。
 
-4. **判定面能换成结构就别拿文本匹配。** 两处刻意偏离上游：
+4. **转义必须匹配实际在用的那条 band。** 实现期间曾把转义「借」给
+   `guardx/injectband.SanitizeBody`（通用安全原语、单源、不重复造），用例当场打穿：
+   它的 `tagRe` 是写死的、只认 `<system-reminder>` 家族，拿它守 `<memory-context>` 时
+   伪造的闭合标签原样穿过。集成与依赖一并撤掉，转义归本仓——门禁这关守的是
+   **安全性质**，不是代码量。详见方案 §4.3。
+
+5. **判定面能换成结构就别拿文本匹配。** 两处刻意偏离上游：
    召回结果**不**直接拼 prompt（过 `guardx/injectband` 身份防伪，记忆是跨会话
    跨用户的不可信内容）；`Provenance` 做成**类型**而不是 payload 里的字符串键。
    这两条各配一个「不接会怎样」的用例钉住——否则后人会照着上游改回去。

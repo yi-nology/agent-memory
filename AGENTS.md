@@ -92,8 +92,36 @@
 - 例外必须登记在 policy 的 `exceptions` 段，带 `reason` + `until` + `removal`
   （拆除条件）。无期限的例外等于规则失效。
 
+## 召回面的四条纪律（M2 实弹）
+
+1. **Bander 是必需依赖，不是可选增强。** `recall.New` 传 nil 直接返回错误。
+   召回内容跨会话、跨用户、跨宿主，它进 prompt 必须处在数据区。一条写着
+   「忽略之前的指令」的记忆被当成系统注入读进去，整条会话的控制权就转移了。
+   用例：`TestNewRejectsMissingBander`。
+
+2. **转义必须匹配实际在用的那条 band。** 借 A 的转义规则去守 B 等于没有转义。
+   本仓曾把转义借给 `guardx/injectband.SanitizeBody`，被 `ports/band_test.go`
+   的攻击载荷用例当场打穿——它的 `tagRe` 是写死的、只认 `<system-reminder>` 家族。
+   **已撤掉该集成与依赖**，转义归 `ports.MemoryBand`（转义全部 `<`，一次挡住两类伪造）。
+   勿重复评估「为什么不借 guardx」。
+
+3. **画像桶不参与多样性裁剪。** 画像是那个实体的摘要，裁掉它等于裁掉整个实体。
+   而「实体事实多」恰恰是最该保留画像的情形——初版把画像算进单实体配额，
+   于是该场景下画像恒被挤掉（用例 `TestBucketsAreIndependent` 钉住）。
+
+4. **丢弃必须分路可观测。** `Result` 给 `DroppedByBudget` / `DroppedByDiversity` /
+   `DroppedByDuplicate` 三路 + 合计，因为处置完全不同：预算不足改总量或改提炼，
+   多样性超限改 `PerEntityMax`，内容重复说明提炼层在制造同一件事。
+   只给合计的话，宿主只能猜。
+
 ## 已定案、勿重复评估
 
+- **召回不借 harness/budget**（2026-10-19 M2 推翻方案 §三 的「借道」裁定）：
+  两边的词表不同（System/Tools/Conversation vs atoms/quotes/headlines），
+  且借道会同时撞破 `memory-no-harness-dependency` 与 `memory-core-stdlib-only`
+  两条红线。共享的是纪律不是代码；计量改走 `ports.TokenEstimator` 注入。
+- **召回的存储依赖面是 `recall.Reader`（5 个方法）**，不是 `store.Store`：
+  兑现 store/store.go 里「阶段只声明自己需要的子接口」那条纪律。
 - **树（root/branch/leaf）暂不做**：对运维域价值有限（实体两态够用）。
   等真出现「同一事实挂多锚点」再启（方案 §5）。
 - **向量索引不接**：上游自己标为「默认关闭、测试全 mock、真实集成未验证」。

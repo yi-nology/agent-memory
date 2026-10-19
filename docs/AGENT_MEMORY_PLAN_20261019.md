@@ -198,7 +198,7 @@ lifecycle / operations 与 pipeline 平级
 
 | 包 | 非测试行 | 裁定 | 理由 |
 |---|---|---|---|
-| `budget` | 756 | **借道（只借 `Meter`/分段/上限，不借 `compact.go`）** | harness 面是「输入侧分段计量 + 窗口上限 + 压实计划」，recall 面是「召回选段的桶配额」——**同一个分段账本，两个作用域**。正确形态是 agent-memory 单向 import `budget` 的计量面；反过来搬进 memory 会造出 harness→memory 的反向依赖（harness 不该知道记忆）。压实不搬：记忆是**补料**、压实是**减料**，方向相反 |
+| `budget` | 756 | ~~**借道**~~ → **实装改为：不借道，召回自带分桶配额器**（2026-10-19 M2 实弹推翻） | 原判据是「同一个分段账本，两个作用域」。**实现时发现两条都对**：① 两边词表不同——harness 的分段是 System/Tools/Conversation（prompt 组装面），召回的分桶是 atoms/quotes/headlines（选择面）；② 借道会同时撞破本仓两条门禁红线（`memory-no-harness-dependency` + `memory-core-stdlib-only`）。共享的是**纪律**（先计量、再在上限内分配），不是代码。`pipeline/recall` 自带 `allocate()`，计量走 `ports.TokenEstimator` 注入 |
 | `pii` | 827 | **接线（非下沉）** | octop 的 privacy 只有 `store_raw_content`/`store_tool_payloads` 两个开关式丢弃，**没有内容级打码**。记忆跨会话持久化 + 可导出成包 = 新增泄漏面。裁定：capture 管线挂 pii 处置面，**落库前打码**（不是注入前打码——落库后打码等于已泄漏）。这是本仓强于 octop 的一处 |
 | `reminder` | 30 | **接线（改引 guardx，不经本门面）** | recall 内容跨会话/跨用户/跨宿主 = **不可信内容**，直拼 prompt = 提示注入。核心 `injectband` 已在 guardx/tier 0，agent-memory **直接引 guardx**；`harness/reminder` 这个门面是为保扁鹊调用点稳定而存在的，不是给外仓用的出口 |
 | `pending` | 62 | **不合并，只抄机制** | octop 的 `thread_active_entities` 回答「『那个』指谁」= 召回期代词消解栈；pending 是「上一轮问了什么」= 跨轮挂起态载体。表面都是跨轮状态，**生命周期相反**（前者随召回滑动淘汰，后者等用户答复才结算）。同 AGENTS.md「意图两个 LLM 选路面不合并」的判据。但 thread_state 的 **LRU + pin-time + 重启存活**三条机制值得整体抄 |
@@ -212,15 +212,50 @@ lifecycle / operations 与 pipeline 平级
 
 ---
 
-## 四、我们比 octop 强 / 必须补的两处
+## 四、我们比 octop 强 / 必须补的三处
 
 | 处 | octop 现状 | 本仓要求 |
 |---|---|---|
 | **落库前脱敏** | privacy 只有开关式丢弃，无内容级打码 | capture 管线挂 pii；**打码在落库前**，否则导出即泄漏 |
 | **召回注入防伪** | recall 输出直接拼 prompt，无身份防伪 | recall 结果统一过 `guardx/injectband`；记忆内容标记为数据区，不得被当指令 |
 
-这两处不是「对齐 octop」，是**明确偏离 octop**。写进 `types` 与 `recall` 的包注释，
+这三处不是「对齐 octop」，是**明确偏离 octop**。写进 `types`/`ports`/`recall` 的包注释，
 并各配一个把「不接会怎样」的用例钉住——否则后人会看着 octop 把它们改回去。
+
+### 4.3 转义必须匹配**实际在用的那条 band**（M2 实弹，代价是一个被拆掉的集成）
+
+方案 §三 原写「召回注入防伪 → 改引 guardx，不经 harness 门面」。M2 实现时照做了：
+建 `integrations/guardx`，把 `ports.Bander` 接到 `injectband.SanitizeBody` 上——
+理由是「转义是通用安全原语，单源在 guardx，本仓不重复造」。
+
+**用例当场打穿了它**。`injectband.SanitizeBody` 的实现是
+
+```go
+func SanitizeBody(body string) string {
+    return tagRe.ReplaceAllStringFunc(body, func(m string) string {
+        return strings.Replace(m, "<", "&lt;", 1)
+    })
+}
+```
+
+`tagRe` 是写死的、**只匹配 `<system-reminder…>` 家族**。它守得住的只有它自己那条
+band；拿它守 `<memory-context>` 时，一句 `</memory-context>` 原样穿过——攻击者提前
+闭合数据区把内容搬出去，还顺手在后面自称系统注入。
+
+> **教训（值得单独立一条纪律）**：转义规则与「实际在用的那条 band」是**一对**。
+> 借 A 的规则去守 B，等于没有转义。「不重复造轮子」在这里必须让位给
+> 「转义必须匹配实际 band」——门禁这关守的是**安全性质**，不是代码量。
+
+处置：**集成与依赖一并撤掉**，转义归 `ports.MemoryBand` 自己所有（转义全部 `<`，
+一次同时挡住两类伪造）。`ports/band_test.go` 留 9 条攻击载荷用例钉住这件事，
+并在文件头写明「曾打算借 guardx，被本用例打穿」。
+
+### 4.4 召回的依赖面收窄成 `recall.Reader`（M2 兑现自己的纪律）
+
+`store/store.go` 的包注释写着「阶段只声明自己需要的子接口」，但 M1 的后端全量实现了
+`store.Store`。M2 兑现这条：召回只用得到 5 个存储方法，于是声明 `recall.Reader`。
+量化收益：召回的单元测试写 5 个方法而不是 40 个，且「召回依赖了存储的哪些面」
+在类型上直接可见。
 
 ---
 
