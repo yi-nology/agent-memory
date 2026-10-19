@@ -294,11 +294,22 @@ band；拿它守 `<memory-context>` 时，一句 `</memory-context>` 原样穿�
 
 ### 7.1 现存缺陷（**宿主侧，仍未修**）
 
-> ⚠️ **本仓（M3）已把接线点做出来了，但宿主那条路还是通的。**
-> `capture.Capture` 会先打码再落库——**前提是宿主把事件交给 capture**。
-> 宿主现有的蒸馏路径（`internal/service/memory_svc.go`）仍然把断言与逐字引用
-> 原样落库，那条路径上没有任何脱敏接线。**改本仓不会自动修好它**，
-> 需要在宿主侧单列一批把蒸馏产物改走 capture。
+> ✅ **宿主侧已于 2026-10-19 清偿**（宿主仓提交 `ad3ada51`）。
+>
+> 修法不是把蒸馏产物改走 capture（那要先发布本仓并让宿主依赖它，是 M7 的事），
+> 而是**在宿主自己的「构造事实卡」这个动作上收口**：CreateManual /
+> CreateFromEvent / promote 三条写入路径都经过它，用宿主既有的两层脱敏
+> （logredact 凭据类 + pii 个人信息价值面），与告警/审计/工单三条出口面同款口径。
+>
+> 落 service 层而不是 repo：架构策略的 repo 模块 requires 不含 pii
+> （repo 不得上溯业务面），service 已有 pii。
+>
+> **先脱敏再算签名**（签名由 repo 用落库的断言现算）：签名的用途是对**存下来的**
+> 事实去重，而存下来的是脱敏后的文本。副作用是「两条断言只差一个密钥」会被判成
+> 同一条——那正是我们要的：差别只在我们要不存的密钥上。
+>
+> 用例 `TestMemoryRedactedBeforeStore` 钉住「从库里读出来也是脱敏后的」，
+> 不靠内存态。
 
 **记忆面没有接 pii**。证据：`internal/service/memory_svc.go` 的 import 面只有
 `runner`/`llm`/`model`/`repo`/eino/`gorm`，**无 pii**。会话终稿蒸馏出的
