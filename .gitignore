@@ -1,0 +1,16 @@
+# 构建产物
+/bin/
+/tools/archcheck/archcheck
+
+# 本地缓存（沙箱内会话用；仓库内构建会生成）
+.gomodcache-*/
+.gocache-*/
+
+# 本地记忆库（导出的 .hmpkg / sqlite 文件绝不入库）
+*.hmpkg
+*.sqlite
+*.sqlite-journal
+*.db
+
+# macOS 噪声
+.DS_Store

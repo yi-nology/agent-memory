@@ -1,0 +1,213 @@
+# agent-memory 架构治理策略
+#
+# 双面设计：本文件既是「声明面」（模块清单 + 依赖方向 + 域词红线，供人阅读与
+# AI 对齐），也是「可执行面」（rules 段由 tools/archcheck 逐条执行，
+# `make architecture-check` 门禁；违反即非零退出）。正则一律 RE2 语法。
+#
+# ── 与 agent-harness 的分工 ──
+# harness 管「编排内核不得长出领域知识」+「harness 内部依赖方向」；
+# 本仓管「记忆内核不得长出领域知识」+「记忆内部依赖方向」+「两者不得互相 import」。
+# 三面合起来才是完整红线：拆分后最怕的就是半年后业务代码慢慢渗回内核。
+#
+# 纪律：
+#   - 提交前跑 `make check`；
+#   - **policy 先行**：新依赖方向先改本文件再写代码；
+#   - 新模块登记 {id, roots, requires}；
+#   - 例外必须带注释说明原因与拆除条件（当前 exceptions 为空）。
+
+version: 1
+
+# ── 模块清单（requires = 允许的内部依赖方向）──
+# 未落地的模块先登记在此：policy 先行的意义就是「方向先钉死，代码后跟上」，
+# 否则实现时会顺手 import 一个当时看着方便、事后没人查得清的包。
+modules:
+  - id: types
+    roots: [types]
+    requires: []
+    owner: memory
+    managed: true
+    notes: |
+      领域结构单源：捕获事件/候选/事实卡/实体/页面/树/情节/审计条目。
+      零内部依赖、零第三方依赖——它是整个仓的地基，地基一动全塌。
+
+  - id: ports
+    roots: [ports]
+    requires: []
+    owner: memory
+    managed: true
+    notes: |
+      外部能力接口面：模型调用、向量化、向量索引。
+      只声明协议，不含实现、不引任何 SDK。「装了包不等于配好了模型」是显式立场：
+      没注入模型时提炼类动作必须**报错**而非静默产出幻觉。
+
+  - id: store
+    roots: [store]
+    requires: [types]
+    owner: memory
+    managed: true
+    notes: |
+      持久化契约。按消费面拆成小接口（RawStore/AtomStore/...），
+      阶段只持自己那一小片——「阶段能碰哪些表」在类型上可见。
+      namespace 显式传参，不在构造时绑定。
+
+  - id: storage-sqlite
+    roots: [storage/sqlite]
+    requires: [types, store]
+    owner: memory
+    managed: true
+    notes: 纯 Go SQLite 驱动（FTS5 + 表前缀隔离 namespace）。方言 SQL 只许出现在本目录。
+
+  - id: storage-postgres
+    roots: [storage/postgres]
+    requires: [types, store]
+    owner: memory
+    managed: true
+    notes: PostgreSQL 后端（namespace-first 键 + 全文检索）。与 sqlite 必须同一组行为断言。
+
+  - id: pipeline-capture
+    roots: [pipeline/capture]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: 事件 → RawEvent。**脱敏接线点在此**（落库前，不是注入前——落库后再打等于已泄漏）。
+
+  - id: pipeline-extractor
+    roots: [pipeline/extractor]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: RawEvent → Candidate。抽取要调模型（贵、慢、会幻觉），故与判定分层。
+
+  - id: pipeline-promotion
+    roots: [pipeline/promotion]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: 候选判定五检查（价值/证据/实体归一/重复/矛盾）→ 晋升·并入·丢弃·送人工。
+
+  - id: pipeline-recall
+    roots: [pipeline/recall]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: 召回全链（路由/多源/重排/去冗/抑制/预算/活跃实体栈/缓存/超时）+ 注入防伪。
+
+  - id: pipeline-page
+    roots: [pipeline/page]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: 实体页面脏标记与重生成。页面是派生物，事实卡才是真源。
+
+  - id: pipeline-episode
+    roots: [pipeline/episode]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: 情节摘要与日/周/月周期摘要。与事实卡是两条独立的路，互不依赖。
+
+  - id: lifecycle
+    roots: [lifecycle]
+    requires: [types, ports, store, pipeline-extractor, pipeline-promotion, pipeline-recall, pipeline-page, pipeline-episode]
+    owner: memory
+    managed: true
+    notes: 回收/合并/清真/保留期。事实卡只软退役不硬删——被推翻的事实曾经是真的。
+
+  - id: operations
+    roots: [operations]
+    requires: [types, store]
+    owner: memory
+    managed: true
+    notes: 导出/导入与跨宿主迁移包。
+
+  - id: application
+    roots: [application]
+    requires: [types, ports, store, pipeline-capture, pipeline-extractor, pipeline-promotion, pipeline-recall, pipeline-page, pipeline-episode, lifecycle, operations]
+    owner: memory
+    managed: true
+    notes: 宿主装配面：配置、运行时、路径投影、宿主手改文件对账。
+
+  - id: adapters-bridge
+    roots: [adapters/bridge]
+    requires: [application]
+    owner: memory
+    managed: true
+    notes: JSON-RPC over stdio。跨语言/独立进程宿主的入口。
+
+  - id: adapters-cli
+    roots: [adapters/cli]
+    requires: [application]
+    owner: memory
+    managed: true
+    notes: 命令行面。
+
+# ── 规则段（由 tools/archcheck 逐条执行）──
+rules:
+  - id: memory-no-domain-vocabulary
+    desc: |
+      记忆内核不得长出领域知识。本仓认识「事实/实体/会话」，不认识「主机/集群/Pod」。
+      注释与测试数据同样计入——只扫 import 图和标识符的检查会被注释里的
+      领域词表绕过去，而那正是最常见的渗入路径。
+    severity: error
+    scope: ["."]
+    scope_exclude: [".gomodcache-mavis", ".gocache-mavis", "tools", "docs"]
+    ignore_test: false
+    forbid_regex:
+      # 中文域词：运维对象与运维流程。逐词挑选，不写「节点」——
+      # 树节点（MemoryNode）是本仓的正统概念，写进去会逼着人绕过门禁。
+      - '(主机|集群|巡检|诊断链|故障链|运维|专家包|知识库)'
+      # 英文域词：只收 k8s 与集群语义的确定形态。
+      - '\b(kubernetes|k8s|kubectl|kubeconfig|pods?|clusters?)\b'
+
+  - id: memory-vocabulary-false-positive-guard
+    desc: |
+      禁词表**刻意不含**四个与领域同形、但确属本仓正统概念的词——
+      首轮实跑正是被它们打红的（误报 2 处），现记在这里防复发：
+        - host / 「主机」以外的用法：产出方标识（哪个宿主产生了这条记忆）；
+        - namespace / **「命名空间」**：记忆隔离维度（store.Namespace），
+          不是 k8s namespace。中文形式尤其危险——同一个词两种含义，
+          英文能被 \b 词边界救回来，中文没有边界，只能靠人判；
+        - node / 「节点」：记忆树节点（MemoryNode），不是集群节点。
+      k8s 侧的 namespace 不靠禁词抓，靠 kubernetes/k8s/kubectl 这几个
+      必现的伴生词——见到 namespace 且同文件有 k8s 词，k8s 词先红。
+      ⚠️ 已知限制（首轮实跑撞到，写在这里免得后人以为是 bug）：本门禁是纯文本匹配，
+      **连「解释禁词的那行注释」都会拦**。因此禁用词不能出现在任何文本里，
+      包括解释它的那一行。要写这类说明，只能说「本仓没有的某类基础设施对象」，
+      不能逐字复述词表。
+      另一条已知限制：中文没有词边界，同形不同义只能靠人判（见上面「命名空间」）。
+
+      本条不是检测规则，是**给改门禁的人的警示**：看到这三个词不要"顺手补进禁词表"——
+      门禁一旦有假红，团队就会开始用 nolint 绕它，而绕过的门禁等于没有门禁。
+      （判据：误命中方向决定代价。这三个词加进去会立刻产生假红，而它们指的东西
+      在本仓是承重的。）
+
+  - id: memory-no-harness-dependency
+    desc: |
+      agent-memory 与 agent-harness 是**平级内核**，不是父子。
+      记忆不得 import 编排（harness）；编排也不得 import 记忆——记忆是宿主可选装的。
+      两侧要交换的东西走宿主：编排把事件喂进来，宿主把召回结果取走。
+    severity: error
+    scope: ["."]
+    scope_exclude: [".gomodcache-mavis", ".gocache-mavis", "tools", "docs"]
+    ignore_test: false
+    forbid_import_regex: '^github\.com/yi-nology/agent-harness(/|$)'
+
+  - id: memory-store-single-source
+    desc: |
+      方言 SQL 只许出现在 storage/ 下。pipeline 层出现 SQL 即为越界：
+      换后端时 SQL 会跟着漏出去，而漏出去的那几处永远没人记得回来改。
+    severity: error
+    scope: ["types", "ports", "store", "pipeline", "lifecycle", "operations", "application", "adapters"]
+    ignore_test: false
+    forbid_regex: ['(?i)\b(SELECT\s+.*\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|CREATE\s+TABLE)\b']
+
+thresholds:
+  max_file_lines: 800
+  max_methods_per_type: 60
+  scan_roots: ["types", "ports", "store", "pipeline", "storage", "lifecycle", "operations", "application", "adapters"]
+  enforce: true
+  notes: |
+    max_file_lines 是拆分信号不是风格偏好：本仓的经验是文件长到某个程度，
+    就会有人把「两件事」塞进同一个文件而只改一半。god object 阈值沿用 harness 的 60。
+
+exceptions: []
