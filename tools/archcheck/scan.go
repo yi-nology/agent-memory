@@ -257,8 +257,31 @@ func checkDeps(p *policy, fset *token.FileSet, repoRoot string) ([]violation, er
 		if _, err := os.Stat(dir); err != nil {
 			continue // 未落地的模块（policy 先行的正常状态）
 		}
+		// 嵌套的模块根归**它们自己**管：外层模块遍历时必须跳过，
+		// 否则同一个文件会被算成两个模块的，依赖方向检查随之失真。
+		nested := map[string]bool{}
+		for _, other := range p.Modules {
+			if other.ID == m.ID {
+				continue
+			}
+			for _, root := range other.Roots {
+				if len(root) > len(m.Roots) && strings.HasPrefix(root, m.Roots[0]+"/") {
+					nested[root] = true
+				}
+			}
+		}
 		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				rel, rerr := filepath.Rel(dir, path)
+				if rerr == nil && rerr == nil && nested[rel] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(path, ".go") {
 				return nil
 			}
 			b, err := os.ReadFile(path) // #nosec G304

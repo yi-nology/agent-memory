@@ -102,6 +102,16 @@ modules:
     managed: true
     notes: 召回全链（路由/多源/重排/去冗/抑制/预算/活跃实体栈/缓存/超时）+ 注入防伪。
 
+  - id: pipeline-entity
+    roots: [pipeline/entity]
+    requires: [types, store]
+    owner: memory
+    managed: true
+    notes: |
+      归一面：把同一个对象的不同叫法收敛到一张实体卡上。
+      宿主认识自己的对象标识，内核不认识——故本包只提供**机制**
+      （按名查、登记别名、合并实体），词表与判定标准归宿主。
+
   - id: pipeline-page
     roots: [pipeline/page]
     requires: [types, ports, store]
@@ -118,17 +128,45 @@ modules:
 
   - id: lifecycle
     roots: [lifecycle]
-    requires: [types, ports, store, pipeline-extractor, pipeline-promotion, pipeline-recall, pipeline-page, pipeline-episode]
+    requires: [types, ports, store, pipeline-extractor, pipeline-promotion, pipeline-recall, pipeline-page, pipeline-episode, pipeline-entity, storage-sqlite]
     owner: memory
     managed: true
     notes: 回收/合并/清真/保留期。事实卡只软退役不硬删——被推翻的事实曾经是真的。
 
   - id: operations
     roots: [operations]
-    requires: [types, store]
+    requires: [types, store, operations-portable, storage-sqlite]
     owner: memory
     managed: true
-    notes: 导出/导入与跨宿主迁移包。
+    notes: |
+      导入/导出与跨宿主迁移包（.hmpkg，zip 容器 + JSONL + 校验和清单）。
+      三条闭环：pack / adopt / doctor。doctor 存在的原因是迁移是最容易出
+      静默错误的环节——包缺一半，导入「成功」了，而宿主从此拥有一段残缺的记忆，
+      而记忆库不会告诉你它缺了什么。
+
+  - id: operations-portable
+    roots: [operations/portable]
+    requires: [types, store, storage-sqlite]
+    owner: memory
+    managed: true
+    notes: 迁移包的具体格式与三条闭环（pack/adopt/doctor）。
+
+  - id: adapters-cli
+    roots: [adapters/cli]
+    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall]
+    owner: memory
+    managed: true
+    notes: |
+      命令行面。`Run(args, stdout, stderr) int` 而非 `main()`——命令逻辑因此
+      可被单测直接调用，不用起子进程。CLI **不注入模型**：它是运维口
+      （看与搬），不是生成口。
+
+  - id: cmd-memory
+    roots: [cmd]
+    requires: [adapters-cli]
+    owner: memory
+    managed: true
+    notes: 二进制入口的薄壳。
 
   - id: application
     roots: [application]
@@ -139,17 +177,10 @@ modules:
 
   - id: adapters-bridge
     roots: [adapters/bridge]
-    requires: [application]
+    requires: [application, types, store, ports, pipeline-recall, pipeline-capture, storage-sqlite]
     owner: memory
     managed: true
     notes: JSON-RPC over stdio。跨语言/独立进程宿主的入口。
-
-  - id: adapters-cli
-    roots: [adapters/cli]
-    requires: [application]
-    owner: memory
-    managed: true
-    notes: 命令行面。
 
 # ── 规则段（由 tools/archcheck 逐条执行）──
 rules:

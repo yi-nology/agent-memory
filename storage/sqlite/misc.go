@@ -91,6 +91,26 @@ func (s *pageStore) ListDirtyEntityPages(ctx context.Context, ns store.Namespace
 	return out, rows.Err()
 }
 
+// ListEntityPages 列出全部页面。
+func (s *Store) ListEntityPages(ctx context.Context, ns store.Namespace, limit int) ([]*types.EntityPage, error) {
+	rows, err := s.query(ctx,
+		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? ORDER BY entity_id LIMIT ?`,
+		nsOf(ns), limitOf(limit, 1000))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*types.EntityPage
+	for rows.Next() {
+		p, err := s.scanPage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // MarkEntityPageDirty 标脏。
 //
 // 页面不存在时**不报错而是建一条空脏页**：晋升先于首次生成是常态，
@@ -410,6 +430,35 @@ func (s *episodeStore) GetDigest(ctx context.Context, ns store.Namespace, period
 	d.WindowEnd = fromTS(end)
 	d.GeneratedAt = fromTS(gen)
 	return &d, nil
+}
+
+// ListDigests 列出全部周期摘要。
+func (s *Store) ListDigests(ctx context.Context, ns store.Namespace, limit int) ([]*types.DigestRecord, error) {
+	rows, err := s.query(ctx,
+		`SELECT period, period_key, markdown, episode_ids, window_start, window_end, generated_at
+		 FROM digests WHERE namespace = ? ORDER BY period, period_key LIMIT ?`,
+		nsOf(ns), limitOf(limit, 1000))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*types.DigestRecord
+	for rows.Next() {
+		var (
+			d               types.DigestRecord
+			ids             string
+			start, end, gen int64
+		)
+		if err := rows.Scan(&d.Period, &d.PeriodKey, &d.Markdown, &ids, &start, &end, &gen); err != nil {
+			return nil, err
+		}
+		d.EpisodeIDs = parseStrings(ids)
+		d.WindowStart = fromTS(start)
+		d.WindowEnd = fromTS(end)
+		d.GeneratedAt = fromTS(gen)
+		out = append(out, &d)
+	}
+	return out, rows.Err()
 }
 
 // ── 审计与元数据 ──

@@ -53,11 +53,25 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 	if now.IsZero() {
 		now = a.CreatedAt
 	}
+	// **upsert 而不是纯 INSERT**：事实卡会被更新——晋升并入时补证据、
+	// 退役时改状态、合并时迁移归属。这些都是「改既有卡」而不是「新增一张」。
+	// 用纯 INSERT 的话，第二步就撞唯一键——
+	// 而这个 bug 潜伏了很久：它只在「真的发生并入」时才暴露，
+	// 第一次撞上它的是生命周期层的合并用例。
 	if _, err := s.exec(ctx, `INSERT INTO atoms
 		(namespace, id, entity_id, candidate_id, raw_event_ids, assertion, verbatim_quote,
 		 quote_event_id, search_terms, occurred_at, confidence, importance,
 		 created_at, updated_at, superseded_by, deprecated_at, provenance, signature)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(namespace, id) DO UPDATE SET
+			entity_id = excluded.entity_id, candidate_id = excluded.candidate_id,
+			raw_event_ids = excluded.raw_event_ids, assertion = excluded.assertion,
+			verbatim_quote = excluded.verbatim_quote, quote_event_id = excluded.quote_event_id,
+			search_terms = excluded.search_terms, occurred_at = excluded.occurred_at,
+			confidence = excluded.confidence, importance = excluded.importance,
+			updated_at = excluded.updated_at, superseded_by = excluded.superseded_by,
+			deprecated_at = excluded.deprecated_at, provenance = excluded.provenance,
+			signature = excluded.signature`,
 		nsOf(ns), a.ID, a.EntityID, a.CandidateID, stringsJSON(a.RawEventIDs), a.Assertion,
 		a.VerbatimQuote, a.QuoteEventID, stringsJSON(a.SearchTerms), ts(a.OccurredAt),
 		string(a.Confidence), string(a.Importance), ts(a.CreatedAt), ts(now),
@@ -112,8 +126,12 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 		where = append(where, "occurred_at < ?")
 		args = append(args, ts(f.OccurredTo))
 	}
+	// 末尾的 id ASC 是**并列时的稳定序**：重要度与发生时刻都相同的两张卡，
+	// 没有它时返回顺序不确定——而「同签名合并时保留哪一张」正是由这个顺序
+	// 决定的，于是合并结果会随机变。同一类 bug 在原始事件面上修过一次
+	// （时间存纳秒 + id 次序），这里是同一课的第二处。
 	q := `SELECT ` + atomCols + ` FROM atoms WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY importance DESC, occurred_at DESC LIMIT ?`
+		` ORDER BY importance DESC, occurred_at DESC, id ASC LIMIT ?`
 	args = append(args, limitOf(f.Limit, 50))
 
 	rows, err := s.query(ctx, q, args...)

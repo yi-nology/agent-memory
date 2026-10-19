@@ -137,6 +137,18 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// Vacuum 物理整理（VACUUM）。
+//
+// 刻意**不在 store.Store 接口里**：VACUUM 是 SQLite 的概念，PostgreSQL 没有
+// 对应物。把它做成可选接口（lifecycle.Vacuumer）而不是塞进 Store，
+// 是为了让「本仓支持多个后端」这件事保持为真。
+func (s *Store) Vacuum(ctx context.Context) error {
+	if _, err := s.exec(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("VACUUM 失败: %w", err)
+	}
+	return nil
+}
+
 // Close 关闭底层连接。
 func (s *Store) Close() error {
 	if s.tx != nil {

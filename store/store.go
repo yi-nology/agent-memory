@@ -164,6 +164,8 @@ type PageStore interface {
 	UpsertEntityPage(ctx context.Context, ns Namespace, p *types.EntityPage) error
 	GetEntityPage(ctx context.Context, ns Namespace, entityID string) (*types.EntityPage, error)
 	ListDirtyEntityPages(ctx context.Context, ns Namespace, limit int) ([]*types.EntityPage, error)
+	// ListEntityPages 列出全部页面（导包要完整，不能只导脏的）。
+	ListEntityPages(ctx context.Context, ns Namespace, limit int) ([]*types.EntityPage, error)
 	// MarkEntityPageDirty 标脏（晋升侧调用，不触发生成）。
 	MarkEntityPageDirty(ctx context.Context, ns Namespace, entityID string, when time.Time) error
 	// ApplyEntityPageRegen 生成成功：落正文、清脏、记录尝试时刻与清失败。
@@ -192,6 +194,8 @@ type EpisodeStore interface {
 	ListEpisodesInWindow(ctx context.Context, ns Namespace, from, to time.Time) ([]*types.Episode, error)
 	SaveDigest(ctx context.Context, ns Namespace, d *types.DigestRecord) error
 	GetDigest(ctx context.Context, ns Namespace, period types.DigestPeriod, key string) (*types.DigestRecord, error)
+	// ListDigests 列出全部周期摘要（导包要完整）。
+	ListDigests(ctx context.Context, ns Namespace, limit int) ([]*types.DigestRecord, error)
 }
 
 // JournalStore 审计日志（追加面）。
