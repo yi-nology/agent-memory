@@ -276,7 +276,7 @@ func checkDeps(p *policy, fset *token.FileSet, repoRoot string) ([]violation, er
 			}
 			if info.IsDir() {
 				rel, rerr := filepath.Rel(dir, path)
-				if rerr == nil && rerr == nil && nested[rel] {
+				if rerr == nil && nested[rel] {
 					return filepath.SkipDir
 				}
 				return nil
