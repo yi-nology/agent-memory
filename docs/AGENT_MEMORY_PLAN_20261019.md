@@ -314,6 +314,13 @@ M7-b1 落定三条**刻意偏离**（写在宿主适配层的包注释里，勿�
 被抬，已按房规精确同步、零 tidy）：`oagentkit/guardx` v0.4.0→v0.4.1→v0.5.0、
 `oagentkit/agent` v0.8.0→v0.10.0 等八模块。
 
+**地板抬升的连带面**：`oekit/pkg` v0.15.1 把 `uidgen` 挪进了该模块的 `kitx/uidgen`
+子目录，模块路径不变、只是子路径变了。于是宿主源码里四处旧导入
+`github.com/oekit/pkg/uidgen` 在这个版本**不存在**——只抬 `go.mod` 版本而不改
+import 路径，仓库会停在「编译不过」，且报错（`cannot find module providing
+package`）完全指不到真正成因（**包被拆了**，不是模块找不到）。已同批修掉并提交
+（宿主仓 `129c6c03`，每文件一行 import）。
+
 ---
 
 ## 七、风险与未决
