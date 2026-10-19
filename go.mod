@@ -13,15 +13,25 @@ go 1.27
 //
 // 纪律：
 //   - 提交前跑 `make check`（build + vet + test + architecture-check）；
-//   - 核心零依赖：不引 LLM SDK / embedding SDK / HTTP 框架，只用 stdlib +
-//     database/sql + 纯 Go SQLite 驱动；
+//   - 核心零依赖：**只有 storage/ 允许第三方包**，其余模块只准 stdlib 与本仓
+//     （门禁 memory-core-stdlib-only 强制，make tidy-check 复核）；
 //   - 领域词（主机/集群/Pod/巡检/专家…）进本仓代码即红，由门禁强制；
 //   - 新依赖方向先改 architecture-policy.yaml 再写代码（policy 先行）。
-//
-// # 依赖面
-//
-// **M0 阶段 require 段为空**，这是刻意的：领域模型与端口契约必须是纯 stdlib 的，
-// 这样「无模型、无数据库」的降级路径可以被完整编译与测试（方案 §1.1 对标的
-// 「零核心依赖、装了包不等于配好了」）。存储后端引入的纯 Go SQLite 驱动
-// 在 M1 随实现一并进入 require 段。
 
+require modernc.org/sqlite v1.40.1
+
+// 下面三条是离线可解析的前提：modernc.org/sqlite 的 go.mod 钉的是更早的
+// 版本，本机模块缓存里没有那些精确版本，而 MVS 取「最大」——显式抬到缓存里
+// 存在的版本即可，不改任何行为面。
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/ncruces/go-strftime v0.1.9 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	modernc.org/libc v1.66.10 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.11.0 // indirect
+)

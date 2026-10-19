@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -254,4 +255,90 @@ func TestRepoItselfIsClean(t *testing.T) {
 		}
 		t.Fatalf("本仓存在门禁违规:%s", b.String())
 	}
+}
+
+// 核心零依赖：核心层引第三方包必须让门禁变红。
+//
+// 理由不是洁癖，是**降级路径**：没有模型时手工写入 + 词法召回必须能跑，
+// 没有数据库时领域模型必须能编译。核心一旦引了 SDK，这条路径就没了——
+// 而它塌了之后不会立刻暴露，它塌在「用户配了模型、装了数据库」的生产环境里。
+func TestGateGoesRedOnThirdPartyImportInCore(t *testing.T) {
+	p := loadRepoPolicy(t)
+	root := t.TempDir()
+
+	writeFile(t, root, "ports/x.go", `package ports
+
+import "github.com/some/sdk/llm"
+
+type LLM interface{ Complete() }
+`)
+
+	vs, err := run(p, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range vs {
+		if v.Rule == "memory-core-stdlib-only" {
+			return
+		}
+	}
+	t.Fatal("核心层引第三方包必须让门禁变红")
+}
+
+// 标准库与本仓的 import 必须放行。门禁只会红没用——满屏红会逼人整体关掉它。
+func TestGateAllowsStdlibAndSelfImport(t *testing.T) {
+	p := loadRepoPolicy(t)
+	root := t.TempDir()
+
+	writeFile(t, root, "ports/x.go", `package ports
+
+import (
+	"context"
+
+	"github.com/yi-nology/agent-memory/types"
+)
+
+type LLM interface{ Complete(context.Context) (string, error) }
+
+var _ types.Provenance
+`)
+
+	vs, err := run(p, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range vs {
+		if v.Rule == "memory-core-stdlib-only" {
+			t.Fatalf("标准库与本仓的 import 不得误伤: %s", v)
+		}
+	}
+}
+
+// god object 门禁：方法数超限必须红。
+//
+// 真实案件：M1 首轮 SQLite 的 Store 平铺 9 个接口 = 73 个方法，被这条规则逮住，
+// 拆成每表一个内嵌窄结构后最大的子结构只有 12 个。门禁不是风格偏好。
+func TestGateGoesRedOnGodObject(t *testing.T) {
+	p := loadRepoPolicy(t)
+	root := t.TempDir()
+
+	var b strings.Builder
+	b.WriteString("package fat\n\ntype Fat struct{}\n")
+	for i := 0; i < 61; i++ {
+		b.WriteString("\nfunc (f *Fat) M")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString("() {}\n")
+	}
+	writeFile(t, root, "store/fat.go", b.String())
+
+	vs, err := run(p, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range vs {
+		if v.Rule == "threshold-god-object" {
+			return
+		}
+	}
+	t.Fatal("方法数超限必须让门禁变红")
 }

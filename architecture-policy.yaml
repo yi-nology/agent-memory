@@ -50,16 +50,26 @@ modules:
       阶段只持自己那一小片——「阶段能碰哪些表」在类型上可见。
       namespace 显式传参，不在构造时绑定。
 
+  - id: storage-parity
+    roots: [storage/parity]
+    requires: [types, store]
+    owner: memory
+    managed: true
+    notes: |
+      跨后端共享行为断言。它本身不实现存储，只定义「记忆库该有什么行为」。
+      放在仓内而不是仓外，是为了让两个后端都**必须**接到同一份断言上——
+      断言与被断言者同仓，改断言时改不动实现的诱惑小得多。
+
   - id: storage-sqlite
     roots: [storage/sqlite]
-    requires: [types, store]
+    requires: [types, store, storage-parity]
     owner: memory
     managed: true
     notes: 纯 Go SQLite 驱动（FTS5 + 表前缀隔离 namespace）。方言 SQL 只许出现在本目录。
 
   - id: storage-postgres
     roots: [storage/postgres]
-    requires: [types, store]
+    requires: [types, store, storage-parity]
     owner: memory
     managed: true
     notes: PostgreSQL 后端（namespace-first 键 + 全文检索）。与 sqlite 必须同一组行为断言。
@@ -201,6 +211,25 @@ rules:
     ignore_test: false
     forbid_regex: ['(?i)\b(SELECT\s+.*\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|CREATE\s+TABLE)\b']
 
+  # 核心零依赖：这是「零核心依赖」纪律的执行面。
+  #
+  # 只查 go.mod 的 require 段是不够的——require 是整个模块的账，而本仓的纪律
+  # 是「核心零依赖、第三方只许出现在存储层」，两种纪律在同一份 go.mod 里并存
+  # 是可接受的。判据必须落在 **import 面**上：谁真的引了它。
+  - id: memory-core-stdlib-only
+    desc: |
+      types / ports / store / pipeline / lifecycle / operations / application / adapters
+      只准 import 标准库与本仓。第三方包（LLM SDK、embedding SDK、HTTP 框架、
+      数据库驱动）只许出现在 storage/ 下。
+
+      理由不是洁癖，是**降级路径**：没有模型时手工写入 + 词法召回必须能跑，
+      没有数据库时领域模型必须能编译。核心一旦引了 SDK，这条路径就没了——
+      而它塌了之后不会立刻暴露，它塌在「用户配了模型、装了数据库」的生产环境里。
+    severity: error
+    scope: ["types", "ports", "store", "pipeline", "lifecycle", "operations", "application", "adapters"]
+    ignore_test: false
+    forbid_third_party_in: ["types", "ports", "store", "pipeline", "lifecycle", "operations", "application", "adapters"]
+
 thresholds:
   max_file_lines: 800
   max_methods_per_type: 60
@@ -211,3 +240,4 @@ thresholds:
     就会有人把「两件事」塞进同一个文件而只改一半。god object 阈值沿用 harness 的 60。
 
 exceptions: []
+

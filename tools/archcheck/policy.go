@@ -37,6 +37,17 @@ type rule struct {
 	ForbidImport string      `yaml:"forbid_import_regex"` // 打在 import 路径上
 	ForbidRegex  []string    `yaml:"forbid_regex"`        // 打在整行文本上（含注释）
 	NegFollow    []negFollow `yaml:"negative_follow"`
+
+	// ForbidThirdPartyIn 列出「只准 stdlib 与本仓」的目录前缀。
+	//
+	// 为什么不直接查 go.mod 的 require 段：require 是**整个模块**的账，
+	// 而本仓的纪律是「核心零依赖、第三方只许出现在存储层」——同一个 go.mod 里
+	// 两种纪律并存是可接受的，判据得落在 import 面上。
+	//
+	// stdlib 判据用「首段路径不含点」：github.com/x、golang.org/x、
+	// modernc.org/x 都含点，context/encoding/json 不含。这是 Go 社区通用启发式，
+	// 与 `go list std` 的一致性足够，且不引依赖。
+	ForbidThirdPartyIn []string `yaml:"forbid_third_party_in"`
 }
 
 // threshold 体量阈值。写入方只被告警不自动拆——拆分是人的决定。

@@ -210,6 +210,23 @@ func applyRule(fset *token.FileSet, r rule, path string, content []byte) ([]viol
 		}
 	}
 
+	if len(r.ForbidThirdPartyIn) > 0 {
+		f, err := parser.ParseFile(fset, path, content, parser.ImportsOnly)
+		if err != nil {
+			return nil, fmt.Errorf("解析 %s 失败: %w", path, err)
+		}
+		for _, im := range f.Imports {
+			p := strings.Trim(im.Path.Value, `"`)
+			if strings.HasPrefix(p, modulePrefix) || isStdlib(p) {
+				continue
+			}
+			out = append(out, violation{
+				Rule: r.ID, Path: path, Line: fset.Position(im.Pos()).Line, Text: p,
+				Note: "核心层只准 stdlib 与本仓；第三方包只许出现在 storage/ 下",
+			})
+		}
+	}
+
 	if r.ForbidImport != "" {
 		re, err := regexp.Compile(r.ForbidImport)
 		if err != nil {
@@ -333,6 +350,12 @@ func checkDeps(p *policy, fset *token.FileSet, repoRoot string) ([]violation, er
 		}
 	}
 	return out, nil
+}
+
+// isStdlib 判定是否为标准库包：首段路径不含点即为标准库。
+func isStdlib(p string) bool {
+	first, _, ok := strings.Cut(p, "/")
+	return !ok || !strings.Contains(first, ".")
 }
 
 func relPath(path, root string) string {
