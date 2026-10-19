@@ -8,6 +8,8 @@
 // # 命令面
 //
 //	capture   捕获一条事件（落库前已打码）
+//	extract   从原始事件提炼候选（**要模型**）
+//	promote   判定候选并落成事实（**要模型**）
 //	recall    召回并渲染
 //	search    检索事实卡
 //	stats     计数
@@ -34,6 +36,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/yi-nology/agent-memory/adapters/llm"
 	"github.com/yi-nology/agent-memory/application"
 	"github.com/yi-nology/agent-memory/operations/portable"
 	"github.com/yi-nology/agent-memory/pipeline/capture"
@@ -52,6 +55,68 @@ type Options struct {
 	Namespace string
 	// Host 宿主标识。
 	Host string
+	// Model 模型接入配置（**按需**：只有要模型的命令才用得上）。
+	Model ModelOptions
+}
+
+// ModelOptions 模型接入配置。
+//
+// 从环境变量读，故命令行不必带密钥（密钥进命令行会进 shell 历史与进程表）。
+type ModelOptions struct {
+	// BaseURL 端点根地址（环境变量 MEMORY_LLM_BASE_URL）。
+	BaseURL string
+	// APIKey 密钥（环境变量 MEMORY_LLM_API_KEY）。
+	APIKey string
+	// Model 模型名（环境变量 MEMORY_LLM_MODEL）。
+	Model string
+	// Timeout 单次请求超时（环境变量 MEMORY_LLM_TIMEOUT）。
+	Timeout time.Duration
+	// TimeoutError 时长配置的原值与解析失败原因。
+	//
+	// 为什么必须保留这个字段：**解析失败不能静默回落**。
+	// 用户写 MEMORY_LLM_TIMEOUT=300（想 300 秒，漏了单位），
+	// 静默回落成 60 秒的后果是「请求莫名其妙卡 60 秒就断」，
+	// 而配置里写着 300——**配错的值不报错，返回一个看起来完全正常的结果**。
+	// 这类静默失效正是本仓反复强调要消灭的形态。
+	TimeoutError string
+}
+
+// Configured 报告模型配置是否齐备。
+func (m ModelOptions) Configured() bool {
+	return m.BaseURL != "" && m.Model != ""
+}
+
+// modelEnv 模型配置的环境变量名。
+const (
+	envLLMBaseURL = "MEMORY_LLM_BASE_URL"
+	envLLMAPIKey  = "MEMORY_LLM_API_KEY"
+	envLLMModel   = "MEMORY_LLM_MODEL"
+	envLLMTimeout = "MEMORY_LLM_TIMEOUT"
+)
+
+// readModelEnv 从环境变量读模型配置。
+//
+// 时长解析失败**保留原值与原因**（记在 TimeoutError），由调用方显式报出——
+// 不静默回落。理由见 ModelOptions.TimeoutError 的说明。
+func readModelEnv() ModelOptions {
+	m := ModelOptions{
+		BaseURL: os.Getenv(envLLMBaseURL),
+		APIKey:  os.Getenv(envLLMAPIKey),
+		Model:   os.Getenv(envLLMModel),
+	}
+	if t := os.Getenv(envLLMTimeout); t != "" {
+		d, err := time.ParseDuration(t)
+		switch {
+		case err != nil:
+			m.TimeoutError = fmt.Sprintf("%s=%q 不是合法的时长（如 30s / 5m）：%v",
+				envLLMTimeout, t, err)
+		case d <= 0:
+			m.TimeoutError = fmt.Sprintf("%s=%q 必须为正时长", envLLMTimeout, t)
+		default:
+			m.Timeout = d
+		}
+	}
+	return m
 }
 
 // Run 执行一条命令，返回进程退出码。
@@ -104,12 +169,16 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(rest); err != nil {
 		return 2
 	}
-	opt := Options{DB: *db, Namespace: *ns, Host: *host}
+	opt := Options{DB: *db, Namespace: *ns, Host: *host, Model: readModelEnv()}
 
 	switch cmd {
 	case "capture":
 		return cmdCapture(ctx, opt, stdout, stderr, *eventID, *sessionID, *threadID, *user,
 			*evType, *content, *explicit)
+	case "extract":
+		return cmdExtract(ctx, opt, stdout, stderr, *sessionID, *limit)
+	case "promote":
+		return cmdPromote(ctx, opt, stdout, stderr, *entityID, *limit)
 	case "recall":
 		query := fs.Arg(0)
 		if query == "" {
@@ -175,13 +244,15 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `memory — 长期记忆内核的命令行面
 
 用法:
-  memory capture --content "…" [--session S] [--thread T] [--user U] [--type T] [--explicit]
-  memory recall  <查询词> [--session S] [--thread T] [--limit N]
-  memory search  <查询词> [--limit N]
+  memory capture  --content "…" [--session S] [--thread T] [--user U] [--type T] [--explicit]
+  memory extract  [--session S] [--limit N]        从原始事件提炼候选（要模型）
+  memory promote  [--entity ID] [--limit N]        判定候选并落成事实（要模型）
+  memory recall   <查询词> [--session S] [--thread T] [--limit N]
+  memory search   <查询词> [--limit N]
   memory stats
-  memory export  --out <包路径>
-  memory import  --pkg <包路径>
-  memory doctor  --pkg <包路径>
+  memory export   --out <包路径>
+  memory import   --pkg <包路径>
+  memory doctor   --pkg <包路径>
 
 库管理面:
   memory gc [--before 720h]              按龄回收原始事件（默认保留 30 天）
@@ -197,17 +268,168 @@ func usage(w io.Writer) {
   --db <路径>        记忆库文件（默认 memory.sqlite）
   --namespace <名>   记忆库名（默认 default）
   --host <标识>      宿主标识（写进事件的来源）
+
+模型接入（extract / promote 需要；从环境变量读，密钥不进命令行）:
+  MEMORY_LLM_BASE_URL   端点根地址，如 http://127.0.0.1:8000/v1
+  MEMORY_LLM_API_KEY    密钥（可留空，表示端点不校验）
+  MEMORY_LLM_MODEL      模型名
+  MEMORY_LLM_TIMEOUT    单次请求超时（默认 60s）
 `)
+}
+
+// cmdExtract 从原始事件提炼候选。
+//
+// 提炼**不落库**（见 extractor.Extract 的契约）：候选先给调用方看，
+// 落库与否由调用方决定。这条纪律在 CLI 上也遵守——
+// 「提取出来的东西直接进库」会把模型的幻觉直接写进长期记忆。
+func cmdExtract(ctx context.Context, opt Options, stdout, stderr io.Writer,
+	sessionID string, limit int) int {
+
+	if !opt.Model.Configured() {
+		fmt.Fprintf(stderr, "extract 需要模型：请设置 %s 与 %s\n", envLLMBaseURL, envLLMModel)
+		return 2
+	}
+	if opt.Model.TimeoutError != "" {
+		// 配置写错了就说清楚，不让它静默回落成默认值。
+		fmt.Fprintln(stderr, "模型配置有误:", opt.Model.TimeoutError)
+		return 2
+	}
+	svc, st, err := open(ctx, opt)
+	if err != nil {
+		fmt.Fprintln(stderr, "打开失败:", err)
+		return 1
+	}
+	defer func() { _ = st.Close() }()
+
+	ns := store.Namespace(opt.Namespace)
+	evs, err := svc.Store().ListRaw(ctx, ns, time.Time{}, store.Page{Limit: limit})
+	if err != nil {
+		fmt.Fprintln(stderr, "读原始事件失败:", err)
+		return 1
+	}
+	if len(evs) == 0 {
+		fmt.Fprintln(stdout, "（没有原始事件，先 capture）")
+		return 0
+	}
+	cands, err := svc.Extract(ctx, ns, sessionID, evs)
+	if err != nil {
+		fmt.Fprintln(stderr, "提炼失败:", err)
+		return 1
+	}
+	// 候选要落库才能晋升（promotion.Promote 的契约：候选必须已在库里，
+	// 因为「候选落定」那一步要改候选状态，候选不在库里时整笔晋升会回滚）。
+	//
+	// 注意这与「提炼不落库」并不矛盾：那条纪律说的是**内核的提炼器**
+	// 不替调用方决定落库与否；而 CLI 是调用方，它在这里**看过结果后**
+	// 主动落库——落的是候选，不是事实。事实仍要经过 promote 的五道检查。
+	saved := 0
+	for _, c := range cands {
+		if err := svc.Store().SaveCandidate(ctx, ns, c); err != nil {
+			fmt.Fprintf(stderr, "存候选 %s 失败: %v\n", c.ID, err)
+			continue
+		}
+		saved++
+		fmt.Fprintf(stdout, "- [%s] %s\n", c.ID, c.Assertion)
+	}
+	// 报**实际存成功数**而不是提炼数：两者不等时（如存库失败），
+	// 报提炼数会让「库里存了几个」看不出来——而那正是下一步要用的事实。
+	fmt.Fprintf(stderr, "从 %d 条事件提炼出 %d 条候选，已存库 %d 条（用 promote 判定）\n",
+		len(evs), len(cands), saved)
+	return 0
+}
+
+// cmdPromote 判定候选并落成事实。
+func cmdPromote(ctx context.Context, opt Options, stdout, stderr io.Writer,
+	candidateID string, limit int) int {
+
+	if !opt.Model.Configured() {
+		fmt.Fprintf(stderr, "promote 需要模型：请设置 %s 与 %s\n", envLLMBaseURL, envLLMModel)
+		return 2
+	}
+	if opt.Model.TimeoutError != "" {
+		fmt.Fprintln(stderr, "模型配置有误:", opt.Model.TimeoutError)
+		return 2
+	}
+	svc, st, err := open(ctx, opt)
+	if err != nil {
+		fmt.Fprintln(stderr, "打开失败:", err)
+		return 1
+	}
+	defer func() { _ = st.Close() }()
+
+	ns := store.Namespace(opt.Namespace)
+	// 只判待判定的候选：已判过的再判一次会撞乐观锁
+	//（UpdateCandidateStatus 带 expected 防并发双判）。
+	cands, err := svc.Store().ListCandidates(ctx, ns, store.CandidateFilter{
+		Statuses: []types.CandidateStatus{types.CandidatePending},
+		Limit:    limit,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, "读候选失败:", err)
+		return 1
+	}
+	if len(cands) == 0 {
+		fmt.Fprintln(stdout, "（没有候选，先 extract）")
+		return 0
+	}
+	promoted := 0
+	for _, c := range cands {
+		if candidateID != "" && c.ID != candidateID {
+			continue
+		}
+		verdict, err := svc.Promote(ctx, ns, c)
+		if err != nil {
+			fmt.Fprintf(stderr, "判定 %s 失败: %v\n", c.ID, err)
+			continue
+		}
+		promoted++
+		fmt.Fprintf(stdout, "- [%s] %s → %s\n", c.ID, c.Assertion, verdict.Decision)
+	}
+	if promoted == 0 {
+		fmt.Fprintln(stderr, "没有候选被判定")
+		return 1
+	}
+	fmt.Fprintf(stderr, "判定 %d 条候选\n", promoted)
+	return 0
 }
 
 // open 打开记忆库并装配服务。
 //
-// 装配面**不注入模型**：CLI 是看与搬的口子，而记忆的提炼需要模型。
-// CLI 的定位是看与搬（捕获/召回/检索/导出导入），不是生成。
+// 模型是**按需注入**的：未配置模型时服务照常装配（未配置模型的端口是
+// ports.NoopLLM），只是要模型的命令会显式失败并说清原因。
+//
+// # 为什么模型从「一律不注入」改成「按需注入」
+//
+// 原先 CLI 一律不注入模型，理由是「CLI 是看与搬的口子，不是生成口」。
+// 这条理由在**搬**的那半边成立，在**看**的那半边不成立：
+//
+//   - 记忆的完整链路是「捕获 → 提炼 → 晋升 → 召回」，四步里前两步要模型。
+//     没有模型时，CLI 只能捕获、只能召回，而库里**永远不会长出事实卡**——
+//     recall 永远召回不到东西，而用户看到的是「（无召回）」，
+//     没有任何迹象表明「是缺模型」而不是「是没东西可记」。
+//     这是最贵的一种易用性缺口：**能力实现了却没有入口，且失败形态是静默的**。
+//   - 提早在装配期暴露：模型没配好时，第一次 extract 就报「未配置端点」，
+//     比在生产里发现「记了三个月什么都没记住」便宜三个数量级。
+//
+// 故改为按需注入：需要模型的动作显式要求配置，其余动作零影响。
 func open(ctx context.Context, opt Options) (*application.Service, *sqlite.Store, error) {
 	st, err := sqlite.OpenFile(opt.DB)
 	if err != nil {
 		return nil, nil, err
+	}
+	var model ports.LLM
+	if opt.Model.Configured() {
+		mc, err := llm.New(llm.Config{
+			BaseURL: opt.Model.BaseURL,
+			APIKey:  opt.Model.APIKey,
+			Model:   opt.Model.Model,
+			Timeout: opt.Model.Timeout,
+		})
+		if err != nil {
+			_ = st.Close()
+			return nil, nil, err
+		}
+		model = mc
 	}
 	svc, err := application.New(application.Config{
 		Namespace: store.Namespace(opt.Namespace),
@@ -217,6 +439,7 @@ func open(ctx context.Context, opt Options) (*application.Service, *sqlite.Store
 		Store:    st,
 		Redactor: ports.PatternRedactor{},
 		Bander:   ports.MemoryBand{},
+		LLM:      model,
 	})
 	if err != nil {
 		_ = st.Close()

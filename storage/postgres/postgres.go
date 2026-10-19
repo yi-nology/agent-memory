@@ -311,7 +311,7 @@ func ftsBody(parts ...string) string {
 // ftsQuery 把词元拼成 tsquery 的输入。
 //
 // 用 plainto_tsquery：它把词元合取（AND）起来，与 FTS5 的空格分词语义一致。
-// 词元里不含引号与运算符（store.LexicalTokens 只产出字母/数字/下划线/汉字），
+// 词元里不含引号与运算符（store.LexicalTokens 只产出字母/数字/汉字），
 // 故不需要转义——而这正是「查询串不再原样透传」换来的好处：
 // 任意用户输入都不会变成语法。
 func ftsQuery(tokens []string) string {

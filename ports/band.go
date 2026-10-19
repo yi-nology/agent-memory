@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
-	"unicode"
+
+	"github.com/oagentkit/textx/textutil"
 )
 
 // ErrNoEstimator 未注入计量器时的哨兵。
@@ -35,6 +36,15 @@ const (
 	CharsPerTokenASCII = 4
 )
 
+// estimatorRatio 本仓采用的折算系数。
+//
+// 系数写在这里（而不是直接用上游默认值）是为了让「本仓选了这一档」这件事
+// 在代码里看得见：上游的默认值是可改的，本仓的口径不该跟着漂。
+var estimatorRatio = textutil.CJKRatio{
+	CJKCharsPerToken:   CharsPerTokenCJK,
+	ASCIICharsPerToken: CharsPerTokenASCII,
+}
+
 // StaticEstimator 把文本按「CJK 每 2 字符 1 token、其余每 4 字符 1 token」
 // 折算成估算 token。
 //
@@ -50,32 +60,23 @@ const (
 type StaticEstimator struct{}
 
 // Estimate 静态估算。
-func (StaticEstimator) Estimate(_ context.Context, text string) (int, error) {
-	if text == "" {
-		return 0, nil
-	}
-	cjk, other := 0, 0
-	for _, r := range text {
-		if isCJK(r) {
-			cjk++
-			continue
-		}
-		other++
-	}
-	// 逐段向上取整：先合总再取整会让满额的两个桶各自少算半个 token，
-	// 八个桶累下来就是四个 token 的系统性低估。
-	n := (cjk + CharsPerTokenCJK - 1) / CharsPerTokenCJK
-	m := (other + CharsPerTokenASCII - 1) / CharsPerTokenASCII
-	return n + m, nil
-}
-
-// isCJK 判定是否为中日韩表意文字。
 //
-// 只认 CJK 统一表意文字这一段：假名/谚文在召回正文里占比很低，
-// 为它们单开分支会让这个函数在实测语料上无意义地变复杂。
-func isCJK(r rune) bool {
-	return unicode.Is(unicode.Han, r) ||
-		(r >= 0x4E00 && r <= 0x9FFF)
+// # 取整方向是**逐段**，不是合总
+//
+// 折算按「连续同类字符游程」切段，每段各自向上取整后求和。
+// 合总再取整（把全文的 CJK 算一个桶、其余算另一个桶，各取整一次）会把
+// 每段的零头一起吞掉——多段混合文本累加起来是**成规模的低估**，不是随机误差。
+// 实测口径：「中a中a中a中a」逐段是 8，合总是 3。
+//
+// 这条曾经写反过：注释写的是「逐段向上取整」，代码做的是合总再取整——
+// 而合总恰恰是那段注释在论证要避免的那一侧。低估的方向又恰好是静默的
+// （预算看着够，实际超了），所以这段注释与代码必须一起钉住。
+//
+// 算术走上游 textutil.EstTokensWithRounding：它是同一套口径的**单源**，
+// 且把「取整方向」做成了参数——两个口径是同一个问题的两个答案，
+// 分成两个函数只会逼调用方在两套命名之间猜。
+func (StaticEstimator) Estimate(_ context.Context, text string) (int, error) {
+	return textutil.EstTokensWithRounding(text, estimatorRatio, textutil.RoundingSegment), nil
 }
 
 // Bander 给不可信内容加身份标记的端口。

@@ -153,16 +153,44 @@ modules:
 
   - id: adapters-cli
     roots: [adapters/cli]
-    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall, pipeline-entity, lifecycle]
+    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall, pipeline-entity, lifecycle, adapters-llm]
     owner: memory
     managed: true
     notes: |
       命令行面。`Run(args, stdout, stderr) int` 而非 `main()`——命令逻辑因此
-      可被单测直接调用，不用起子进程。CLI **不注入模型**：它是管理口
-      （看与搬），不是生成口。
+      可被单测直接调用，不用起子进程。
       requires 里的 pipeline-entity 与 lifecycle 是库管理面的依赖：
       实体归一的修正（合并 / 登记别名）与生命周期四动作（回收 / 合并 /
       保留期 / 物理整理）在内核里实现了却没有入口时，既不会被用也不会被验证。
+      adapters-llm 是**按需**依赖：只有要模型的子命令（extract/promote）才装配它，
+      未配置模型时其余命令零影响。
+
+  - id: adapters-llm
+    roots: [adapters/llm]
+    requires: [ports]
+    owner: memory
+    managed: true
+    notes: |
+      面向 OpenAI 兼容端点的模型适配器，让 ports.LLM 端口**开箱可用**。
+
+      为什么有这一层：ports 段只声明协议不含实现（刻意如此——核心不绑死 SDK），
+      但 ports.LLM 只有一个 Complete 方法，形状极其简单，
+      于是每个宿主都要**重写一遍**同样的东西：拼请求体、解析响应、判错误码、
+      算超时、处理 JSON 模式。这正是「各仓都要重写一遍且边界易错」的那类轮子——
+      错误码判错会静默把失败当成功。
+
+      **纯标准库，不引 SDK**：本仓的零第三方依赖纪律覆盖 adapters 段。
+      这条纪律不是为了洁癖：核心一旦引了 SDK，「没有模型时手工写入 +
+      词法召回必须能跑」这条降级路径就没了——而它塌了之后不会立刻暴露，
+      它塌在「用户配了模型、装了数据库」的生产环境里。
+      OpenAI 兼容协议本身足够简单，net/http + encoding/json 就能覆盖，
+      且比引 SDK 更可控：SDK 会带来自己的重试/超时/日志语义，
+      而本包的行为是**逐行可查**的。
+      也不引 oagentkit/llm：那是 eino 重仓，会把「非 eino 生态的宿主」挡在门外，
+      而本仓的定位恰恰是**宿主无关**。
+
+      它是**可替换的适配器**，不是核心的一部分：宿主若已有 SDK 客户端，
+      照旧实现自己的 ports.LLM 即可，本包不用。
 
   - id: cmd-memory
     roots: [cmd]
@@ -318,11 +346,13 @@ rules:
       - path: github.com/oekit/pkg
         reason: |
           纯 stdlib 微工具集（go.mod require 段为空，不引任何第三方）。
-          本仓用到三处：时间段的期初边界（timex，替掉手写的日/周/月墙钟算术）、
+          本仓用到四处：时间段的期初边界（timex，替掉手写的日/周/月墙钟算术）、
           泛型集合（container，替掉两处重复的保序去重与两处手写已见集合）、
-          摘要入口（encoding，替掉两处手写 sha256+hex）。
-          三者都是「各仓都要重写一遍」且**边界易错**（大小月、闰年、周起始日）
-          的轮子，自研副本的漂移成本高于引用成本。
+          摘要入口（encoding，替掉两处手写 sha256+hex）、
+          形态脱敏遮蔽器（stringx.Masker，替掉本仓自研的掩码实现——
+          自研那版的掩码主体长度等于原值长度，是长度泄露）。
+          四者都是「各仓都要重写一遍」且**边界易错**（大小月、闰年、周起始日、
+          掩码保留位与短值边界）的轮子，自研副本的漂移成本高于引用成本。
         until: 2027-10-19
         removal: |
           该模块停更、出现不可接受的破坏性变更，或本仓自研出等价实现且
@@ -330,12 +360,18 @@ rules:
 
       - path: github.com/oagentkit/textx
         reason: |
-          纯 stdlib（仅依赖 oekit/pkg）。用到 textutil 的代码围栏剥离：
-          模型输出常带 ``` 围栏，本仓在提炼面与页面重生成面各手写了一份，
-          而围栏形态（语言标记、闭合缺失、散文夹带）边界多。
+          纯 stdlib（仅依赖 oekit/pkg）。用到 textutil 的三处：
+          一、代码围栏剥离——模型输出常带 ``` 围栏，本仓在提炼面与页面重生成面
+          各手写了一份，而围栏形态（语言标记、闭合缺失、散文夹带）边界多；
+          二、检索词元切分（Tokens）——汉字逐字成词元是中文子串检索能用的关键，
+          本仓两个后端（SQLite FTS5 / PostgreSQL tsvector）必须同一套切法，
+          而切法规则由上游单源给出，本仓在 store 层钉住一处；
+          三、token 折算（EstTokensWithRounding）——取整方向是**参数**
+          （逐段 vs 合总），本仓选逐段档：合总会把每段的零头一起吞掉，
+          在混合文本上是成规模的**低估**，而低估在预算场景里是静默的那一侧。
         until: 2027-10-19
         removal: |
-          该模块停更，或本仓两处围栏处理都改走别的单源时移除。
+          该模块停更，或本仓三处都改走别的单源时移除。
 
       - path: github.com/oagentkit/guardx/logredact
         reason: |
@@ -345,8 +381,13 @@ rules:
           漏报的代价是轮换都来不及。该包是上游单源，抄一份会立刻变成双源漂移。
         until: 2027-10-19
         removal: |
-          上游提供可组合/可扩展的规则表（见已提 issue）后改用组合式接入，
-          或本仓自研补齐那四类形态。
+          上游 v0.6.0 已落地可组合/可扩展的规则表（Rules / RedactWith /
+          NewRedactor），组合式入口已具备。届时若本仓需要把宿主自定义规则并进
+          同一张表（而不是「本仓形态标签档 + 上游互补档」两层串联），
+          改用组合式接入；在此之前保留两层串联——
+          上游规则表是**无形态标签**的（`Authorization=****` 那种），
+          而本仓需要「形态标签进掩码供审计读」这一档，两者形态不同，
+          合成一张表会丢掉形态标签。
         paths: ["ports"]
 
 thresholds:

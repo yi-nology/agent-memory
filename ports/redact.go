@@ -3,11 +3,12 @@ package ports
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"regexp"
-	"strings"
 
 	"github.com/oagentkit/guardx/logredact"
+	"github.com/oekit/pkg/stringx"
 )
 
 // ErrNoRedactor 未注入脱敏器时的哨兵。
@@ -76,20 +77,33 @@ type Redactor interface {
 // 后果不是泄漏（明文照样没了），而是**审计失真**：读掩码的人看到的是
 // 「secret-assignment」，而实际被打码的是 URL 里的凭据——
 // 形态标签说的和事实不是一回事。故类型名一律避开键名表。
+//
+// # minLen 是**安全地板**，不是注释
+//
+// 上游 stringx.Masker 的 Keep 档在「匹配长度 ≤ 2*Keep」时，头尾两段保留位
+// 会拼回**完整原文**（头 Keep 个 + 尾 Keep 个，恰好覆盖整段），而掩码主体
+// `****` 只是插在中间的装饰。同一形态在 guardx/logredact 的 MaskHint 上
+// 没有这个问题（它按 HintMinLenRatio=4 要求长度 ≥ keep*4 才留线索）。
+//
+// 故凡 keep>0 的规则都必须声明自己的命中长度地板 minLen，且
+// **minLen ≥ 4*keep**（留 8 藏 1 等于没藏）。这条不变量在构造期校验，
+// 不满足直接 panic——它一旦破了，暴露出去的是凭据明文。
 var structuralPatterns = []struct {
 	name string
 	re   *regexp.Regexp
-	keep int // 保留前后各几个字符作为定位线索
+	keep int // 保留前后各几个字符作为定位线索（封顶）
+	// minLen 该规则命中的最小长度。keep>0 时必填，且须满足 minLen ≥ 4*keep。
+	minLen int
 }{
 	// URL 里内嵌的凭据：https://user:pass@host
 	// 类型名用 userinfo（凭据所在的 URL 部位）而不用 credential——后者在键名表里。
-	{"url-userinfo", regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@`), 0},
+	{"url-userinfo", regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@`), 0, 0},
 	// key=value / key: value 形态的敏感赋值。键名只收通用词。
-	{"secret-assignment", regexp.MustCompile(`(?i)\b(token|password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential)\b\s*[=:]\s*"?([^\s"',;]{4,})"?`), 0},
+	{"secret-assignment", regexp.MustCompile(`(?i)\b(token|password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential)\b\s*[=:]\s*"?([^\s"',;]{4,})"?`), 0, 0},
 	// 裸长十六进制串（≥32 位）：密钥/令牌的典型形态
-	{"long-hex", regexp.MustCompile(`\b[0-9a-fA-F]{32,}\b`), 4},
+	{"long-hex", regexp.MustCompile(`\b[0-9a-fA-F]{32,}\b`), 4, 32},
 	// 私钥块
-	{"private-key-block", regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`), 0},
+	{"private-key-block", regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`), 0, 0},
 	// 已知凭据前缀族：形态确定、零误伤，且这一类**一旦落库即不可逆**。
 	//
 	// 这一条是被用例逼出来的：初版只收 key=value 与 AWS 前缀，于是
@@ -97,7 +111,34 @@ var structuralPatterns = []struct {
 	// 最常见的一种。兵底漏掉不可逆的那一类，兵底就没有意义。
 	{"known-token-prefix", regexp.MustCompile(
 		`\b(ghp_|gho_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-|xoxa-|` +
-			`sk-|sk_live_|sk_test_|AKIA|ASIA|AIza)[A-Za-z0-9_\-]{16,}\b`), 0},
+			`sk-|sk_live_|sk_test_|AKIA|ASIA|AIza)[A-Za-z0-9_\-]{16,}\b`), 0, 0},
+}
+
+// structuralMasker 本仓形态规则表的遮蔽器。
+//
+// 构造一次、全局复用：规则表是编译期常量，每次处置重建只会把正则编译
+// 成本乘到每条事件上，而脱敏在捕获面是**逐条**跑的。
+var structuralMasker = mustNewStructuralMasker()
+
+// mustNewStructuralMasker 构造遮蔽器，并把安全不变量卡在构造期。
+//
+// 构造期就炸，而不是等某条短凭据真的落库：这条不变量破了，漏出去的是明文。
+func mustNewStructuralMasker() *stringx.Masker {
+	rules := make([]stringx.Rule, 0, len(structuralPatterns))
+	for _, p := range structuralPatterns {
+		if p.keep > 0 && p.minLen < 4*p.keep {
+			panic(fmt.Sprintf("ports: 规则 %q 的 keep=%d 要求命中长度地板 ≥ %d，实际声明 %d",
+				p.name, p.keep, 4*p.keep, p.minLen))
+		}
+		rules = append(rules, stringx.Rule{Name: p.name, Re: p.re, Keep: p.keep})
+	}
+	m, err := stringx.NewMasker(rules)
+	if err != nil {
+		// 规则表是编译期常量，构造失败只可能是表本身写错了——那必须在
+		// 进程启动时就炸，不该等到第一条事件进来才暴露。
+		panic(fmt.Sprintf("ports: 形态规则表构造失败: %v", err))
+	}
+	return m
 }
 
 // PatternRedactor 结构性敏感信息的兵底处置。
@@ -138,46 +179,41 @@ var structuralPatterns = []struct {
 //     本仓在前，已知前缀族（ghp_ / sk- / AKIA …）由本仓掩掉并留下线索；
 //     若上游在前，这几族会先被抹成 `****`，定位能力就此丢失。
 //
-// 代价：两种掩码风格会同时出现在一段文本里（`«secret-assignment:***»` 与
+// # 本仓这一道用上游 stringx.Masker，不自研
+//
+// 自研的那版把「被掩掉多少字符」直接写成等长的星号串，于是
+// **掩码长度 = 原值长度**——凭据多长，掩码就多长，攻击者据此知道原值长度，
+// 而注释里「不可复原」的承诺只兑现了一半（复原不了，但长度泄了）。
+//
+// 换成 stringx.Masker 后有三条性质是自研版给不了的：
+//
+//  1. 掩码主体恒为 `****`，长度固定，不随原值变化 → 长度不泄露；
+//  2. **单次扫描合并**（起点最左 → 长度最长 → 注册顺序最前），替换结果
+//     不再参与匹配 → 规则之间不会自污染（自研版逐条顺序替换，规则 N 的
+//     输出可能被规则 N+1 再处理一次）；
+//  3. 保留位数是**封顶**语义：保留的字符总数与原值长度无关。
+//
+// 代价：上游那个 Keep 档在短值上会把原文拼回来（见 structuralPatterns 的
+// minLen 说明），故带保留位的规则必须声明长度地板，构造期卡死。
+//
+// 代价二：两种掩码风格会同时出现在一段文本里（`«secret-assignment:****»` 与
 // `Authorization=****`）。这是刻意的取舍——收录标准第三条说「漏报代价不可逆」，
 // 而定位线索只是「少几个字符就能补」的那一档。
 type PatternRedactor struct{}
 
 // Redact 逐条形态匹配并替换。
 //
-// 先跑本仓的 5 条形态规则，再跑上游 guardx/logredact 的规则表（取并集）。
-// 顺序理由见 PatternRedactor 的类型注释。
+// 先跑本仓的 5 条形态规则（stringx.Masker），再跑上游 guardx/logredact
+// 的规则表（取并集）。顺序理由见 PatternRedactor 的类型注释。
 func (PatternRedactor) Redact(_ context.Context, req RedactRequest) (string, error) {
-	out := req.Text
-	for _, p := range structuralPatterns {
-		out = p.re.ReplaceAllStringFunc(out, func(m string) string {
-			return maskMatch(p.name, m, p.keep)
-		})
-	}
-	return logredact.Redact(out), nil
+	return logredact.Redact(structuralMasker.Mask(req.Text)), nil
 }
 
-// maskMatch 把一处命中替换成可定位但不可复原的掩码。
+// maskPlaceholder 是掩码主体。
 //
-// 保留首尾少量字符是刻意的：全量打码会让处置后的文本失去定位能力，
-// 用户问「我那条凭据呢」时没人能指出是哪一条；而掩码必须**不可复原**——
-// 所以保留位数一律封顶 4，不随原值长度变化。
-func maskMatch(kind, match string, keep int) string {
-	r := []rune(match)
-	if len(r) <= keep*2+1 {
-		return "«" + kind + ":" + mask(len(r)) + "»"
-	}
-	head := string(r[:keep])
-	tail := string(r[len(r)-keep:])
-	return head + "«" + kind + ":" + mask(len(r)-keep*2) + "»" + tail
-}
-
-func mask(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	return strings.Repeat("*", n)
-}
+// 恒为固定长度。掩码的长度**不得随原值长度变化**——那不是「保守一点」的
+// 风格问题，是长度泄露：凭据多长，掩码就多长。
+const maskPlaceholder = "****"
 
 // RedactionApplied 判断处置是否发生过。
 //
@@ -198,6 +234,6 @@ func SanitizeURLUserinfo(raw string) string {
 	if _, hasPass := u.User.Password(); !hasPass {
 		return raw
 	}
-	u.User = url.UserPassword(u.User.Username(), mask(8))
+	u.User = url.UserPassword(u.User.Username(), maskPlaceholder)
 	return u.String()
 }

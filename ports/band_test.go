@@ -108,3 +108,39 @@ func TestStaticEstimatorLanguageRatios(t *testing.T) {
 		t.Fatalf("同长 CJK 应比拉丁贵（每 2 字符 vs 每 4 字符）：%d vs %d", cjk, lat)
 	}
 }
+
+// 取整方向必须是**逐段**，不是合总。
+//
+// 这条曾经被写反过：注释写「逐段向上取整」，代码做的是合总再取整——
+// 而合总恰恰是那段注释在论证要避免的那一侧（每段的零头被一起吞掉，
+// 多段混合文本累加起来是成规模的低估）。
+//
+// 判据用交替串：交替串是两种口径差得最开的地方（「中a中a中a中a」逐段 8、
+// 合总 3）。用纯中文或纯英文测不出这个差别——那两种串两种口径同值。
+//
+// 方向性也在这里：低估是**静默**的那一侧（预算看着够，实际超了，
+// 挤掉的是靠后的内容，没人察觉），故必须钉死。
+func TestStaticEstimatorRoundingIsPerSegment(t *testing.T) {
+	e := StaticEstimator{}
+	const alt = "中a中a中a中a"
+	got, err := e.Estimate(t.Context(), alt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 8 段各 1 字符：CJK 段 ceil(1/2)=1，ASCII 段 ceil(1/4)=1，逐段共 8。
+	if got != 8 {
+		t.Fatalf("交替串必须按逐段口径折算（期望 8，合总口径会得 3）: 实得 %d", got)
+	}
+	// 逐段不得小于合总：逐段只会多算，不会少算。
+	total, err := e.Estimate(t.Context(), "中文abcdefgh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seg, err := e.Estimate(t.Context(), "中a中a中a中a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seg < total {
+		t.Fatalf("逐段口径不得低于合总口径（逐段只多不少）: %d < %d", seg, total)
+	}
+}

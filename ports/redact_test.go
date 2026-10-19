@@ -155,3 +155,52 @@ func TestRedactorKeepsClueOnLongHex(t *testing.T) {
 		t.Fatalf("掩码应保留首部定位线索: %q", out)
 	}
 }
+
+// 掩码**长度不得泄露原值长度**。
+//
+// 这条是被自己的实现撞出来的：自研那版把「被掩掉多少字符」直接写成等长的
+// 星号串，于是掩码长度 = 原值长度——凭据 16 位是 16 个星，36 位是 36 个星。
+// 攻击者据此知道原值长度，而注释里「不可复原」的承诺只兑现了一半
+// （复原不了，但长度泄了）。
+//
+// 判据用**不同长度的同形态输入产出等长掩码**来表达，而不是数星号个数：
+// 数星号会把「掩码主体固定」与「定位线索按原值长度变化」两件事混在一起。
+func TestRedactorMaskLengthDoesNotLeak(t *testing.T) {
+	short := redact(t, "token=abcdefghij")
+	long := redact(t, "token=abcdefghijklmnopqrstuvwxyz0123456789")
+	if len([]rune(short)) != len([]rune(long)) {
+		t.Fatalf("同形态不同长度的原值必须产出等长掩码（否则长度泄露）:\n短: %q\n长: %q", short, long)
+	}
+	if strings.Contains(short, "abcdefghij") || strings.Contains(long, "abcdefghij") {
+		t.Fatalf("凭据明文不许残留:\n短: %q\n长: %q", short, long)
+	}
+}
+
+// 带保留位的规则必须有**命中长度地板**，否则短凭据会被完整暴露。
+//
+// 上游 stringx.Masker 的 Keep 档在「匹配长度 ≤ 2*Keep」时，头尾两段保留位
+// 恰好拼回完整原文（掩码主体只是插在中间的装饰）——这是上游已知缺陷，
+// 本仓的规避手段是：凡 keep>0 的规则必须声明 minLen ≥ 4*keep，构造期校验。
+//
+// 这条用例钉住「声明的 minLen 与正则的真实下限一致」：改正则的量词而忘了
+// 改 minLen，或反过来，都会在这里露出来。
+func TestRedactorKeepRuleLengthFloor(t *testing.T) {
+	// long-hex 的正则是 {32,}：31 位不命中，32 位命中。
+	short31 := strings.Repeat("a", 31)
+	if out := redact(t, "句柄 "+short31+" 记一下"); out != "句柄 "+short31+" 记一下" {
+		t.Fatalf("31 位十六进制不该被命中（低于声明的长度地板 32）: %q", out)
+	}
+	long32 := strings.Repeat("a", 32)
+	out := redact(t, "句柄 "+long32+" 记一下")
+	if !strings.Contains(out, "long-hex") {
+		t.Fatalf("32 位十六进制应被命中: %q", out)
+	}
+	// 命中之后，原值不得整体出现在结果里（保留位只留首尾各 4）。
+	if strings.Contains(out, long32) {
+		t.Fatalf("掩码后原值整体残留: %q", out)
+	}
+	// 保留位合计必须显著少于原值：留 8 藏 1 等于没藏。
+	if kept := len(out) - len("句柄  记一下"); kept >= len(long32) {
+		t.Fatalf("保留位过多，等于没藏: %q", out)
+	}
+}

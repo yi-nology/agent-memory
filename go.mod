@@ -38,9 +38,9 @@ go 1.27
 // 故**转义**归本仓自己所有；guardx 现在只被用在凭据脱敏规则表上。
 require (
 	github.com/lib/pq v1.10.9
-	github.com/oagentkit/guardx v0.5.0
-	github.com/oagentkit/textx v0.5.0
-	github.com/oekit/pkg v0.15.1
+	github.com/oagentkit/guardx v0.8.0
+	github.com/oagentkit/textx v0.6.0
+	github.com/oekit/pkg v0.16.0
 	modernc.org/sqlite v1.40.1
 )
 

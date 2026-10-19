@@ -268,7 +268,7 @@ func (s *rawStore) rawByIDsOrdered(ctx context.Context, ns store.Namespace, ids 
 //
 // 查询串**先在 Go 侧切成词元**（store.LexicalTokens），再用 plainto_tsquery 合取：
 // 与 FTS5 的空格分词语义一致（隐式 AND），且任意用户输入都不会变成语法
-// （词元里只有字母/数字/下划线/汉字）。
+// （词元里只有字母/数字/汉字）。
 func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int) ([]string, error) {
 	tokens := store.LexicalTokens(query)
 	if len(tokens) == 0 {

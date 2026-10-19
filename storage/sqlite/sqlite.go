@@ -342,20 +342,23 @@ func ftsBody(parts ...string) string {
 	return strings.Join(store.LexicalTokens(strings.Join(out, " ")), " ")
 }
 
-// ftsQuery 把词元拼成 FTS5 查询串。
+// ftsQuery 把查询串拼成 FTS5 的 MATCH 串。
 //
-// 每个词元都加引号：FTS5 的 AND/OR/NOT/NEAR 是**大写**关键字，
-// 裸词元撞上它们会被当成运算符——于是「查 AND」要么语法错误，
-// 要么语义翻转成「不含某词」。加引号后词元只当字面量。
+// 走上游 textutil.FTS5Query（经 store.FTS5Query 钉子）：它把查询串切成词元后
+// **逐个加引号**再空格连接。
 //
-// 词元里不含引号本身（store.LexicalTokens 只产出字母/数字/下划线/汉字），
-// 故不需要转义。
-func ftsQuery(tokens []string) string {
-	parts := make([]string, 0, len(tokens))
-	for _, t := range tokens {
-		parts = append(parts, `"`+t+`"`)
-	}
-	return strings.Join(parts, " ")
+// 加引号是**安全边界**，不是装饰：FTS5 的 AND / OR / NOT / NEAR 是裸词才生效的
+// 运算符，用户输入里的 NOT 会被当成「排除后面那个词」而不是「查 NOT 这个词」；
+// 引号把它降回字面量，引号同样能让 `"`、`*`、`(` 之类不构成语法错误。
+//
+// 切不出词元时返回空串——空 MATCH 是 FTS5 的语法错误，调用方据此跳过查询
+// 而不是把空串拼上去。
+//
+// 走 store.FTS5Query 而非直接调上游：查询侧与索引侧（ftsBody → store.LexicalTokens）
+// 必须在**同一处**吸收上游切法变化，否则两侧口径分叉 → 静默漏命中。
+// 详见 store.FTS5Query 的注释。
+func ftsQuery(query string) string {
+	return store.FTS5Query(query)
 }
 
 // refCol 取 FTS 虚表的引用列名。
@@ -396,20 +399,20 @@ func (s *Store) indexDelete(ctx context.Context, table, namespace, ref string) e
 
 // searchFTS 走 FTS5 检索，返回按相关度排序的标识。
 //
-// 查询串直接透传 FTS5 的 MATCH 语法（支持 "精确短语" / AND / OR / 前缀 *）。
-// 这也是一处**注入面**：调用方若把用户原文直接拼进 MATCH，查询里的引号与
-// 运算符会被当成语法。转义由调用方（pipeline/recall）负责——本层无法区分
-// 「用户想按语法检索」与「用户输入恰好含语法」。
+// 查询串**不透传** FTS5 的 MATCH 语法（不支持 "精确短语" / AND / OR / 前缀 *）：
+// 用户原文直接拼进 MATCH 就是一处注入面——查询里的引号与运算符会被当成语法。
+// 本层无法区分「用户想按语法检索」与「用户输入恰好含语法」，故一律按字面量
+// 处理：切词 + 逐词加引号（见 ftsQuery）。
 func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int) ([]string, error) {
-	tokens := store.LexicalTokens(query)
-	if len(tokens) == 0 {
+	match := ftsQuery(query)
+	if match == "" {
 		// 查询里没有可检索的词元（全是标点/空白）：不是错误，是「没得可查」。
 		return nil, nil
 	}
 	rows, err := s.query(ctx,
 		`SELECT `+refCol(table)+` FROM `+table+`
 		 WHERE namespace = ? AND `+table+` MATCH ? ORDER BY rank LIMIT ?`,
-		namespace, ftsQuery(tokens), limitOf(limit, 10))
+		namespace, match, limitOf(limit, 10))
 	if err != nil {
 		// MATCH 语法错误不该炸掉整条召回路径——退回空结果，让上层决定要不要兜底。
 		//

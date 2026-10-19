@@ -1,8 +1,7 @@
 package store
 
 import (
-	"strings"
-	"unicode"
+	"github.com/oagentkit/textx/textutil"
 )
 
 // LexicalTokens 把查询串与可检索正文切成同一套词元。
@@ -24,69 +23,57 @@ import (
 // 而「同一批记忆换个部署形态，召回结果不该变」是本仓的产品承诺
 // （见 storage/parity 的存在理由）。规则落在这里，两个后端都依赖它，漂移无处发生。
 //
+// # 切法本身走上游，本包是**契约钉子**
+//
+// 切词规则由 oagentkit/textx 的 textutil.Tokens 给出——汉字/假名/谚文逐字成词元，
+// 拉丁与数字按空白与标点切词，**只产出裸词元**（标点、运算符、引号一律丢弃，
+// 故任意用户输入都不会造成检索语法错误，更不会被当成 NOT 条件）。
+//
+// 本包保留一层薄封装而不是让各处直接 import 上游，理由是**把上游口径钉在
+// 一处**：上游改了切法（例如新增一种表意文字），本仓在这一处吸收并复核，
+// 而不是四个调用点各自跟着变、变出一条没人发现的检索行为漂移。
+//
 // # 语义边界（写清楚，免得被当成连续子串匹配）
 //
 //   - 切出来的是**词的合取**，不是连续子串：
 //     「长期偏」能命中「磁盘长期偏小」，即便三者不连成一片。
 //   - 英文按空白与标点切词，原样保留大小写
 //     （英文分词本就是 FTS5 的强项，不要动它）。
-//   - 只产出**裸词元**：字母、数字、下划线与汉字。标点、运算符、引号一律丢弃，
-//     故任意用户输入都不会造成检索语法错误，更不会被当成 NOT 条件。
-//     代价是**不支持短语检索**（`"disk is"` 会被当成两个词的合取）。
+//   - **不支持短语检索**（`"disk is"` 会被当成两个词的合取）。
+//
+// # 下划线是分隔符，与 FTS5 的实际切法一致
+//
+// 本包早先的一版把下划线当**词内字符**（`api_key` 切成一个词元）。
+// 那与索引侧的真实分词器对不上：FTS5 的 unicode61 只把字母与数字当词元字符，
+// 下划线是分隔符，于是索引里 `api_key` 实际存成 `api` + `key` 两个词元，
+// 而 Go 侧却产出一个 `api_key`——两侧口径不一致。
+//
+// 之所以一直没出事：FTS5 对加引号的查询串会**重新分词**，
+// `"api_key"` 在匹配阶段又被切成 `api` + `key`，于是照样命中。
+// 但那是「碰巧对」：口径不一致这件事本身是隐患（一旦 FTS5 的分词行为变化，
+// 或查询侧改成不复用索引侧切法，就会变成静默漏命中）。故统一成两侧一致。
 func LexicalTokens(s string) []string {
-	var out []string
-	var word strings.Builder
-	flush := func() {
-		if word.Len() > 0 {
-			out = append(out, word.String())
-			word.Reset()
-		}
-	}
-	for _, r := range s {
-		switch {
-		case isCJKRune(r):
-			// 汉字逐字成词元。
-			flush()
-			out = append(out, string(r))
-		case isWordRune(r):
-			word.WriteRune(r)
-		default:
-			// 标点与空白是切分点，也顺带把运算符与引号清掉了。
-			flush()
-		}
-	}
-	flush()
-	return out
+	return textutil.Tokens(s)
 }
 
-// isCJKRune 判定是否为需要逐字切分的表意文字。
+// FTS5Query 把查询串拼成 FTS5 的 MATCH 串。
 //
-// 范围覆盖：CJK 统一表意文字、扩展 A、兼容表意文字、假名、谚文。
-// 不含日文假名与谚文之外的其它文字（如西里尔、阿拉伯）——
-// 那些文字本身以空格分词，交给 FTS5 的 unicode61 处理即可。
-func isCJKRune(r rune) bool {
-	switch {
-	case r >= 0x3400 && r <= 0x4DBF: // CJK 扩展 A
-		return true
-	case r >= 0x4E00 && r <= 0x9FFF: // CJK 统一表意文字
-		return true
-	case r >= 0xF900 && r <= 0xFAFF: // CJK 兼容表意文字
-		return true
-	case r >= 0x3040 && r <= 0x30FF: // 假名
-		return true
-	case r >= 0xAC00 && r <= 0xD7AF: // 谚文音节
-		return true
-	}
-	return false
-}
-
-// isWordRune 判定是否属于「词内字符」。
+// # 为什么查询侧也要有钉子（2026-10-20 实弹）
 //
-// 用 unicode 包而不是 ASCII 判定：拉丁字母带重音的形态、
-// 西里尔文、希腊文都该算词内字符，它们按空格分词，FTS5 处理得很好。
-func isWordRune(r rune) bool {
-	if r == '_' {
-		return true
-	}
-	return unicode.IsLetter(r) || unicode.IsDigit(r)
+// 索引侧（ftsBody）走 LexicalTokens 钉子，查询侧若直接调上游 textutil.FTS5Query，
+// 就成了**第二个上游入口**，不在钉子下。
+//
+// 今天两者行为一致（上游 FTS5Query 内部也走 Tokens），所以不是当下的错。
+// 但上游一旦改 FTS5Query 的切法（加短语支持、调下划线处理等），
+// 会出现「索引侧仍走 Tokens、查询侧走新口径」→ 两侧分叉 → **静默漏命中**：
+// 用户看到的是「明明记过却查不到」，而排查方向会完全跑偏（去查数据、去查权限）。
+//
+// AGENTS.md 写的「上游改切法时在 LexicalTokens 这一处吸收并复核」这个动作，
+// 若查询侧绕过钉子，就**漏掉了这个入口**——故把它一并收进单源。
+//
+// 语义边界与 LexicalTokens 相同：词元逐个加引号（降回字面量，
+// 防止用户输入里的 AND/OR/NOT/NEAR 被当成运算符），空格连接即隐式 AND。
+// 切不出词元时返回空串——空 MATCH 是 FTS5 的语法错误，调用方据此跳过查询。
+func FTS5Query(s string) string {
+	return textutil.FTS5Query(s)
 }
