@@ -204,3 +204,59 @@ func TestRedactorKeepRuleLengthFloor(t *testing.T) {
 		t.Fatalf("保留位过多，等于没藏: %q", out)
 	}
 }
+
+// 长度地板必须在**运行期按实际命中长度**生效（2026-10-20 实弹补）。
+//
+// # 这条用例钉的是什么
+//
+// 原先的「声明 minLen + 构造期校验」是**拿声明比声明**：
+//   - minLen 从未传进下游（上游 stringx.Rule 只有 Name/Re/Keep 三个字段，
+//     没有 MinLen），运行期零作用；
+//   - 构造期校验的只是「声明值够不够」，不是「正则的真实下限」。
+//
+// 真正保护秘密的物理量是**实际命中长度**——它只有运行期按实际匹配值才知道。
+//
+// 失效形态（一个人「为了多抓一点」的常见小改）：
+// 把 long-hex 的量词从 {32,} 改成 {8,}，声明的 minLen 仍是 32（构造期不炸），
+// 但 8 位密钥会被掩成 `0123«long-hex:****»4567`——**完整可复原**。
+//
+// # 断言必须挑「两种情形结果不同」的输入
+//
+// 不能拿「查不到东西」当断言——那分不清「有地板」与「没地板」。
+// 这里断言的是**可复原性**：把掩码里的形态标签剥掉、把保留位拼回去，
+// 若能还原出原值，就是泄露。这条断言在「有地板」时红（短值被全量打码，
+// 拼不回），在「没地板」时绿（拼得回）——**能区分**。
+func TestRedactorShortHitIsFullyMasked(t *testing.T) {
+	// 8 位十六进制：低于 long-hex 当前量词 {32,}，故不命中——
+	// 但它正是「量词被改短」之后的形态。用例直接构造这个场景。
+	short := "01234567"
+
+	// 直接验证运行期地板的行为：构造一条 keep>0、量词放宽的规则，
+	// 走同一条 maskStructural 路径。
+	out := redactWithShortHit(t, short)
+	if strings.Contains(out, short) {
+		t.Fatalf("短命中被完整暴露: %q", out)
+	}
+	// 复原检测：把形态标签与分隔符剥掉，看能不能拼回原值。
+	reconstructed := stripMask(out)
+	if reconstructed == short {
+		t.Fatalf("短命中可被复原（长度地板未在运行期生效）: 掩码=%q 复原=%q", out, reconstructed)
+	}
+	// 地板生效时，短命中应被**全量**打码（无保留位）——
+	// 掩码里不应出现形态标签（标签会暴露是哪条规则命中）。
+	if strings.Contains(out, "long-hex") {
+		t.Fatalf("短命中应走全量打码（无形态标签），实际: %q", out)
+	}
+}
+
+// 命中长度**够**时，仍应保留定位线索（地板不能把有用信息也抹掉）。
+func TestRedactorLongHitKeepsLocator(t *testing.T) {
+	long := strings.Repeat("a", 32)
+	out := redact(t, "句柄 "+long+" 记一下")
+	if !strings.Contains(out, "long-hex") {
+		t.Fatalf("长命中应带形态标签: %q", out)
+	}
+	if strings.Contains(out, long) {
+		t.Fatalf("长命中原值整体残留: %q", out)
+	}
+}
