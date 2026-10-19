@@ -288,6 +288,32 @@ band；拿它守 `<memory-context>` 时，一句 `</memory-context>` 原样穿�
 | **M6** | lifecycle（gc/consolidate/vacuum/retention）+ provenance 排除运行期错误 | provenance 只看结构化来源，不含意图关键词黑名单 |
 | **M7** | 扁鹊切流：`subject_kind` → Entity 投影 + `repo_memory` → `store` 适配层（**留门面保调用点**） | 扁鹊全量 test + e2e 绿 |
 
+### 6.1 M7 的实际拆法（2026-10-19 落地）
+
+M7 拆成两刀，因为**召回切流是面向生产 prompt 的行为面变更**，与「接缝铺好」
+不是同一件事：
+
+| 刀 | 内容 | 状态 |
+|---|---|---|
+| **M7-b1** | ① 本仓发版 v0.1.0（宿主按版本号引入，零本地 replace）；② 宿主新增实体表/别名表 + `subject_kind`→Entity 投影（标识**派生**非自增，可跨宿主重算）；③ 宿主 GORM 记忆面实现内核 `store.AtomStore` + `store.MetaStore` + `pipeline/entity.Store` 三片契约；④ 四条写入路径挂实体投影；⑤ 架构门禁加两条规则锁「内核依赖只经适配层进入」 | ✅ 宿主仓已落地 |
+| **M7-b2** | 扁鹊召回改走内核 `pipeline/recall` 八段链 | ⏳ 未做：内核的 `recall.Reader` 要 5 个方法，其中 `ListRaw` / `GetEntityPage` / 活跃实体栈三片**宿主当前没有对应表**；且内核召回的片段是**已包裹**的（bander），换过去会改注入 prompt 的形态 |
+
+M7-b1 落定三条**刻意偏离**（写在宿主适配层的包注释里，勿在别处"修"回去）：
+
+1. **事实卡签名不换**。存量唯一索引是 `repo.MemorySignature`（锚点+kind+断言），
+   内核的 `AtomCard.Signature()` 是（实体+断言），语义不同——换了就是存量去重键
+   变更，同一件事会多出一张卡。
+2. **`QuoteEventID` 不是捕获事件标识**。内核不变量要求「出处能解析到一条捕获
+   事件」，宿主没有捕获面，故映射到宿主会话/案例标识——**不满足该不变量**，
+   接入 capture 面后才成立。
+3. **实体计数不增量维护**。内核契约给的是 `BumpEntityAtomCount(delta)`，宿主
+   实现为**重算**：增量的漂移不可自愈（漏一次加一次就永远差一，且无任何症状），
+   重算永远正确。
+
+宿主侧依赖地板的两处**非自主**抬升（本地 replace `../agent-harness` 随上游发版
+被抬，已按房规精确同步、零 tidy）：`oagentkit/guardx` v0.4.0→v0.4.1→v0.5.0、
+`oagentkit/agent` v0.8.0→v0.10.0 等八模块。
+
 ---
 
 ## 七、风险与未决
