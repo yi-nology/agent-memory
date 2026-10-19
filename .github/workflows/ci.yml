@@ -122,12 +122,21 @@ jobs:
         # 「下游 import 它」这件事由 go build 那个包来证明，不必再写一个 main。
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
+          # ⚠️ 这里必须用**带 v 的** tag 名，不能用剥掉 v 的版本号。
+          #
+          # Go 的模块版本号**必须**以 v 开头（v0.2.0，不是 0.2.0），
+          # 而 `go get module@0.2.0` 会报 "invalid version: unknown revision 0.2.0"。
+          #
+          # 这道闸从 v0.1.0 起就一直是红的：脚本剥掉 v 之后拿它当模块版本用，
+          # 于是每次发版的「下游能按版本号引入」自检都失败——
+          # 而它恰好是唯一能提前发现「发布物下游引不进」的那道闸。
+          # 一次错两处：版本号形态错，以及**没人看它红**。
+          tag="${GITHUB_REF_NAME}"
           tmp="$(mktemp -d)"
           cd "$tmp"
           go mod init probe >/dev/null
           # 走 proxy 引入自己发布的版本：这是下游的真实路径
-          go get "github.com/yi-nology/agent-memory@${ver}"
+          go get "github.com/yi-nology/agent-memory@${tag}"
           go list -m github.com/yi-nology/agent-memory
           CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/types
           CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/store
