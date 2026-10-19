@@ -33,6 +33,33 @@
 //
 // 查询侧用 plainto_tsquery：它把词元**合取**（AND）起来，
 // 与 FTS5 的空格分词语义一致。
+//
+// # 宿主如何改走本仓的 PG 后端
+//
+// 宿主的记忆面现役在 PG 上，而它自己写了一套 GORM 适配层。改走本仓的后端
+// 是三步：
+//
+//  1. **装配**：用本仓的 DSN 开一个库。
+//     DSN 必须是 URL 形态（postgres://user:pass@host:5432/db?sslmode=disable）——
+//     WithDatabase 靠它换库名，而换库名是 parity「每个用例一份干净库」的基础。
+//  2. **接进内核链**：本包的 *Store 实现 store.Store（编译期有
+//     `var _ store.Store = (*Store)(nil)` 兜着），可直接传给
+//     application.New 的 Deps.Store。
+//     若宿主只实现了内核的窄契约（store.AtomStore / store.MetaStore /
+//     pipeline/entity.Store），那些窄接口本包也全部满足。
+//  3. **验一致性**：把宿主的 DSN 填进 BQ_MEMORY_TEST_POSTGRES_DSN，
+//     跑 `go test ./storage/postgres/` ——31 条 parity 断言对着**真库**跑，
+//     覆盖软退役过滤、乐观锁、事务回滚、时间窗闭开区间、中文子串检索这些
+//     「各自单测都看不出来」的面。
+//
+// # 已知限制
+//
+//   - **表前缀**：本后端用表内 namespace 列，与 SQLite 后端同款
+//     （不用表前缀，见 sqlite.go 头注）。故两者的库**不能**互相导入。
+//   - **列表/载荷仍是 TEXT 存 JSON**：刻意不用 JSONB——JSONB 更省空间，
+//     但它会把「往返失真」这类编码问题抹平，而 parity 断言里正好有一条
+//     「往返失真」的用例，JSONB 会让那条用例测不到东西。
+//   - **无向量索引**：与 SQLite 后端同款，向量面刻意不做（方案 §5）。
 package postgres
 
 import (

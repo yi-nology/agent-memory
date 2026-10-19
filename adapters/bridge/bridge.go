@@ -17,6 +17,12 @@
 //	memory.get       取一条事实卡
 //	memory.stats     计数
 //
+// 库管理面（**需要模型**，未装配时返回 CodeUnavailable）：
+//
+//	memory.page.regen        重生成实体页面（脏页面）
+//	memory.episode.extract   从一批捕获事件抽情节
+//	memory.episode.digest    生成日/周/月周期摘要
+//
 // # 两条边界纪律
 //
 //  1. **白名单方法**：宿主能调什么由本包列出，不提供「执行任意 SQL」式的
@@ -33,9 +39,12 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/yi-nology/agent-memory/application"
 	"github.com/yi-nology/agent-memory/pipeline/capture"
+	"github.com/yi-nology/agent-memory/pipeline/episode"
+	"github.com/yi-nology/agent-memory/pipeline/page"
 	"github.com/yi-nology/agent-memory/pipeline/recall"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
@@ -83,15 +92,51 @@ type rpcResponse struct {
 
 // Server JSON-RPC 服务端。
 type Server struct {
-	svc *application.Service
+	svc  *application.Service
+	mgmt *Management
 }
 
-// New 造服务端。
+// Management 库管理动作（**可选装配**）。
+//
+// # 为什么要与业务面分开
+//
+// 页面重生成、情节抽取与周期摘要**都需要模型**，而 application 的服务面
+// 刻意「不装它们」（见该包的包注释：它们是库管理动作，由 CLI 与宿主自己触发，
+// 不该占服务面的位置）。
+//
+// 拆成独立的 Management，是为了让「服务面不装它们」这条纪律**保持成立**：
+// 宿主想要这些能力时显式装一份，而不是让服务面被动膨胀。
+//
+// 每一项都可以为 nil——没装的那项对应的方法会返回 CodeUnavailable
+// （能力未装配），而不是「装了个永远返回空集的桩」：
+// 桩是**契约洗白**（声称支持，实际不支持），而内核会据此做出错误假设。
+type Management struct {
+	// Page 页面重生成器。
+	Page *page.Regenerator
+	// Episode 情节抽取器。
+	Episode *episode.Extractor
+	// Digester 周期摘要器。
+	Digester *episode.Digester
+}
+
+// New 造服务端（只挂业务面）。
 func New(svc *application.Service) (*Server, error) {
 	if svc == nil {
 		return nil, errors.New("bridge: 服务未装配")
 	}
 	return &Server{svc: svc}, nil
+}
+
+// NewWithManagement 造带库管理动作的服务端。
+//
+// mgmt 为 nil 时等价于 New：业务面照样能用，只是那些方法返回「能力未装配」。
+func NewWithManagement(svc *application.Service, mgmt *Management) (*Server, error) {
+	s, err := New(svc)
+	if err != nil {
+		return nil, err
+	}
+	s.mgmt = mgmt
+	return s, nil
 }
 
 // Serve 读 stdin 直到 EOF，逐行处理，响应写 stdout。
@@ -286,6 +331,104 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			return nil, err
 		}
 		return map[string]any{"stats": st}, nil
+
+	// ── 库管理面（需要模型；未装配 → CodeUnavailable）──
+
+	case "memory.page.regen":
+		if s.mgmt == nil || s.mgmt.Page == nil {
+			return nil, &rpcError{Code: CodeUnavailable, Message: "未装配页面重生成能力"}
+		}
+		var p struct {
+			Namespace string `json:"namespace"`
+			// EntityID 非空时只重生成这一个实体；为空则重生成全部到期脏页面。
+			EntityID string `json:"entity_id"`
+		}
+		if err := decodeParams(params, &p); err != nil {
+			return nil, err
+		}
+		if p.EntityID != "" {
+			if err := s.mgmt.Page.RegenerateOne(ctx, store.Namespace(p.Namespace), p.EntityID); err != nil {
+				return nil, err
+			}
+			return map[string]any{"regenerated": 1, "failed": 0, "skipped": 0}, nil
+		}
+		res, err := s.mgmt.Page.RegenerateDirty(ctx, store.Namespace(p.Namespace))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"regenerated": res.Regenerated, "failed": res.Failed,
+			"skipped": res.Skipped, "failures": res.Failures,
+		}, nil
+
+	case "memory.episode.extract":
+		if s.mgmt == nil || s.mgmt.Episode == nil {
+			return nil, &rpcError{Code: CodeUnavailable, Message: "未装配情节抽取能力"}
+		}
+		var p struct {
+			Namespace string `json:"namespace"`
+			SessionID string `json:"session_id"`
+			// EventIDs 本次会话的捕获事件标识。
+			//
+			// 由宿主给出而不由内核按会话去查：内核的 ListRaw 不按会话过滤
+			// （存储层那一面没有会话维度），而「哪些事件属于这次会话」
+			// 是宿主的事——它才知道会话的边界。
+			EventIDs []string `json:"event_ids"`
+		}
+		if err := decodeParams(params, &p); err != nil {
+			return nil, err
+		}
+		if len(p.EventIDs) == 0 {
+			return nil, &rpcError{Code: CodeInvalidParams, Message: "event_ids 不能为空：没有素材就抽不出情节"}
+		}
+		events, err := s.svc.Store().GetRawByIDs(ctx, store.Namespace(p.Namespace), p.EventIDs)
+		if err != nil {
+			return nil, err
+		}
+		ep, err := s.mgmt.Episode.ExtractFromSession(ctx, store.Namespace(p.Namespace),
+			p.SessionID, events)
+		if err != nil {
+			return nil, err
+		}
+		if ep == nil {
+			return nil, &rpcError{Code: CodeInvalidParams, Message: "抽不出情节：素材不足"}
+		}
+		return map[string]any{"episode": ep}, nil
+
+	case "memory.episode.digest":
+		if s.mgmt == nil || s.mgmt.Digester == nil {
+			return nil, &rpcError{Code: CodeUnavailable, Message: "未装配周期摘要能力"}
+		}
+		var p struct {
+			Namespace string `json:"namespace"`
+			// Period day | week | month。
+			Period string `json:"period"`
+			// At 周期锚点（RFC3339，缺省=此刻）。
+			At string `json:"at"`
+		}
+		if err := decodeParams(params, &p); err != nil {
+			return nil, err
+		}
+		period := types.DigestPeriod(p.Period)
+		switch period {
+		case types.PeriodDay, types.PeriodWeek, types.PeriodMonth:
+		default:
+			return nil, &rpcError{Code: CodeInvalidParams,
+				Message: "period 只能是 day | week | month，实得 " + p.Period}
+		}
+		at := time.Now().UTC()
+		if p.At != "" {
+			t, err := time.Parse(time.RFC3339, p.At)
+			if err != nil {
+				return nil, &rpcError{Code: CodeInvalidParams, Message: "at 不是 RFC3339: " + err.Error()}
+			}
+			at = t.UTC()
+		}
+		rec, err := s.mgmt.Digester.Digest(ctx, store.Namespace(p.Namespace), period, at)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"digest": rec}, nil
 	}
 	return nil, &rpcError{Code: CodeMethodNotFound, Message: "未知方法: " + method}
 }

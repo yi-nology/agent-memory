@@ -180,10 +180,17 @@ modules:
 
   - id: adapters-bridge
     roots: [adapters/bridge]
-    requires: [application, types, store, ports, pipeline-recall, pipeline-capture, storage-sqlite]
+    requires: [application, types, store, ports, pipeline-recall, pipeline-capture,
+               pipeline-page, pipeline-episode, storage-sqlite]
     owner: memory
     managed: true
-    notes: JSON-RPC over stdio。跨语言/独立进程宿主的入口。
+    notes: |
+      JSON-RPC over stdio。跨语言/独立进程宿主的入口。
+
+      pipeline-page 与 pipeline-episode 是**库管理面**：页面重生成、情节抽取与
+      周期摘要都需要模型，而服务面刻意不装它们（见 application 的包注释）。
+      它们挂在 bridge 上，是因为 bridge 才是「宿主不必是 Go」时唯一能触达的口子——
+      能力实现了却没有入口，既不会被用也不会被验证。
 
   - id: integration
     roots: [integration]

@@ -158,6 +158,45 @@ type Config struct {
 	RecallTimeout time.Duration
 	// MaxRaw 原始事件取数上限（0=5）。
 	MaxRaw int
+	// RestrictAtomsToEntities 是否把事实卡**限定**在 Request.Entities 之内。
+	//
+	// # 为什么默认 false
+	//
+	// Request.Entities 这个字段同时承载两种**语义相反**的用法：
+	//
+	//   - 「本轮**提到**的实体」——用来补画像页（页面桶）；
+	//   - 「本会话的**锚点**实体」——用来给事实卡划范围。
+	//
+	// 内核从字段本身**区分不了**这两者。故默认不过滤，
+	// 由宿主显式声明「这一轮的 Entities 就是事实边界」——
+	// 接错了的后果是「本轮随口提到的一个对象，把整个会话的事实集清空」。
+	//
+	// # 置真时的语义
+	//
+	//   - Request.Entities 非空 → 事实卡只取这些实体的；
+	//   - Request.Entities 为空 → **返回空集**（不是全库）。
+	//
+	// 最后一条是要点：「显式声明了范围但范围为空」与「没声明范围」
+	// 是两种不同的意图——前者是「这一轮不该带任何事实」，
+	// 后者是「不限」。退化成全库会把「限定」变成「装饰」。
+	RestrictAtomsToEntities bool
+	// NoCaptureFace 宿主**没有捕获面**（只蒸馏终稿，不采集原始事件）。
+	//
+	// 缺省 false = 有捕获面。置 true 时：
+	//
+	//   - raw 源**不出现在路由里**（不取、不注入、也不占预算桶）；
+	//   - 存储**不需要**实现 recall.RawReader。
+	//
+	// # 为什么需要它
+	//
+	// 只有采集原始事件的宿主才有捕获面；只蒸馏终稿的宿主没有。
+	// 让那种宿主实现 ListRaw 只能给一个「永远返回空集」的桩——
+	// 那是**契约洗白**（声称支持捕获面，实际不支持），
+	// 而内核会据此在 raw 源上做出「有原始事件」的假设。
+	//
+	// 这条开关优先于 Sources：显式说「没有捕获面」时，
+	// 即使 Sources 里还留着 SourceRaw，也会被摘掉。
+	NoCaptureFace bool
 }
 
 // DefaultConfig 缺省配置。
@@ -195,6 +234,16 @@ func (c Config) normalize() (Config, error) {
 	if c.MaxRaw <= 0 {
 		c.MaxRaw = 5
 	}
+	// 无捕获面：raw 源**不出现在路由里**。
+	//
+	// 这一步放在默认来源之后：Sources 为空时先补上默认（atom + raw），
+	// 再按「没有捕获面」把 raw 摘掉——否则显式开关会被默认值吃掉。
+	//
+	// 它优先于 Sources：显式说「没有捕获面」时，
+	// 即使 Sources 里还留着 SourceRaw，也以开关为准。
+	if c.NoCaptureFace {
+		c.Sources = withoutSource(c.Sources, SourceRaw)
+	}
 	sum := c.BucketAtom + c.BucketQuote + c.BucketHeadline
 	if sum <= 0 {
 		c.BucketAtom, c.BucketQuote, c.BucketHeadline = 0.70, 0.20, 0.10
@@ -226,16 +275,29 @@ type Reader interface {
 	// 候选池之外再相关的事实也进不来。
 	// 故这一条不能省，尽管它让接口从 5 个方法变成 6 个。
 	SearchAtoms(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.AtomCard, error)
-	ListRaw(ctx context.Context, ns store.Namespace, before time.Time, p store.Page) ([]*types.RawEvent, error)
 	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string) (*types.EntityPage, error)
 	UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error
 	EvictActiveEntities(ctx context.Context, ns store.Namespace, threadID string, keep int) ([]types.ActiveEntity, error)
+}
+
+// RawReader 召回链用到的**原始事件**面（可选）。
+//
+// 刻意与 Reader 分开：只有**采集原始事件**的宿主才有捕获面，
+// 只蒸馏终稿的宿主没有。让那种宿主实现 ListRaw 只能给一个
+// 「永远返回空集」的桩——那是**契约洗白**（声称支持捕获面，实际不支持），
+// 而内核会据此在 raw 源上做出「有原始事件」的假设。
+//
+// 故它是**可选实现**：存储实现了它，raw 源才进路由；
+// 没实现而配置又要 raw 源，New 会**响亮失败**（见 New）。
+type RawReader interface {
+	ListRaw(ctx context.Context, ns store.Namespace, before time.Time, p store.Page) ([]*types.RawEvent, error)
 }
 
 // Pipeline 召回流水线。
 type Pipeline struct {
 	cfg    Config
 	store  Reader
+	raw    RawReader // nil = 宿主没有捕获面
 	est    ports.TokenEstimator
 	bander ports.Bander
 	cache  *cache
@@ -246,6 +308,12 @@ type Pipeline struct {
 //
 // bander 为 nil 时**直接报错**：记忆是不可信内容，不裹数据区就进 prompt 等于
 // 把控制权交给记忆里的一行字。装配层漏配时在这里炸，比在生产里被注入强。
+//
+// 存储**没有捕获面**（未实现 RawReader）而配置又要 raw 源时，同样**直接报错**：
+// 让那种宿主实现 ListRaw 只能给一个「永远返回空集」的桩——
+// 那是契约洗白（声称支持捕获面，实际不支持），
+// 而内核会据此在 raw 源上做出「有原始事件」的假设。
+// 两条出路由错误信息给出：实现 RawReader，或设 Config.NoCaptureFace = true。
 func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*Pipeline, error) {
 	if s == nil {
 		return nil, errNilStore
@@ -262,8 +330,16 @@ func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*
 	if err != nil {
 		return nil, err
 	}
+	var raw RawReader
+	if hasSource(norm.Sources, SourceRaw) {
+		r, ok := s.(RawReader)
+		if !ok {
+			return nil, errNoRawSource
+		}
+		raw = r
+	}
 	p := &Pipeline{
-		cfg: norm, store: s, est: est, bander: bander,
+		cfg: norm, store: s, raw: raw, est: est, bander: bander,
 		now: func() time.Time { return time.Now().UTC() },
 	}
 	// 缓存用流水线自己的时钟：两处时间不一致时，「缓存过期」这条行为

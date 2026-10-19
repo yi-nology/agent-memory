@@ -35,12 +35,26 @@ func (f *fakeReader) ListAtoms(_ context.Context, _ store.Namespace, flt store.A
 		if flt.ActiveOnly && !a.Active() {
 			continue
 		}
+		// 实体过滤必须**真的生效**：假存储若无视它，
+		// 「限定」那条用例就验不到东西——它会靠召回层的兜底过滤蒙对。
+		if len(flt.EntityIDs) > 0 && !containsStr(flt.EntityIDs, a.EntityID) {
+			continue
+		}
 		if flt.Limit > 0 && len(out) >= flt.Limit {
 			break
 		}
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+func containsStr(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeReader) ListRaw(_ context.Context, _ store.Namespace, _ time.Time, _ store.Page) ([]*types.RawEvent, error) {

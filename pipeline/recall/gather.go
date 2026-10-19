@@ -13,6 +13,13 @@ import (
 var (
 	errNilStore  = errors.New("recall: 存储未装配")
 	errNilBander = errors.New("recall: 必须装配 Bander：召回内容是不可信内容，不裹数据区不得进 prompt")
+	// errNoRawSource 配置要 raw 源，但存储没有捕获面。
+	//
+	// 这不是「配错了，忍一忍」——它意味着宿主被迫给 ListRaw 一个
+	// 「永远返回空集」的桩（契约洗白），而内核会据此在 raw 源上
+	// 做出「有原始事件」的假设。故让它在**构造期**炸。
+	errNoRawSource = errors.New("recall: 配置要 raw 源，但存储没有捕获面（未实现 recall.RawReader）：" +
+		"要么实现 RawReader，要么设 Config.NoCaptureFace = true，要么从 Sources 里去掉 SourceRaw")
 )
 
 // hasSource 判断来源是否在配置里。
@@ -23,6 +30,17 @@ func hasSource(list []Source, want Source) bool {
 		}
 	}
 	return false
+}
+
+// withoutSource 从来源列表里去掉某个来源。
+func withoutSource(list []Source, drop Source) []Source {
+	out := make([]Source, 0, len(list))
+	for _, s := range list {
+		if s != drop {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // gather 按路由决定的面取候选。
@@ -56,8 +74,8 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 		}
 	}
 
-	if hasSource(p.cfg.Sources, SourceRaw) {
-		raws, err := p.store.ListRaw(ctx, req.Namespace, time.Time{},
+	if hasSource(p.cfg.Sources, SourceRaw) && p.raw != nil {
+		raws, err := p.raw.ListRaw(ctx, req.Namespace, time.Time{},
 			store.Page{Limit: p.cfg.MaxRaw})
 		if err != nil {
 			return nil, err
@@ -133,6 +151,19 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 // 见 store 的软退役约定），所以这里必须显式滤掉——
 // 否则一条被推翻的事实会照进 prompt，而它在数据上完全看不出异常。
 func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]*types.AtomCard, error) {
+	// 显式限定时：事实范围 = Request.Entities。
+	scope := p.entityScope(req)
+	if scope != nil && len(scope) == 0 {
+		// 显式声明了范围但范围是空的 → 这一轮**不该带任何事实**。
+		// 退化成全库会把「限定」变成「装饰」——
+		// 而宿主正是靠这个开关把全库事实挡在 prompt 之外的。
+		return nil, nil
+	}
+	var entityIDs []string
+	if scope != nil {
+		entityIDs = req.Entities
+	}
+
 	var hits []*types.AtomCard
 	if strings.TrimSpace(req.Query) != "" {
 		var err error
@@ -143,6 +174,7 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 	}
 	base, err := p.store.ListAtoms(ctx, req.Namespace, store.AtomFilter{
 		ActiveOnly: true,
+		EntityIDs:  entityIDs,
 		Limit:      limit,
 	})
 	if err != nil {
@@ -158,6 +190,11 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 		if !a.Active() {
 			return // 退役/作废的事实不参与召回
 		}
+		// 检索路**不受**存储层过滤保护（SearchAtoms 没有实体过滤维度），
+		// 所以限定在这一侧再兜一道。
+		if scope != nil && !scope[a.EntityID] {
+			return
+		}
 		seen[a.ID] = true
 		out = append(out, a)
 	}
@@ -168,6 +205,22 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 		add(a)
 	}
 	return out, nil
+}
+
+// entityScope 事实卡的范围。
+//
+// 返回 nil = **不限定**（默认）；返回空但非 nil 的 map = 显式限定为空 → 空集。
+// 两者不可混：把「不限定」与「限定为空」都表达成空 slice，
+// 就没有办法区分「不限」与「这一轮不该带事实」。
+func (p *Pipeline) entityScope(req Request) map[string]bool {
+	if !p.cfg.RestrictAtomsToEntities {
+		return nil
+	}
+	scope := make(map[string]bool, len(req.Entities))
+	for _, e := range req.Entities {
+		scope[e] = true
+	}
+	return scope
 }
 
 // snippet 造一个**已包裹**的候选片段。
