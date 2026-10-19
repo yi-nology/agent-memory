@@ -141,3 +141,25 @@ jobs:
           CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/types
           CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/store
           echo "release: 下游视角编译通过"
+
+      - name: 以模块身份自证（带依赖的包）
+        # 上一段只编译了 types 与 store——它们**没有第三方依赖**，
+        # 所以那道闸从不验「发布物的 go.mod/go.sum 对带依赖的包是否自洽」。
+        # 而这类失效的症状极隐蔽：下游 import 到那个包时才发现
+        # 「missing go.sum entry」，报错完全指不到本仓。
+        #
+        # 下游的正确路径是 `go get <模块>/<包>@版本`（或 import 之后 go mod tidy）：
+        # 只 `go get <模块>@版本` 不会把传递依赖的校验和写进下游的 go.sum，
+        # 那是 Go 的既定行为，不是本仓的缺陷——但**发布闸必须按下游的真实路径走**。
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          tmp="$(mktemp -d)"
+          cd "$tmp"
+          go mod init probe >/dev/null
+          go get "github.com/yi-nology/agent-memory/pipeline/recall@${tag}"
+          go get "github.com/yi-nology/agent-memory/ports@${tag}"
+          CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/pipeline/recall
+          CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/ports
+          CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/storage/postgres
+          echo "release: 带依赖的包下游也能引进来并编译"
