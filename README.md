@@ -9,44 +9,57 @@
 
 ```
 RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard ──dirty/regen──→ EntityPage
-    └──episode extraction──→ Episode              └──AtomID 引用──→ tree leaf
+    └──episode extraction──→ Episode
 ```
 
-## 现在有什么（批次 M0）
+## 现在有什么（v0.2.0）
 
 | 面 | 状态 | 位置 |
 |---|---|---|
-| 领域结构单源 | ✅ | `types/` —— 捕获事件/候选/事实卡/实体/页面/树/情节/审计条目 |
-| 外部能力端口 | ✅ | `ports/` —— 模型调用/向量化/向量索引，全部是接口 |
-| 持久化契约 | ✅ | `store/` —— 按消费面拆成 9 个小接口，17 个模块的方向已登记 |
-| 架构门禁 | ✅ | `architecture-policy.yaml` + `tools/archcheck/`（**独立模块**，5 条规则 / 12 个自证用例） |
+| 领域结构单源 | ✅ | `types/` —— 捕获事件/候选/事实卡/实体/别名/页面/情节/审计条目 |
+| 外部能力端口 | ✅ | `ports/` —— 模型调用/向量化/向量索引/脱敏/注入防伪，全部是接口 |
+| 持久化契约 | ✅ | `store/` —— 按消费面拆成小接口，21 个模块的方向已登记 |
+| 架构门禁 | ✅ | `architecture-policy.yaml` + `tools/archcheck/`（**独立模块**，5 条规则 / 18 个自证用例） |
 | SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑** |
-| 跨后端行为断言 | ✅ | `storage/parity/` —— 29 条断言，SQLite 已接上并全绿 |
-| PostgreSQL 后端 | ⏳ M6 | `storage/postgres/` —— 接线位就位，**实现未落，行为一致性未验证** |
-| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测 |
+| PostgreSQL 后端 | ✅ | `storage/postgres/` —— tsvector + GIN + 事务，与 SQLite **同一组行为断言** |
+| 跨后端行为断言 | ✅ | `storage/parity/` —— **31 条断言，两个后端都真跑**（PG 对着真实服务器） |
+| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测、**取数两路**（查询命中 ∪ 高价值兜底） |
 | 注入防伪 | ✅ | `ports.MemoryBand` —— 转义全部 `<`，9 条攻击载荷用例钉住 |
-| 捕获面 | ✅ | `pipeline/capture/` —— **落库前打码**（Redactor 必需）、运行期错误拒收 |
+| 捕获面 | ✅ | `pipeline/capture/` —— **落库前打码**（Redactor 必需）、运行期错误与空白正文拒收 |
 | 提炼面 | ✅ | `pipeline/extractor/` —— 防稀释校验、非法枚举硬拒、无模型显式失败 |
-| 晋升面 | ✅ | `pipeline/promotion/` —— 五检查（价值/证据/实体/重复/矛盾），送人工是默认姿态 |
-| 页面/情节 | ⏳ M4 | `pipeline/` |
-| 生命周期 | ⏳ M6 | `lifecycle/` |
-| 迁移包 / bridge / CLI | ⏳ M5 | `operations/` `adapters/` |
+| 晋升面 | ✅ | `pipeline/promotion/` —— 五检查（价值/证据/实体/重复/矛盾）+ **落库四步在一个事务里**，送人工是默认姿态 |
+| 归一面 | ✅ | `pipeline/entity/` —— 按名查/登记别名/合并实体（合并**改归属**不是复制） |
+| 页面/情节 | ✅ | `pipeline/page/` `pipeline/episode/` —— 页面重生成、情节与日/周/月周期摘要 |
+| 生命周期 | ✅ | `lifecycle/` —— 回收/合并/保留期/物理整理 |
+| 迁移包 / bridge / CLI | ✅ | `operations/portable/`（.hmpkg）`adapters/bridge`（JSON-RPC）`adapters/cli` |
+| 跨包端到端测试 | ✅ | `integration/` —— 主链走一遍（真实后端，不 mock 任何一层） |
 
-> ⚠️ 上表里 PG 那行的 ⏳ 是有意的：它的测试是**跳过**的，而**跳过的用例不证明兼容**。
-> 「SQLite 与 PG 行为一致」这句话目前还没有被验证过。
+> **PG 那一行不再是「未验证」**：v0.2.0 起 PG 后端是**完整实现**，
+> 31 条 parity 断言对着**真实 PostgreSQL** 跑通，且 CI 里加了 `postgres` service
+> 让它每次推送都真跑——「skipped 的 PG 用例不证明兼容」，所以它不许被 skip 掉。
 
 ## 设计取舍（先看这三条，其余都在方案文档里）
 
-1. **核心零依赖，可机检。** 第三方包只许出现在 `storage/`（纯 Go SQLite 驱动）；
+1. **核心零依赖，可机检。** 默认第三方包只许出现在 `storage/`（纯 Go SQLite 驱动）；
    其余模块只准 stdlib 与本仓，由门禁 `memory-core-stdlib-only` 在**源码 import 面**
    上执行。理由不是洁癖，是**降级路径**：没有模型时手工写入 + 词法召回必须能跑，
    没有数据库时领域模型必须能编译——核心一旦引了 SDK，这条路径就塌在
    「用户配了模型、装了数据库」的生产环境里，而不是在 CI 里。
+   2026-10-19 起开了一个**受控开口**：纯 stdlib 的工具级模块（`oekit/pkg`、
+   `oagentkit/textx`、`oagentkit/guardx/logredact`）可在 `architecture-policy.yaml`
+   的 `allow_third_party` 段逐条登记后进核心——它们不引模型、不联网、不碰数据库，
+   不破坏那条降级路径；每条登记带 `reason` + `until` + `removal`，缺一条加载即失败、
+   到期即红。
 
-1. **行为一致性由共享断言保证，不由各自的单测保证。** `storage/parity` 里 29 条断言，
-   两个后端跑**同一份**。各自单测都绿 ≠ 行为一致：软退役过滤漏一列、分页游标用
+1. **行为一致性由共享断言保证，不由各自的单测保证。** `storage/parity` 里 31 条断言，
+   两个后端跑**同一份**，且**两个都必须真跑过**（PG 那个对着真实服务器）。
+   各自单测都绿 ≠ 行为一致：软退役过滤漏一列、分页游标用
    `<=` 还是 `<`、时间窗闭开区间——这类不一致在各自单测里全都看不出来，
    而「换个部署形态召回结果就不变」是产品承诺。
+   > 补 PG 实现时立刻撞出两条真缺陷：签名分隔符用 NUL（**PG 的 TEXT 禁止 0x00**，
+   > 同一份签名在一个后端落库、另一个报编码错），以及重要度排序是字典序
+   > （`TEXT` 列下 `'med' > 'low' > 'high'`，最重要的排最后）。
+   > 两条都是 SQLite 侧永远绿的——**契约的可移植性要靠第二个实现来暴露**。
 
 2. **没注入模型就必须报错。** 提炼、页面重生成、情节摘要在无模型时返回 `ErrNoLLM`，
    **不许返回空串假装成功**——空串会被下游当成「模型说没什么」，
@@ -81,6 +94,42 @@ make tidy-check   # 核对主模块仍然零依赖
 ```
 
 需要 Go 1.25+。全程 `CGO_ENABLED=0`（SQLite 走纯 Go 驱动，不依赖 cgo）。
+
+### 命令行面
+
+```bash
+memory capture --content "…"      # 捕获一条事件（落库前已打码）
+memory recall  <查询词>            # 召回并渲染
+memory search  <查询词>            # 检索事实卡
+memory stats                       # 计数
+memory export --out <包路径>        # 导出成 .hmpkg
+memory import --pkg <包路径>        # 导入
+memory doctor --pkg <包路径>        # 检查包完整性
+
+memory gc [--before 720h]          # 按龄回收原始事件
+memory consolidate                 # 合并同签名事实
+memory retention                   # 退役证据全来自运行期错误的事实
+memory vacuum                      # 物理整理（后端专属）
+memory entity list                 # 列出实体
+memory entity merge --to ID --from ID   # 合并两个实体（事实卡改归属）
+memory entity alias --entity ID --alias A # 登记别名
+memory episode list                # 列出情节
+```
+
+CLI 是**管理口**（看与搬），不注入模型：提炼、页面重生成、周期摘要由宿主触发。
+
+### 跑 PG 的行为断言
+
+PG parity 需要一个**真实服务器**（它测的是「约束建了没」「类型映射对不对」，
+内存实现测不出来）：
+
+```bash
+export BQ_MEMORY_TEST_POSTGRES_DSN="postgres://user:pass@127.0.0.1:5432/postgres?sslmode=disable"
+go test ./storage/postgres/ -count=1
+```
+
+没配这个环境变量时它会**显式跳过**并说明「PG 行为一致性未验证」——
+跳过的用例不证明兼容。CI 里已配 `postgres` service，它每次推送都真跑。
 
 ## 边界
 

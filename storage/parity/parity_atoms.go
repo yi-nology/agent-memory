@@ -64,15 +64,65 @@ func tAtomSignature(t *testing.T, s store.Store) {
 	}
 }
 
+// 中文子串检索必须命中**真实形态**的中文正文。
+//
+// 这条曾经被违反：FTS5 的 unicode61 分词器把连续汉字算作**一个词元**，
+// 于是索引里的「磁盘长期偏小」与查询「磁盘」永不相等 → 0 命中。
+//
+// 而夹具若写成「磁盘 剩余 2G」（汉字之间有空格），unicode61 正好切成两个词元，
+// 查询照样命中——**夹具替实现蒙混过关**，缺陷在 parity 套件下全绿。
+// 故这里的夹具一律用真实中文形态（句子内部没有空格分词）。
 func tAtomSearch(t *testing.T, s store.Store) {
-	_ = s.SaveAtom(bg(), nsA, atom("m1", "e1", "磁盘 剩余 2G", "ev1", types.ImportanceHigh))
-	_ = s.SaveAtom(bg(), nsA, atom("m2", "e1", "内存 占用 偏高", "ev1", types.ImportanceHigh))
+	_ = s.SaveAtom(bg(), nsA, atom("m1", "e1", "磁盘剩余 2G", "ev1", types.ImportanceHigh))
+	_ = s.SaveAtom(bg(), nsA, atom("m2", "e1", "内存占用偏高", "ev1", types.ImportanceHigh))
 	hits, err := s.SearchAtoms(bg(), nsA, "磁盘", 5)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(hits) != 1 || hits[0].ID != "m1" {
 		t.Fatalf("应只命中 m1，实得 %+v", hits)
+	}
+	// 子串不在词首：中文查询常是词中的一部分（「剩余」「占用」）。
+	hits2, err := s.SearchAtoms(bg(), nsA, "剩余", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits2) != 1 || hits2[0].ID != "m1" {
+		t.Fatalf("词中子串应命中 m1，实得 %+v", hits2)
+	}
+	// 英文侧不能被中文归一化带坏。
+	_ = s.SaveAtom(bg(), nsA, atom("m3", "e1", "the disk is almost full", "ev1", types.ImportanceHigh))
+	en, err := s.SearchAtoms(bg(), nsA, "disk", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(en) != 1 || en[0].ID != "m3" {
+		t.Fatalf("英文查询应只命中 m3，实得 %+v", en)
+	}
+}
+
+// 真实形态的中文正文必须能被中文子串检索命中，且不同子串互不串味。
+//
+// 这条是「夹具替实现背书」的教训本身：夹具按真实形态写，
+// 实现若退回字典序/整词匹配，这条会红。
+func tAtomSearchChineseSubstring(t *testing.T, s store.Store) {
+	_ = s.SaveAtom(bg(), nsA, atom("c1", "e1", "磁盘长期偏小需要清理旧文件", "ev1", types.ImportanceHigh))
+	for _, q := range []string{"磁盘", "长期", "清理", "旧文件"} {
+		hits, err := s.SearchAtoms(bg(), nsA, q, 5)
+		if err != nil {
+			t.Fatalf("检索 %q 失败: %v", q, err)
+		}
+		if len(hits) != 1 || hits[0].ID != "c1" {
+			t.Fatalf("中文子串 %q 应只命中 c1，实得 %+v", q, hits)
+		}
+	}
+	// 不在正文里的子串不得命中。
+	hits, err := s.SearchAtoms(bg(), nsA, "扩容", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("不相关的查询不该命中，实得 %+v", hits)
 	}
 }
 
@@ -147,6 +197,78 @@ func tAtomOrderIsDeterministic(t *testing.T, s store.Store) {
 			if again[j].ID != first[j].ID {
 				t.Fatalf("并列时的返回顺序不确定: 第 %d 位 %s vs %s", j, first[j].ID, again[j].ID)
 			}
+		}
+	}
+}
+
+// 按实体取事实卡：必须**包含已退役的**。
+//
+// 实体合并要把该实体名下所有卡（含已退役的）一起迁到新归属——
+// 漏掉已退役的，那些卡会永远指向一个已经不存在的实体，
+// 而它们仍在库里、仍可被搜到。
+func tAtomListByEntity(t *testing.T, s store.Store) {
+	live := atom("e-live", "e1", "磁盘长期偏小", "ev1", types.ImportanceHigh)
+	dead := atom("e-dead", "e1", "内存泄漏已修复", "ev1", types.ImportanceHigh)
+	dead.SupersededBy = "e-live"
+	_ = s.SaveAtom(bg(), nsA, live)
+	_ = s.SaveAtom(bg(), nsA, dead)
+	_ = s.SaveAtom(bg(), nsA, atom("other", "e2", "别的事实", "ev1", types.ImportanceMed))
+
+	got, err := s.ListAtomsByEntity(bg(), nsA, "e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("应取回 e1 名下全部 2 张（含已退役），实得 %d 张", len(got))
+	}
+	other, err := s.ListAtomsByEntity(bg(), nsA, "e2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other) != 1 || other[0].ID != "other" {
+		t.Fatalf("应只取回 e2 名下的那一张，实得 %+v", other)
+	}
+}
+
+// 重要度排序必须是**语义序**（high → med → low），不是字典序。
+//
+// 这条曾经被违反：importance 列是 TEXT，`ORDER BY importance DESC`
+// 的字典序是 'med' > 'low' > 'high'——**最重要的排在最后**。
+// 后果：召回的候选池是 ListAtoms 的前 N 条（N 默认 50），
+// 事实卡一多，最重要的那批最先被裁掉，而它们恰恰是最该进 prompt 的。
+// 晋升的矛盾检测、生命周期三件套、迁移包导出也都走 ListAtoms，
+// 于是「按字典序取前 N 条」会渗进所有依赖它的动作。
+//
+// 跨后端断言：PG 侧若用同样的字典序排序，这条会红。
+func tAtomImportanceOrder(t *testing.T, s store.Store) {
+	// 同一发生时刻，只让重要度不同——把其他变量钉死。
+	for _, tc := range []struct {
+		id  string
+		imp types.Importance
+	}{
+		{"i-high", types.ImportanceHigh},
+		{"i-med", types.ImportanceMed},
+		{"i-low", types.ImportanceLow},
+	} {
+		if err := s.SaveAtom(bg(), nsA, atom(tc.id, "e1", "同刻事实 "+tc.id, "ev1", tc.imp)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := s.ListAtoms(bg(), nsA, store.AtomFilter{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, a := range list {
+		got = append(got, a.ID)
+	}
+	want := []string{"i-high", "i-med", "i-low"}
+	if len(got) != len(want) {
+		t.Fatalf("本用例的三张卡应全部返回，实得 %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("重要度排序应按语义（high→med→low），实得 %v", got)
 		}
 	}
 }

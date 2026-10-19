@@ -67,10 +67,13 @@ func Run(t *testing.T, open OpenFn) {
 		{"事实卡：软退役两态都排除出召回", tAtomRetiredExcluded},
 		{"事实卡：签名去重", tAtomSignature},
 		{"事实卡：全文检索只命中相关事实", tAtomSearch},
+		{"事实卡：中文子串检索命中真实形态中文", tAtomSearchChineseSubstring},
 		{"事实卡：形状校验拦无出处", tAtomValidation},
 		{"事实卡：退役后仍可搜到（可追问「当初为何」）", tAtomRetiredStillSearchable},
 		{"事实卡：重复保存是更新而不是冲突", tAtomSaveIsUpsert},
 		{"事实卡：并列时的返回顺序确定", tAtomOrderIsDeterministic},
+		{"事实卡：重要度排序按语义序而非字典序", tAtomImportanceOrder},
+		{"事实卡：按实体取全部（含已退役）", tAtomListByEntity},
 		{"实体：规范名与别名两条路径都能查到", tEntityLookupBothPaths},
 		{"实体：计数钳到 0 不报错", tEntityCountClamp},
 		{"活跃实体栈：钉住项不参与淘汰", tActiveEntityPin},
@@ -78,9 +81,6 @@ func Run(t *testing.T, open OpenFn) {
 		{"页面：标脏在页面不存在时自建", tPageMarkDirtyCreates},
 		{"页面：重生成失败保持脏标记", tPageRegenFailureKeepsDirty},
 		{"页面：重生成成功清脏清失败", tPageRegenSuccessClears},
-		{"树：形状校验（叶持事实/非叶不持）", tNodeValidation},
-		{"树：级联删除整棵子树", tNodeCascadeDelete},
-		{"树：按事实反查叶子", tNodeLookupByAtom},
 		{"情节与周期摘要", tEpisodeDigest},
 		{"审计条目按主体检索", tJournalBySubject},
 		{"元数据按命名空间隔离", tMetaIsolation},
@@ -222,8 +222,11 @@ func tRawListCursor(t *testing.T, s store.Store) {
 
 func tRawSearch(t *testing.T, s store.Store) {
 	for _, e := range []*types.RawEvent{
-		{ID: "s1", Timestamp: base, Type: types.EventManual, Content: "磁盘 剩余 2G"},
-		{ID: "s2", Timestamp: base, Type: types.EventManual, Content: "内存 占用 偏高"},
+		// 真实中文形态：句子内部没有空格分词。
+		// 夹具写成「磁盘 剩余 2G」会让 unicode61 正好切成两个词元，
+		// 于是「中文子串检索失效」这个缺陷在 parity 下全绿——夹具替实现背书。
+		{ID: "s1", Timestamp: base, Type: types.EventManual, Content: "磁盘剩余 2G"},
+		{ID: "s2", Timestamp: base, Type: types.EventManual, Content: "内存占用偏高"},
 	} {
 		if err := s.SaveRaw(bg(), nsA, e); err != nil {
 			t.Fatal(err)
@@ -235,6 +238,14 @@ func tRawSearch(t *testing.T, s store.Store) {
 	}
 	if len(hits) != 1 || hits[0].ID != "s1" {
 		t.Fatalf("应只命中 s1，实得 %+v", hits)
+	}
+	// 词中子串同样要命中。
+	hits2, err := s.SearchRaw(bg(), nsA, "占用", 5)
+	if err != nil {
+		t.Fatalf("检索失败: %v", err)
+	}
+	if len(hits2) != 1 || hits2[0].ID != "s2" {
+		t.Fatalf("词中子串应只命中 s2，实得 %+v", hits2)
 	}
 }
 
@@ -334,7 +345,7 @@ func tCandidateDuplicate(t *testing.T, s store.Store) {
 	}
 	_ = s.SaveCandidate(bg(), nsA, mk("p1", types.CandidatePending))
 
-	dup, err := s.FindDuplicateCandidate(bg(), nsA, "机器甲\x00磁盘长期偏小")
+	dup, err := s.FindDuplicateCandidate(bg(), nsA, "机器甲"+types.SignatureSep+"磁盘长期偏小")
 	if err != nil {
 		t.Fatalf("重复检测失败: %v", err)
 	}
@@ -345,7 +356,7 @@ func tCandidateDuplicate(t *testing.T, s store.Store) {
 	// 落定后不应再挡住新候选——晋升层真正关心的是事实卡，不是候选。
 	_ = s.UpdateCandidateStatus(bg(), nsA, "p1",
 		types.CandidatePending, types.CandidatePromoted, types.DecidedRule, "")
-	if _, err := s.FindDuplicateCandidate(bg(), nsA, "机器甲\x00磁盘长期偏小"); !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.FindDuplicateCandidate(bg(), nsA, "机器甲"+types.SignatureSep+"磁盘长期偏小"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("落定候选不该继续挡住，实得 %v", err)
 	}
 }
@@ -521,59 +532,6 @@ func tPageRegenSuccessClears(t *testing.T, s store.Store) {
 	}
 	if len(got.AtomIDs) != 1 || got.AtomIDs[0] != "a1" {
 		t.Fatalf("覆盖的事实集合丢失: %+v", got.AtomIDs)
-	}
-}
-
-// ── 树 ──
-
-func tNodeValidation(t *testing.T, s store.Store) {
-	leaf := &types.MemoryNode{ID: "n1", Level: types.LevelLeaf, CreatedAt: base, UpdatedAt: base}
-	if err := s.SaveNode(bg(), nsA, leaf); !errors.Is(err, types.ErrLeafWithoutAtom) {
-		t.Fatalf("叶节点无事实引用必须被拒，实得 %v", err)
-	}
-	branch := &types.MemoryNode{ID: "n2", Level: types.LevelBranch, CreatedAt: base, UpdatedAt: base}
-	atomID := "a1"
-	branch.AtomID = &atomID
-	if err := s.SaveNode(bg(), nsA, branch); !errors.Is(err, types.ErrNonLeafWithAtom) {
-		t.Fatalf("非叶持事实必须被拒，实得 %v", err)
-	}
-}
-
-func tNodeCascadeDelete(t *testing.T, s store.Store) {
-	_ = s.SaveAtom(bg(), nsA, atom("a1", "e1", "x", "ev1", types.ImportanceMed))
-	rootID, brID, lfID, ref := "root", "br", "leaf", "a1"
-	_ = s.SaveNode(bg(), nsA, &types.MemoryNode{ID: rootID, Level: types.LevelRoot, CreatedAt: base, UpdatedAt: base})
-	_ = s.SaveNode(bg(), nsA, &types.MemoryNode{
-		ID: brID, ParentID: &rootID, Level: types.LevelBranch, CreatedAt: base, UpdatedAt: base})
-	_ = s.SaveNode(bg(), nsA, &types.MemoryNode{
-		ID: lfID, ParentID: &brID, Level: types.LevelLeaf, AtomID: &ref, CreatedAt: base, UpdatedAt: base})
-
-	if err := s.DeleteNode(bg(), nsA, rootID, true); err != nil {
-		t.Fatalf("级联删除失败: %v", err)
-	}
-	left, err := s.GetTree(bg(), nsA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(left) != 0 {
-		t.Fatalf("级联删除后应无残留，实得 %d 个节点", len(left))
-	}
-	// 树是组织视图：删树不该删事实。
-	if _, err := s.GetAtom(bg(), nsA, "a1"); err != nil {
-		t.Fatalf("删树删掉了事实卡——树只是组织视图，不是真源: %v", err)
-	}
-}
-
-func tNodeLookupByAtom(t *testing.T, s store.Store) {
-	ref := "a1"
-	_ = s.SaveNode(bg(), nsA, &types.MemoryNode{
-		ID: "leaf", Level: types.LevelLeaf, AtomID: &ref, CreatedAt: base, UpdatedAt: base})
-	got, err := s.GetNodeByAtomID(bg(), nsA, "a1")
-	if err != nil {
-		t.Fatalf("按事实反查叶子失败: %v", err)
-	}
-	if got.ID != "leaf" || got.AtomID == nil || *got.AtomID != "a1" {
-		t.Fatalf("反查结果失真: %+v", got)
 	}
 }
 

@@ -195,6 +195,31 @@ func TestBadOutputIsAFailure(t *testing.T) {
 	}
 }
 
+// 模型带 ``` 围栏输出时必须照样解析成功。
+//
+// 这条不是「宽松」：被要求输出 JSON 时，模型经常连着 ```json 围栏一起给。
+// 不剥围栏的后果是**每次重生成都失败一次**，而失败保持脏标记——
+// 于是这个实体的画像永远重生成不出来，且失败原因（解析错误）指向的是
+// 格式噪声而不是真问题。
+//
+// 「字段缺失即失败」那条不变：剥围栏只解决格式噪声，不放宽内容校验。
+func TestFencedOutputIsParsed(t *testing.T) {
+	f := newFake()
+	f.dirty = []string{"e1"}
+	f.pages["e1"] = &types.EntityPage{EntityID: "e1", Dirty: true}
+	f.atoms = []*types.AtomCard{{ID: "a1", EntityID: "e1", Assertion: "x"}}
+
+	out := "```json\n{\"headline\": \"一句话画像\", \"body\": \"正文\"}\n```"
+	r, _ := page.New(f, &fakeLLM{out: out}, page.Config{})
+	res, _ := r.RegenerateDirty(ctx2(), ns)
+	if res.Failed != 0 {
+		t.Fatalf("带围栏的合法输出不该判失败: %+v", res)
+	}
+	if res.Regenerated != 1 {
+		t.Fatalf("带围栏的合法输出应重生成成功: %+v", res)
+	}
+}
+
 // 没有事实 → 跳过，不算失败。
 func TestNoAtomsSkips(t *testing.T) {
 	f := newFake()

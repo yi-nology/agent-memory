@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -26,6 +27,31 @@ type negFollow struct {
 	ForbidFollow string `yaml:"forbid_follow"`
 }
 
+// allowEntry 核心层第三方白名单的一条登记。
+//
+// # 为什么白名单必须带四个字段
+//
+// 一个光秃秃的路径列表是最容易变成死条款的东西：半年后没人记得它为什么
+// 在那里，也没人说得清它覆盖了哪个包、什么时候该撤。故每条都必须写明
+// 「放行什么、为什么、到什么时候、什么条件下拆掉」——缺一条就在加载期报错，
+// 而不是默默放行。
+type allowEntry struct {
+	// Path 放行的 import 路径前缀（精确仓路径或其中的子包）。
+	Path string `yaml:"path"`
+	// Reason 为什么放行（写进报告，半年后还有人看得懂）。
+	Reason string `yaml:"reason"`
+	// Until 复核日期（YYYY-MM-DD）。到期即让门禁变红，逼人处理。
+	Until string `yaml:"until"`
+	// Removal 拆除条件：什么情况下这条白名单应该消失。
+	Removal string `yaml:"removal"`
+	// Paths 允许引用的**仓内目录**前缀。留空 = 该规则作用域内任意目录。
+	//
+	// 留空不是省事，是**放弃了这道粒度**：白名单项就会在 8 个核心目录里
+	// 到处可用，包括作为地基的 types。指定了它，policy 自己就说清了
+	// 「这个包只许谁用」。
+	Paths []string `yaml:"paths"`
+}
+
 // rule 一条检测规则。
 type rule struct {
 	ID           string      `yaml:"id"`
@@ -37,6 +63,12 @@ type rule struct {
 	ForbidImport string      `yaml:"forbid_import_regex"` // 打在 import 路径上
 	ForbidRegex  []string    `yaml:"forbid_regex"`        // 打在整行文本上（含注释）
 	NegFollow    []negFollow `yaml:"negative_follow"`
+
+	// AllowThirdParty 放行到核心层的第三方包（见 allowEntry）。
+	//
+	// 它是「核心零依赖」这条纪律的**受控开口**，不是它的废除：默认仍然
+	// 只许 stdlib 与本仓，每一条放行都必须逐条登记理由与到期日。
+	AllowThirdParty []allowEntry `yaml:"allow_third_party"`
 
 	// ForbidThirdPartyIn 列出「只准 stdlib 与本仓」的目录前缀。
 	//
@@ -127,7 +159,61 @@ func loadPolicy(path string) (*policy, error) {
 		}
 		seen[m.ID] = true
 	}
+	if err := validateAllowlist(&p); err != nil {
+		return nil, err
+	}
 	return &p, nil
+}
+
+// validateAllowlist 校验白名单登记。
+//
+// # 校验面为什么这么严
+//
+// 白名单是唯一能让第三方包进核心的口子，而它一旦写错，失效形态是**静默**：
+// 路径写错 → 放行不生效（还好，只是没放行）；理由/到期日写漏 → 放行生效
+// 且永远不过期（**危险的那侧**）。所以缺字段一律在加载期响亮失败，
+// 而不是先跑起来再说。
+func validateAllowlist(p *policy) error {
+	for _, r := range p.Rules {
+		if len(r.AllowThirdParty) == 0 {
+			continue
+		}
+		// 有白名单却没执行体 = 白名单是死条款：写的人以为放行了，
+		// 实际上那条规则根本不存在。必须响亮失败。
+		if len(r.ForbidThirdPartyIn) == 0 {
+			return fmt.Errorf("规则 %s 登记了 allow_third_party，但它没有 forbid_third_party_in 执行体——白名单无从生效", r.ID)
+		}
+		seen := map[string]bool{}
+		for _, e := range r.AllowThirdParty {
+			switch {
+			case e.Path == "":
+				return fmt.Errorf("规则 %s 的白名单条目缺 path", r.ID)
+			case e.Reason == "":
+				return fmt.Errorf("规则 %s 的白名单条目 %s 缺 reason（半年后没人看得懂它为什么在）", r.ID, e.Path)
+			case e.Until == "":
+				return fmt.Errorf("规则 %s 的白名单条目 %s 缺 until（无期限的例外等于规则失效）", r.ID, e.Path)
+			case e.Removal == "":
+				return fmt.Errorf("规则 %s 的白名单条目 %s 缺 removal（拆除条件）", r.ID, e.Path)
+			}
+			if _, err := time.Parse("2006-01-02", e.Until); err != nil {
+				return fmt.Errorf("规则 %s 的白名单条目 %s 的 until 不是 YYYY-MM-DD: %q", r.ID, e.Path, e.Until)
+			}
+			if seen[e.Path] {
+				return fmt.Errorf("规则 %s 的白名单路径重复: %s", r.ID, e.Path)
+			}
+			seen[e.Path] = true
+		}
+	}
+	return nil
+}
+
+// allowExpired 判断白名单条目是否已过期。
+//
+// 比较用**日期字符串**而不是时间点：until 写的是「复核到哪一天」，
+// 那天当天仍算有效，次日才过期。now 由调用方注入——
+// 否则这条判据在测试里不可控。
+func allowExpired(now time.Time, e allowEntry) bool {
+	return now.UTC().Format("2006-01-02") > e.Until
 }
 
 // moduleOf 判断某个仓内包路径属于哪个模块（最长根前缀优先）。

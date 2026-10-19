@@ -35,7 +35,6 @@ type Store struct {
 	candidateStore
 	entityStore
 	pageStore
-	treeStore
 	episodeStore
 	journalStore
 	metaStore
@@ -52,7 +51,6 @@ type (
 	candidateStore struct{ *Store }
 	entityStore    struct{ *Store }
 	pageStore      struct{ *Store }
-	treeStore      struct{ *Store }
 	episodeStore   struct{ *Store }
 	journalStore   struct{ *Store }
 	metaStore      struct{ *Store }
@@ -71,7 +69,6 @@ func newStore(db *sql.DB) *Store {
 	s.candidateStore.Store = s
 	s.entityStore.Store = s
 	s.pageStore.Store = s
-	s.treeStore.Store = s
 	s.episodeStore.Store = s
 	s.journalStore.Store = s
 	s.metaStore.Store = s
@@ -329,6 +326,12 @@ type provenanceFields = struct {
 //
 // 折叠空白不是为了好看：FTS5 的 unicode61 分词器按空白切，保留换行与连续空格
 // 会让词边界错位，中文长句尤其明显。
+// ftsBody 造 FTS 索引正文。
+//
+// 切词走 store.LexicalTokens：**汉字逐字成词元**，英文按空白切。
+// 这是中文子串检索能用的关键——unicode61 会把连续汉字算作一个词元，
+// 而真实中文文本里没有空格分词，用户查的就是子串。
+// 详见 store.LexicalTokens 的注释。
 func ftsBody(parts ...string) string {
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
@@ -336,7 +339,23 @@ func ftsBody(parts ...string) string {
 			out = append(out, strings.TrimSpace(p))
 		}
 	}
-	return strings.Join(out, " ")
+	return strings.Join(store.LexicalTokens(strings.Join(out, " ")), " ")
+}
+
+// ftsQuery 把词元拼成 FTS5 查询串。
+//
+// 每个词元都加引号：FTS5 的 AND/OR/NOT/NEAR 是**大写**关键字，
+// 裸词元撞上它们会被当成运算符——于是「查 AND」要么语法错误，
+// 要么语义翻转成「不含某词」。加引号后词元只当字面量。
+//
+// 词元里不含引号本身（store.LexicalTokens 只产出字母/数字/下划线/汉字），
+// 故不需要转义。
+func ftsQuery(tokens []string) string {
+	parts := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		parts = append(parts, `"`+t+`"`)
+	}
+	return strings.Join(parts, " ")
 }
 
 // refCol 取 FTS 虚表的引用列名。
@@ -382,15 +401,20 @@ func (s *Store) indexDelete(ctx context.Context, table, namespace, ref string) e
 // 运算符会被当成语法。转义由调用方（pipeline/recall）负责——本层无法区分
 // 「用户想按语法检索」与「用户输入恰好含语法」。
 func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int) ([]string, error) {
-	if strings.TrimSpace(query) == "" {
+	tokens := store.LexicalTokens(query)
+	if len(tokens) == 0 {
+		// 查询里没有可检索的词元（全是标点/空白）：不是错误，是「没得可查」。
 		return nil, nil
 	}
 	rows, err := s.query(ctx,
 		`SELECT `+refCol(table)+` FROM `+table+`
 		 WHERE namespace = ? AND `+table+` MATCH ? ORDER BY rank LIMIT ?`,
-		namespace, query, limitOf(limit, 10))
+		namespace, ftsQuery(tokens), limitOf(limit, 10))
 	if err != nil {
 		// MATCH 语法错误不该炸掉整条召回路径——退回空结果，让上层决定要不要兜底。
+		//
+		// 词元已加引号（见 ftsQuery），这条分支实际上很难再触发；
+		// 留着它是纵深防御：FTS5 语法若再扩，这里不会让整条检索路径崩掉。
 		if isFTSSyntaxErr(err) {
 			return nil, nil
 		}

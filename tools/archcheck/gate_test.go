@@ -342,3 +342,182 @@ func TestGateGoesRedOnGodObject(t *testing.T) {
 	}
 	t.Fatal("方法数超限必须让门禁变红")
 }
+
+// ── 核心层第三方白名单 ──
+//
+// 白名单是唯一能让第三方包进核心的口子。这组用例守的是它的**失效形态**：
+// 门禁变绿、规则照常出现在报告里，而放行的范围比登记的宽。
+
+// 白名单登记的包必须放行。门禁只会红没用——满屏红会逼人整体关掉它。
+func TestGateAllowsAllowlistedThirdParty(t *testing.T) {
+	p := loadRepoPolicy(t)
+	root := t.TempDir()
+
+	writeFile(t, root, "ports/x.go", `package ports
+
+import "github.com/oekit/pkg/timex"
+
+var _ = timex.BeginningOfDay
+`)
+
+	vs, err := run(p, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range vs {
+		if v.Rule == "memory-core-stdlib-only" {
+			t.Fatalf("白名单登记的包不得误伤: %s", v)
+		}
+	}
+}
+
+// **前缀混淆必须红**：白名单项 github.com/oekit/pkg 不得顺带放行
+// github.com/oekit/pkg-evil——那是另一个仓，只是名字恰好以它开头。
+//
+// 朴素 HasPrefix 会把它放过去，于是白名单从「允许一个仓」悄悄变成
+// 「允许所有以它开头的仓」。这类失效最阴：报告里规则照常在，一条坏事不判。
+func TestGateGoesRedOnAllowlistPrefixConfusion(t *testing.T) {
+	p := loadRepoPolicy(t)
+	root := t.TempDir()
+
+	writeFile(t, root, "ports/x.go", `package ports
+
+import "github.com/oekit/pkg-evil/secret"
+
+var _ = secret.X
+`)
+
+	vs, err := run(p, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range vs {
+		if v.Rule == "memory-core-stdlib-only" {
+			return
+		}
+	}
+	t.Fatal("白名单只放行登记的那个仓，名字相近的另一个仓必须让门禁变红")
+}
+
+// **目录限定必须生效**：白名单条目限定了 paths 时，在限定目录之外引用
+// 必须让门禁变红。
+//
+// 不限定也行，但那就放弃了粒度——白名单项会在 8 个核心目录里到处可用，
+// 包括作为地基的 types。限定了就必须真的限定。
+func TestGateGoesRedWhenAllowlistScopeMisses(t *testing.T) {
+	p := loadRepoPolicy(t)
+	root := t.TempDir()
+
+	// 该白名单条目限定 paths: ["ports"]，types 不在其中。
+	writeFile(t, root, "types/x.go", `package types
+
+import "github.com/oagentkit/guardx/logredact"
+
+var _ = logredact.Redact
+`)
+
+	vs, err := run(p, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range vs {
+		if v.Rule == "memory-core-stdlib-only" {
+			return
+		}
+	}
+	t.Fatal("白名单限定了目录，在限定之外的引用必须让门禁变红")
+}
+
+// **到期必须红**：白名单条目过了复核日期就该失效，逼人续期或拆除。
+//
+// 方向很重要：到期若只被解析、不被比较，例外就永远不过期——
+// 规则变成死条款，半年后没人知道它还挂着。
+func TestGateGoesRedOnExpiredAllowlist(t *testing.T) {
+	p := loadRepoPolicy(t)
+	root := t.TempDir()
+
+	// 把一条真实的白名单改成过期。
+	for i := range p.Rules {
+		if p.Rules[i].ID != "memory-core-stdlib-only" {
+			continue
+		}
+		p.Rules[i].AllowThirdParty[0].Until = "2020-01-01"
+	}
+
+	vs, err := run(p, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range vs {
+		if v.Rule == "memory-allowlist-expired" {
+			return
+		}
+	}
+	t.Fatal("白名单条目到期必须让门禁变红（到期不豁免等于例外无限期挂着）")
+}
+
+// **白名单登记不全必须响亮失败**：缺 reason / until / removal 的条目
+// 不许被默默放行——缺字段的失效形态是「放行生效且永不过期」，危险的那侧。
+func TestPolicyRejectsIncompleteAllowlistEntry(t *testing.T) {
+	base := `
+version: 1
+modules:
+  - id: types
+    roots: [types]
+    requires: []
+thresholds:
+  scan_roots: [types]
+rules:
+  - id: memory-core-stdlib-only
+    severity: error
+    scope: ["types"]
+    forbid_third_party_in: ["types"]
+    allow_third_party:
+      - path: github.com/oekit/pkg
+`
+	for _, suffix := range []string{
+		"        reason: 有理由\n        until: 2030-01-01\n",
+		"        reason: 有理由\n        removal: 拆掉\n",
+		"        until: 2030-01-01\n        removal: 拆掉\n",
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "p.yaml")
+		if err := os.WriteFile(path, []byte(base+suffix), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadPolicy(path); err == nil {
+			t.Fatalf("白名单条目缺字段必须加载失败（缺字段的失效形态是放行生效且永不过期）: %q", suffix)
+		}
+	}
+}
+
+// **有白名单却无执行体必须响亮失败**：那是一条死条款——
+// 写的人以为放行了，实际上规则根本不存在。
+func TestPolicyRejectsAllowlistWithoutExecutor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "p.yaml")
+	content := `
+version: 1
+modules:
+  - id: types
+    roots: [types]
+    requires: []
+thresholds:
+  scan_roots: [types]
+rules:
+  - id: memory-core-stdlib-only
+    severity: error
+    scope: ["types"]
+    allow_third_party:
+      - path: github.com/oekit/pkg
+        reason: 有理由
+        until: 2030-01-01
+        removal: 拆掉
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPolicy(path); err == nil {
+		t.Fatal("白名单没有执行体时必须加载失败（否则那是一条永不生效的死条款）")
+	}
+}

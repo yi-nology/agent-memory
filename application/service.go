@@ -80,7 +80,7 @@ func New(cfg Config, deps Deps) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	promo, err := promotion.New(deps.Store, deps.Escalation, promotion.Config{})
+	promo, err := promotion.New(promoStore{deps.Store}, deps.Escalation, promotion.Config{})
 	if err != nil {
 		return nil, err
 	}

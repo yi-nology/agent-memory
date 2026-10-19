@@ -67,9 +67,6 @@ type Provenance struct {
 	Tool string
 }
 
-// RedactedRawEvent 标记该捕获事件已脱敏（值对象，便于调用方显式表态）。
-type RedactedRawEvent struct{ RawEvent }
-
 // RawEvent 一条捕获事件：记忆流程的**素材**，尚未被判定是否值得记住。
 //
 // 素材可以任意多、任意杂；进不进长期记忆由晋升层决定，不在捕获层决定。

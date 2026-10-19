@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // violation 一条门禁违规。
@@ -63,7 +64,7 @@ func run(p *policy, repoRoot string) ([]violation, error) {
 			if err != nil {
 				return nil, err
 			}
-			violations, err := applyRule(fset, r, f, b)
+			violations, err := applyRule(fset, r, f, relPath(f, repoRoot), b)
 			if err != nil {
 				return nil, err
 			}
@@ -75,6 +76,11 @@ func run(p *policy, repoRoot string) ([]violation, error) {
 			}
 		}
 	}
+
+	// 白名单到期检查。方向很重要：白名单到期意味着「这个例外不再成立」，
+	// 而如果到期只被解析、不被比较，例外就永远不过期——规则会变成一条
+	// 死条款，半年后没人知道它还挂着。
+	out = append(out, checkAllowlistExpiry(p, time.Now())...)
 
 	// 模块依赖方向。
 	dv, err := checkDeps(p, fset, repoRoot)
@@ -168,7 +174,7 @@ func collect(r rule, repoRoot string) []string {
 }
 
 // applyRule 对单个文件跑一条规则。
-func applyRule(fset *token.FileSet, r rule, path string, content []byte) ([]violation, error) {
+func applyRule(fset *token.FileSet, r rule, path, rel string, content []byte) ([]violation, error) {
 	var out []violation
 
 	if r.ForbidRegex != nil {
@@ -218,6 +224,9 @@ func applyRule(fset *token.FileSet, r rule, path string, content []byte) ([]viol
 		for _, im := range f.Imports {
 			p := strings.Trim(im.Path.Value, `"`)
 			if strings.HasPrefix(p, modulePrefix) || isStdlib(p) {
+				continue
+			}
+			if allowedThirdParty(r.AllowThirdParty, p, rel) {
 				continue
 			}
 			out = append(out, violation{
@@ -379,6 +388,68 @@ func checkDeps(p *policy, fset *token.FileSet, repoRoot string) ([]violation, er
 func isStdlib(p string) bool {
 	first, _, ok := strings.Cut(p, "/")
 	return !ok || !strings.Contains(first, ".")
+}
+
+// allowedThirdParty 判定 import 路径是否被白名单放行。
+//
+// rel 是引用者所在的**仓内相对路径**，用于白名单条目上 paths 的目录限定。
+func allowedThirdParty(entries []allowEntry, impPath, rel string) bool {
+	for _, e := range entries {
+		if !prefixMatch(e.Path, impPath) {
+			continue
+		}
+		if len(e.Paths) == 0 {
+			return true
+		}
+		for _, d := range e.Paths {
+			if prefixMatch(d, rel) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// prefixMatch 判定 s 是否落在 base 之下。
+//
+// # 边界必须卡在路径分隔符上
+//
+// base = "github.com/oekit/pkg" 时，"github.com/oekit/pkg-evil/x" **不该**被
+// 放行——那是另一个仓，只是名字恰好以白名单项开头。朴素 HasPrefix 会把它
+// 放过去，于是白名单从「允许一个仓」悄悄变成「允许所有以它开头的仓」——
+// 而这正是「门禁假通过」最典型的形态：规则照常出现在报告里，一件坏事
+// 也不判。
+func prefixMatch(base, s string) bool {
+	if base == "" {
+		return false
+	}
+	if s == base {
+		return true
+	}
+	return strings.HasPrefix(s, base+"/")
+}
+
+// checkAllowlistExpiry 报告已过期的白名单条目。
+//
+// 报成违规而不是日志：到期意味着「这个例外不再成立」，它应该**逼人处理**
+// （续期并写明理由，或按 removal 条件拆掉），而不是躺在报告里没人看。
+func checkAllowlistExpiry(p *policy, now time.Time) []violation {
+	var out []violation
+	for _, r := range p.Rules {
+		for _, e := range r.AllowThirdParty {
+			if !allowExpired(now, e) {
+				continue
+			}
+			out = append(out, violation{
+				Rule: "memory-allowlist-expired",
+				Path: "<architecture-policy.yaml>",
+				Line: 0,
+				Text: fmt.Sprintf("规则 %s 的白名单条目 %s 已于 %s 到期", r.ID, e.Path, e.Until),
+				Note: "续期需写明理由，或按 removal 条件移除；到期不豁免，例外不许无限期挂着",
+			})
+		}
+	}
+	return out
 }
 
 func relPath(path, root string) string {

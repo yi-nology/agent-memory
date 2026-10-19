@@ -44,7 +44,7 @@ func (s *candidateStore) scanCandidate(rows *sql.Rows) (*types.Candidate, error)
 // 用「主体名 + 断言」而不是完整签名（types.AtomCard.Signature 带 EntityID）：
 // 候选阶段实体还没归一，EntityID 此时是空的，用它会让所有未归一候选撞成同一签名。
 func candidateSignature(c *types.Candidate) string {
-	return types.NormalizeAssertion(c.SubjectName + "\x00" + c.Assertion)
+	return types.NormalizeAssertion(c.SubjectName + types.SignatureSep + c.Assertion)
 }
 
 func (s *candidateStore) SaveCandidate(ctx context.Context, ns store.Namespace, c *types.Candidate) error {

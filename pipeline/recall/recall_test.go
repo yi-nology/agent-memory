@@ -47,6 +47,31 @@ func (f *fakeReader) ListRaw(_ context.Context, _ store.Namespace, _ time.Time, 
 	return f.raws, nil
 }
 
+// SearchAtoms 按查询词检索事实卡（假实现：子串匹配即可）。
+//
+// 假实现只要求能区分「命中」与「不命中」：召回测试关心的正是
+// 「查询词参与了**取数**」这件事，而不是检索算法本身好不好。
+func (f *fakeReader) SearchAtoms(_ context.Context, _ store.Namespace, query string, limit int) ([]*types.AtomCard, error) {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return nil, nil
+	}
+	var out []*types.AtomCard
+	for _, a := range f.atoms {
+		if !a.Active() {
+			continue
+		}
+		if !strings.Contains(a.Assertion, q) {
+			continue
+		}
+		out = append(out, a)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeReader) GetEntityPage(_ context.Context, _ store.Namespace, id string) (*types.EntityPage, error) {
 	if p, ok := f.pages[id]; ok {
 		return p, nil

@@ -164,23 +164,6 @@ CREATE TABLE IF NOT EXISTS entity_pages (
 CREATE INDEX IF NOT EXISTS entity_pages_dirty ON entity_pages (namespace, dirty, updated_at);
 
 -- 记忆树：组织视图。leaf 只持 atom_id（不复制正文，见 types/node.go）。
-CREATE TABLE IF NOT EXISTS memory_nodes (
-  namespace       TEXT NOT NULL,
-  id              TEXT NOT NULL,
-  parent_id       TEXT,
-  level           TEXT NOT NULL,
-  content         TEXT NOT NULL DEFAULT '',
-  topic           TEXT,
-  conversation_id TEXT,
-  atom_id         TEXT,
-  created_at      INTEGER NOT NULL,
-  updated_at      INTEGER NOT NULL,
-  metadata        TEXT NOT NULL DEFAULT '{}',
-  PRIMARY KEY (namespace, id)
-);
-CREATE INDEX IF NOT EXISTS nodes_parent ON memory_nodes (namespace, parent_id);
-CREATE INDEX IF NOT EXISTS nodes_level  ON memory_nodes (namespace, level);
-CREATE INDEX IF NOT EXISTS nodes_atom   ON memory_nodes (namespace, atom_id);
 
 -- 活跃实体栈（召回期代词消解）：LRU 淘汰 + 钉住，跨进程重启存活。
 CREATE TABLE IF NOT EXISTS thread_active_entities (

@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oekit/pkg/timex"
+
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
@@ -158,20 +160,31 @@ const (
 // 用**自然周**（周一起始）而不是 ISO 周：ISO 周的边界规则（哪一周算第一周）
 // 每年会变一次，而人记忆里的「上周」是「七天前那七天」。
 // 宁可与 ISO 差一点，也不要在跨年那几天算出反直觉的窗口。
+//
+// # 边界算术交给 oekit/pkg/timex
+//
+// 期初边界（BeginningOfDay/Week/Month）由 timex 算，它按墙钟重建而非按
+// 绝对时间截断——非整小时偏移的时区（+05:40）用 Truncate 会算错墙钟边界。
+// 周起始日由调用方显式传 time.Monday，与本包的「自然周」口径一致。
+//
+// **to 侧不取 timex 的 EndOfX**：那三个是闭区间的最后一纳秒
+// （下一周期起点 - 1ns），而本仓的窗口是**半开区间** `[from, to)`
+// （见 storage 层的窗口查询）。端点语义必须跟着调用方口径走，
+// 混用会让窗口少一纳秒或多一纳秒——差一纳秒在跨周期那一条记录上
+// 就是「这条情节算进上周还是本周」的差别。故 to 一律由 from 加整周期得出。
 func Window(p Period, at time.Time) (from, to time.Time, key string) {
 	at = at.UTC()
 	switch p {
 	case PeriodWeek:
-		wd := (int(at.Weekday()) + 6) % 7 // 周一=0
-		from = time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -wd)
+		from = timex.BeginningOfWeek(at, time.Monday)
 		to = from.AddDate(0, 0, 7)
 		return from, to, fmt.Sprintf("%04d-W%02d", from.Year(), (from.YearDay()-1)/7+1)
 	case PeriodMonth:
-		from = time.Date(at.Year(), at.Month(), 1, 0, 0, 0, 0, time.UTC)
+		from = timex.BeginningOfMonth(at)
 		to = from.AddDate(0, 1, 0)
 		return from, to, from.Format("2006-01")
 	default:
-		from = time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC)
+		from = timex.BeginningOfDay(at)
 		to = from.AddDate(0, 0, 1)
 		return from, to, from.Format("2006-01-02")
 	}

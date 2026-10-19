@@ -111,6 +111,16 @@ type AtomStore interface {
 	SaveAtom(ctx context.Context, ns Namespace, a *types.AtomCard) error
 	GetAtom(ctx context.Context, ns Namespace, id string) (*types.AtomCard, error)
 	ListAtoms(ctx context.Context, ns Namespace, f AtomFilter) ([]*types.AtomCard, error)
+	// ListAtomsByEntity 取某个实体名下的全部事实卡。
+	//
+	// **不按退役态过滤**：实体合并要把该实体名下**所有**卡（含已退役的）
+	// 一起迁到新归属——漏掉已退役的会让那些卡永远指向一个已经不存在的实体。
+	// 要「活跃的那部分」由调用方自己判（页面重生成就要）。
+	//
+	// 之所以单列一个方法而不让调用方用 ListAtoms + AtomFilter.EntityIDs：
+	// 后者的语义是「按归属过滤」，而「某个实体的全部卡」是页面与归一面
+	// 反复要用的一种**取数形态**——把它写进契约，各后端就不会各自实现一遍。
+	ListAtomsByEntity(ctx context.Context, ns Namespace, entityID string) ([]*types.AtomCard, error)
 	// FindAtomBySignature 按签名查事实（签名定义见 types.AtomCard.Signature）。
 	FindAtomBySignature(ctx context.Context, ns Namespace, signature string) (*types.AtomCard, error)
 	// SearchAtoms 词法检索。
@@ -134,7 +144,6 @@ type Stats struct {
 	Pages       int
 	DirtyPages  int
 	Episodes    int
-	Nodes       int
 }
 
 // EntityStore 实体与别名存取。
@@ -174,18 +183,6 @@ type PageStore interface {
 	RecordEntityPageRegenFailure(ctx context.Context, ns Namespace, entityID, reason string, at time.Time) error
 }
 
-// TreeStore 树投影存取。
-type TreeStore interface {
-	SaveNode(ctx context.Context, ns Namespace, n *types.MemoryNode) error
-	GetNode(ctx context.Context, ns Namespace, id string) (*types.MemoryNode, error)
-	// GetNodeByAtomID 查某事实挂在哪个叶子上（供「事实→树」反向定位）。
-	GetNodeByAtomID(ctx context.Context, ns Namespace, atomID string) (*types.MemoryNode, error)
-	// GetChildren parentID 为空表示取根。
-	GetChildren(ctx context.Context, ns Namespace, parentID string) ([]*types.MemoryNode, error)
-	GetTree(ctx context.Context, ns Namespace) ([]*types.MemoryNode, error)
-	DeleteNode(ctx context.Context, ns Namespace, id string, cascade bool) error
-}
-
 // EpisodeStore 情节与周期摘要存取。
 type EpisodeStore interface {
 	SaveEpisode(ctx context.Context, ns Namespace, e *types.Episode) error
@@ -218,7 +215,6 @@ type Store interface {
 	AtomStore
 	EntityStore
 	PageStore
-	TreeStore
 	EpisodeStore
 	JournalStore
 	MetaStore
@@ -238,10 +234,4 @@ type Store interface {
 type RawWriter interface {
 	SaveRaw(ctx context.Context, ns Namespace, ev *types.RawEvent) error
 	SaveRawBatch(ctx context.Context, ns Namespace, evs []*types.RawEvent) error
-}
-
-// AtomReader 是 AtomStore 的读取面小接口（召回阶段只需要这一片）。
-type AtomReader interface {
-	ListAtoms(ctx context.Context, ns Namespace, f AtomFilter) ([]*types.AtomCard, error)
-	SearchAtoms(ctx context.Context, ns Namespace, query string, limit int) ([]*types.AtomCard, error)
 }

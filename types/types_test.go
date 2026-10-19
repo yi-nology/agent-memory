@@ -66,7 +66,8 @@ func TestAtomActiveRejectsDoubleRetire(t *testing.T) {
 
 func TestAtomValidRejectsMissingEvidence(t *testing.T) {
 	// 没有出处的记忆既不能审计也不能推翻——形状校验必须在入库前拦住。
-	a := &AtomCard{ID: "a1", Confidence: ConfidenceHigh, Importance: ImportanceMed}
+	a := &AtomCard{ID: "a1", Assertion: "磁盘长期偏小",
+		Confidence: ConfidenceHigh, Importance: ImportanceMed}
 	if err := a.Valid(); err != ErrAtomNoEvidence {
 		t.Fatalf("缺 QuoteEventID 应判 ErrAtomNoEvidence，实得 %v", err)
 	}
@@ -82,6 +83,36 @@ func TestAtomValidRejectsMissingEvidence(t *testing.T) {
 	}
 }
 
+// 空白断言的事实卡没有内容——既召不回（召回片段就是断言），也审计不了。
+//
+// 这条曾经漏网：断言为空的事实卡能落库，进而让召回链在读它时解引用 nil
+// 崩溃（见 pipeline/recall/gather.go 的 snippet）。形状校验是最后一道闸。
+func TestAtomValidRejectsEmptyAssertion(t *testing.T) {
+	for _, blank := range []string{"", "   ", "\n\t "} {
+		a := &AtomCard{ID: "a1", Assertion: blank, QuoteEventID: "e1",
+			Confidence: ConfidenceHigh, Importance: ImportanceMed}
+		if err := a.Valid(); err != ErrAtomEmptyAssertion {
+			t.Fatalf("空白断言应判 ErrAtomEmptyAssertion（断言=%q），实得 %v", blank, err)
+		}
+	}
+}
+
+// 空白正文的事件在记忆流程里处处无物：提炼的提示词只带正文、
+// 全文索引只索引正文、召回片段也只有正文。
+func TestRawEventValidRejectsEmptyContent(t *testing.T) {
+	for _, blank := range []string{"", "   ", "\n\t "} {
+		ev := &RawEvent{ID: "e1", Type: EventTurnEnd, Content: blank}
+		if err := ev.Valid(); err != ErrRawEmptyContent {
+			t.Fatalf("空白正文应判 ErrRawEmptyContent（内容=%q），实得 %v", blank, err)
+		}
+	}
+	// 有正文的正常事件不受影响。
+	ok := &RawEvent{ID: "e1", Type: EventTurnEnd, Content: "磁盘长期偏小"}
+	if err := ok.Valid(); err != nil {
+		t.Fatalf("正常事件应合法，实得 %v", err)
+	}
+}
+
 // 归一过激会把互相矛盾的事实判成同一条——而该走的是送审不是合并。
 func TestSignatureKeepsContradictingFactsApart(t *testing.T) {
 	a := &AtomCard{EntityID: "e1", Assertion: "磁盘  剩余 2G"}
@@ -93,30 +124,6 @@ func TestSignatureKeepsContradictingFactsApart(t *testing.T) {
 	c := &AtomCard{EntityID: "e1", Assertion: "  磁盘  剩余 2G  "}
 	if a.Signature() != c.Signature() {
 		t.Fatal("空白差异应折叠成同一签名")
-	}
-}
-
-func TestNodeValidRejectsAtomOnWrongLevel(t *testing.T) {
-	id, atom := "n1", "a1"
-
-	leaf := &MemoryNode{ID: id, Level: LevelLeaf}
-	if err := leaf.Valid(); err != ErrLeafWithoutAtom {
-		t.Fatalf("叶节点无事实引用应判 ErrLeafWithoutAtom，实得 %v", err)
-	}
-
-	branch := &MemoryNode{ID: id, Level: LevelBranch, AtomID: &atom}
-	if err := branch.Valid(); err != ErrNonLeafWithAtom {
-		t.Fatalf("非叶持事实应判 ErrNonLeafWithAtom，实得 %v", err)
-	}
-
-	root := &MemoryNode{ID: id, Level: LevelRoot}
-	if err := root.Valid(); err != nil {
-		t.Fatalf("干净根节点应合法，实得 %v", err)
-	}
-
-	leaf.AtomID = &atom
-	if err := leaf.Valid(); err != nil {
-		t.Fatalf("叶节点持事实应合法，实得 %v", err)
 	}
 }
 

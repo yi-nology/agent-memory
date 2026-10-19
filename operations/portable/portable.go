@@ -33,8 +33,6 @@ import (
 	"archive/zip"
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +42,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/oekit/pkg/encoding"
 
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
@@ -65,7 +65,9 @@ type Manifest struct {
 	SourceNamespace string `json:"source_namespace"`
 	// SourceHost 来源宿主标识。
 	SourceHost string `json:"source_host"`
-	// Counts 各类条数。
+	// Counts 各类条数。键是**数据类别名**（raw / atoms / entities / …），
+	// 与 ImportReport.Counts 同键——往返比较（导出多少、导回多少）
+	// 靠的就是这层对齐，键若一边带文件后缀一边不带，就没法直接比。
 	Counts map[string]int `json:"counts"`
 	// Files 各数据文件的 SHA-256（十六进制），doctor 据此校验完整性。
 	Files map[string]string `json:"files"`
@@ -117,6 +119,11 @@ type ExportOptions struct {
 	Host string
 	// Limit 单类条数上限（0=不限）。
 	Limit int
+	// Now 打包时刻（0=用真实时钟）。
+	//
+	// 注入它的理由与 lifecycle.WithClock 相同：打包时刻会写进清单、
+	// 而清单是迁移包的一部分——它得可断言。
+	Now time.Time
 }
 
 // Export 把一个记忆库导出成包。
@@ -175,7 +182,7 @@ func Export(ctx context.Context, src Source, ns store.Namespace, w io.Writer, op
 
 	man := &Manifest{
 		FormatVersion:   FormatVersion,
-		CreatedAt:       time.Now().UTC(),
+		CreatedAt:       opt.Now.UTC(),
 		SourceNamespace: string(ns),
 		SourceHost:      opt.Host,
 		Counts:          map[string]int{},
@@ -256,9 +263,11 @@ func Export(ctx context.Context, src Source, ns store.Namespace, w io.Writer, op
 		if err := bw.Flush(); err != nil {
 			return err
 		}
-		man.Counts[name] = n
-		sum := sha256.Sum256([]byte(buf.String()))
-		man.Files[name] = hex.EncodeToString(sum[:])
+		// 计数用**类别名**（去掉 .jsonl 后缀），与 ImportReport.Counts 同键：
+		// 「导出多少、导回多少」是迁移最该被核对的一件事，
+		// 而两边的键若一边带后缀一边不带，这个核对就做不成。
+		man.Counts[strings.TrimSuffix(name, ".jsonl")] = n
+		man.Files[name] = encoding.Sha256Hex([]byte(buf.String()))
 
 		f, err := zw.Create(name)
 		if err != nil {
@@ -391,8 +400,7 @@ func Doctor(pkgPath string) (*DoctorReport, error) {
 			rep.Problems = append(rep.Problems, "读取 "+n+" 失败: "+err.Error())
 			continue
 		}
-		sum := sha256.Sum256(b)
-		if got := hex.EncodeToString(sum[:]); got != man.Files[n] {
+		if got := encoding.Sha256Hex(b); got != man.Files[n] {
 			rep.Problems = append(rep.Problems,
 				fmt.Sprintf("%s 校验和不符（期望 %s 实得 %s）", n, short(man.Files[n]), short(got)))
 		}

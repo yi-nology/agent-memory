@@ -23,6 +23,15 @@
   只查 `go.mod` 的 require 段是不够——require 是整个模块的账，而本仓允许
   「核心零依赖 + 存储层带驱动」两种纪律在同一份 go.mod 里并存，判据得落在
   谁真的引了它上。
+- **受控开口（2026-10-19 引入）**：纪律的出发点是「SDK 那一类会拆掉降级路径」，
+  而**纯 stdlib 的工具级模块**不引模型、不联网、不碰数据库，不破坏那条路径。
+  故开一个受控口子：`architecture-policy.yaml` 的 `allow_third_party` 段
+  逐条登记（`path` + `reason` + `until` + `removal`，可选 `paths` 限目录），
+  门禁放行。**缺任一字段在加载期即失败**（缺字段的失效形态是「放行生效
+  且永不过期」，危险的那侧）；**到期即红**（`memory-allowlist-expired`）——
+  到期不豁免，例外不许无限期挂着。路径匹配卡在路径分隔符上，
+  `oekit/pkg` 不会顺带放行 `oekit/pkg-evil`。
+  当前登记：`oekit/pkg`、`oagentkit/textx`、`oagentkit/guardx/logredact`。
 - 需要解析 YAML 的门禁工具单独成模块（`tools/archcheck/`），好让这条纪律
   成立时不把依赖带进核心。
 - `CGO_ENABLED=0` 是硬要求：SQLite 只能走纯 Go 驱动（`modernc.org/sqlite`，
@@ -105,6 +114,12 @@
    AWS 前缀，于是「部署用的访问凭据是 ghp_XXXX」整条漏掉——而那恰是最常见的一种。
    收录标准三条同时成立：① 不认识领域词；② 误报代价只是少几个字符；
    ③ **漏报代价不可逆**。
+   2026-10-19 起叠加 `guardx/logredact` 的规则表（互补而非包含，各有独占形态）。
+   **掩码类型名不许含敏感键名表里的词**——掩码形如 `«kind:****»`，kind 后跟冒号，
+   kind 若含 `credential`，key=value 那条规则会把自己的掩码再打码一次，
+   产出 `«url-«secret-assignment:****»»`：明文照样没了，但**审计失真**
+   （读掩码的人看到的形态标签和事实不是一回事）。首撞的是 `url-credential`，
+   已改名 `url-userinfo`；用例 `TestRedactorOutputHasNoNestedMask` 钉住。
 
 3. **抽取与判定必须分层。** 抽取调模型（会幻觉），判定要可复现。混在一起时，
    一次模型抖动就把幻觉写进长期记忆，数据看着完全正常。抽出来的一律是
@@ -128,8 +143,13 @@
 2. **转义必须匹配实际在用的那条 band。** 借 A 的转义规则去守 B 等于没有转义。
    本仓曾把转义借给 `guardx/injectband.SanitizeBody`，被 `ports/band_test.go`
    的攻击载荷用例当场打穿——它的 `tagRe` 是写死的、只认 `<system-reminder>` 家族。
-   **已撤掉该集成与依赖**，转义归 `ports.MemoryBand`（转义全部 `<`，一次挡住两类伪造）。
-   勿重复评估「为什么不借 guardx」。
+   **已撤掉该集成**，转义归 `ports.MemoryBand`（转义全部 `<`，一次挡住两类伪造）。
+   勿重复评估「为什么不借 injectband」。
+   ⚠️ 但**脱敏**是另一回事：2026-10-19 采纳了 `guardx/logredact` 的规则表
+   （只认形态、与 band 无关），与本仓自研兵底**互补而非包含**（各自独有的
+   形态见 `ports/redact.go` 的对照表）。借的是规则表，不是转义——这条界线
+   就是「转义规则与实际在用的那条 band 是一对」这条纪律的适用边界。
+   处置**顺序不可颠倒**（本仓在前、上游在后），理由见 `ports/redact.go`。
 
 3. **画像桶不参与多样性裁剪。** 画像是那个实体的摘要，裁掉它等于裁掉整个实体。
    而「实体事实多」恰恰是最该保留画像的情形——初版把画像算进单实体配额，

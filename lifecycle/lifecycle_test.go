@@ -141,11 +141,28 @@ func TestConsolidateMergesSameSignature(t *testing.T) {
 }
 
 // 保留期：退役「证据全部来自运行期错误」的事实。
+//
+// 判据读的是**证据事件**的来源标记，不是事实卡自己那个——
+// 事实卡的标记会随证据被更换/补上而过时，按它判会误伤。
+// 故这里把证据事件真的建出来。
 func TestRetentionRetiresRuntimeErrorAtoms(t *testing.T) {
 	s := seed(t)
 	ctx := context.Background()
+	_ = s.SaveRaw(ctx, ns, &types.RawEvent{
+		ID: "e1", Content: "合成出来的错误", Timestamp: now(),
+		Type: types.EventToolResult, Provenance: types.Provenance{
+			Origin: types.OriginModel, RuntimeError: true,
+		}})
+	_ = s.SaveRaw(ctx, ns, &types.RawEvent{
+		ID: "e2", Content: "真实发生的事", Timestamp: now(),
+		Type: types.EventManual, Provenance: types.Provenance{Origin: types.OriginUser}})
+	// e3：正常的事件，但事实卡自己的标记说是运行期错误（标记过时了）。
+	_ = s.SaveRaw(ctx, ns, &types.RawEvent{
+		ID: "e3", Content: "真实发生的事", Timestamp: now(),
+		Type: types.EventManual, Provenance: types.Provenance{Origin: types.OriginUser}})
 	_ = s.SaveAtom(ctx, ns, atom("a-bad", "ent1", "合成出来的错误", "e1", true))
 	_ = s.SaveAtom(ctx, ns, atom("a-good", "ent1", "真实发生的事", "e2", false))
+	_ = s.SaveAtom(ctx, ns, atom("a-stale", "ent1", "真实发生的事", "e3", true))
 
 	res, err := lifecycle.Retention(ctx, s, ns)
 	if err != nil {
@@ -162,11 +179,17 @@ func TestRetentionRetiresRuntimeErrorAtoms(t *testing.T) {
 	if !good.Active() {
 		t.Fatal("正常来源的事实不该被退役")
 	}
+	stale, _ := s.GetAtom(ctx, ns, "a-stale")
+	if !stale.Active() {
+		t.Fatal("事实卡自己的标记过时了（证据是正常事件），不该被退役")
+	}
 }
 
 // 压缩：后端专属能力，不支持的必须明说而不是静默跳过。
 func TestVacuumOnUnsupportedBackend(t *testing.T) {
-	err := lifecycle.Vacuum(context.Background(), struct{}{})
+	// 参数是接口而不是 any：调用方知道自己拿的是哪个后端，
+	// 「这个后端不支持」由传 nil 表达。
+	err := lifecycle.Vacuum(context.Background(), nil)
 	if err == nil {
 		t.Fatal("不支持的后端必须明确报错：静默跳过会让人以为压过了")
 	}
@@ -177,5 +200,32 @@ func TestVacuumOnSQLite(t *testing.T) {
 	s := seed(t)
 	if err := lifecycle.Vacuum(context.Background(), s); err != nil {
 		t.Fatalf("SQLite 应支持 VACUUM: %v", err)
+	}
+}
+
+// 退役时刻必须**可断言**：时钟写死成 time.Now() 时，
+// 测试只能断言「大概刚刚」，而「大概」在断言里等于「没断言」。
+func TestRetentionUsesInjectedClock(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+	_ = s.SaveRaw(ctx, ns, &types.RawEvent{
+		ID: "e1", Content: "合成出来的错误", Timestamp: now(), Type: types.EventToolResult,
+		Provenance: types.Provenance{Origin: types.OriginModel, RuntimeError: true},
+	})
+	_ = s.SaveAtom(ctx, ns, atom("a-bad", "ent1", "合成出来的错误", "e1", true))
+
+	fixed := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	if _, err := lifecycle.Retention(ctx, s, ns, lifecycle.WithClock(func() time.Time { return fixed })); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.ListJournal(ctx, ns, "a-bad", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("退役应写审计条目")
+	}
+	if !entries[0].At.Equal(fixed) {
+		t.Fatalf("审计条目的时刻应取注入的时钟，期望 %v，实得 %v", fixed, entries[0].At)
 	}
 }

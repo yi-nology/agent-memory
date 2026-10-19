@@ -68,8 +68,14 @@ func TestExportDoctorImportRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if man.Counts["raw.jsonl"] != 1 || man.Counts["atoms.jsonl"] != 1 {
+	// 计数的键是**数据类别名**，与 ImportReport.Counts 同键——
+	// 「导出多少、导回多少」是迁移最该被核对的一件事，
+	// 两边键不一致时这个核对做不成（而文件清单在 man.Files 里）。
+	if man.Counts["raw"] != 1 || man.Counts["atoms"] != 1 {
 		t.Fatalf("清单计数不对: %v", man.Counts)
+	}
+	if man.Files["raw.jsonl"] == "" || man.Files["atoms.jsonl"] == "" {
+		t.Fatalf("文件清单必须按文件名记校验和: %v", man.Files)
 	}
 	if man.SourceHost != "test-host" {
 		t.Fatalf("来源宿主没记进清单: %+v", man)

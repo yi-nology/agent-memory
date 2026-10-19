@@ -13,21 +13,37 @@ go 1.27
 //
 // 纪律：
 //   - 提交前跑 `make check`（build + vet + test + architecture-check）；
-//   - 核心零依赖：**只有 storage/ 允许第三方包**，其余模块只准 stdlib 与本仓
-//     （门禁 memory-core-stdlib-only 强制，make tidy-check 复核）；
+//   - 核心零依赖：默认只准 stdlib 与本仓；受控放行的纯 stdlib 工具级模块
+//     在 architecture-policy.yaml 的 allow_third_party 段逐条登记
+//     （带 reason + until + removal），由门禁 memory-core-stdlib-only 强制，
+//     make tidy-check 复核 go.mod 面；
 //   - 领域词（主机/集群/Pod/巡检/专家…）进本仓代码即红，由门禁强制；
 //   - 新依赖方向先改 architecture-policy.yaml 再写代码（policy 先行）。
 
-require modernc.org/sqlite v1.40.1
-
-// 下面三条是离线可解析的前提：modernc.org/sqlite 的 go.mod 钉的是更早的
+// 下面这条是离线可解析的前提：modernc.org/sqlite 的 go.mod 钉的是更早的
 // 版本，本机模块缓存里没有那些精确版本，而 MVS 取「最大」——显式抬到缓存里
 // 存在的版本即可，不改任何行为面。
 //
-// ⚠️ 这里**没有** guardx。曾经的设想是「借 injectband.SanitizeBody 做转义」，
-// 实测它是写死的 tagRe、只认 <system-reminder> 家族：拿它守 <memory-context>
-// 这条数据区，伪造的闭合标签原样穿过——见 ports/band.go 与本文件
-// docs/AGENT_MEMORY_PLAN_20261019.md §四 的偏离记录。转义因此归本仓自己所有。
+// ⚠️ 这里的第三方包分两类，**纪律不同**：
+//
+//   - lib/pq：数据库驱动，只出现在 storage/ 下（核心零依赖纪律的存储层例外）；
+//   - oekit/pkg、oagentkit/textx、oagentkit/guardx：纯 stdlib 工具级模块，
+//     进了核心，故必须在 architecture-policy.yaml 的 allow_third_party 段
+//     逐条登记理由与到期日（门禁加载期校验，缺一条即失败）。
+//
+// 曾经设想「借 guardx/injectband.SanitizeBody 做转义」，实测它是写死的 tagRe、
+// 只认 <system-reminder> 家族：拿它守 <memory-context> 这条数据区，伪造的
+// 闭合标签原样穿过——见 ports/band.go 与本文件
+// docs/AGENT_MEMORY_PLAN_20261019.md §四 的偏离记录。
+// 故**转义**归本仓自己所有；guardx 现在只被用在凭据脱敏规则表上。
+require (
+	github.com/lib/pq v1.10.9
+	github.com/oagentkit/guardx v0.5.0
+	github.com/oagentkit/textx v0.5.0
+	github.com/oekit/pkg v0.15.1
+	modernc.org/sqlite v1.40.1
+)
+
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect

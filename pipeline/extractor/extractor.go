@@ -20,6 +20,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oagentkit/textx/textutil"
+
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
@@ -304,15 +306,12 @@ func parseImportance(s string) types.Importance {
 // 容忍首尾的散文与 ``` 围栏：模型总会多说两句，那是格式噪声不是内容问题。
 // 但**不做**「找到第一个 { 就截到最后一个 }」这种宽松切法——那会把两段
 // 并列 JSON 粘成一段，报一个和真实病因无关的语法错。
+//
+// 围栏剥离交给 oekit/textx 的 textutil.StripCodeFence：它按「第一个围栏块
+// 的内容」取（语言标记 ```json 一并吃掉），而本仓原来那份手写实现与它
+// 逐条等价——本仓多写的那份只是没把语言标记处理得更细。
 func extractJSONArray(s string) string {
-	s = strings.TrimSpace(s)
-	if i := strings.Index(s, "```"); i >= 0 {
-		if j := strings.Index(s[i+3:], "```"); j >= 0 {
-			block := strings.TrimSpace(s[i+3 : i+3+j])
-			block = strings.TrimPrefix(block, "json") // 围栏的语言标记
-			s = strings.TrimSpace(block)
-		}
-	}
+	s = textutil.StripCodeFence(s)
 	if i := strings.Index(s, "["); i >= 0 {
 		if j := strings.LastIndex(s, "]"); j > i {
 			return s[i : j+1]

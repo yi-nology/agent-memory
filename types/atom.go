@@ -74,6 +74,17 @@ func (a *AtomCard) SoftRetired() bool {
 	return !a.Active()
 }
 
+// SignatureSep 签名的分隔符。
+//
+// 刻意**不是** NUL（0x00）：SQLite 的 TEXT 能装 NUL，**PostgreSQL 不能**
+// （PG 的 TEXT 禁止 0x00，插进去直接报 "invalid byte sequence for encoding UTF8"）。
+// 而签名是要**落库**的——它得在两个后端里长得一模一样，
+// 否则「同一批记忆换个部署形态」的去重行为就变了。
+//
+// 用 ASCII 单元分隔符（0x1F）：两个后端都接受，
+// 且它是控制字符，实际文本里不会出现——与用 NUL 的原意相同。
+const SignatureSep = "\x1f"
+
 // Signature 事实签名：实体 + 断言的归一形式。
 //
 // 用途是**重复检测**：同一件事被反复记录时，签名相同即候选重复，
@@ -82,5 +93,5 @@ func (a *AtomCard) SoftRetired() bool {
 // 归一规则刻意保守（只做空白折叠与首尾裁剪）：过度归一会把「磁盘剩 2G」与
 // 「磁盘剩 3G」判成同一条，而它们恰恰互相矛盾——该走的是送审不是合并。
 func (a *AtomCard) Signature() string {
-	return a.EntityID + "\x00" + NormalizeAssertion(a.Assertion)
+	return a.EntityID + SignatureSep + NormalizeAssertion(a.Assertion)
 }

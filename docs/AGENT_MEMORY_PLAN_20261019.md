@@ -455,6 +455,126 @@ octop 的 PG 实现 2,416 行 + 真实 `TEST_POSTGRES_DSN` 门禁。扁鹊记忆
 
 ---
 
+## 八、oekit / oagentkit 矩阵复用裁定（2026-10-19）
+
+> 触发：以 <https://oekit.github.io/llms.txt> 与 <https://oagentkit.github.io/llms.txt>
+> 两份清单为输入，评估能否用这两个矩阵简化本仓业务逻辑，并把矩阵不满足的地方
+> 提为上游 issue。
+
+### 8.1 先说结论
+
+**「全面简化」这个目标本身不成立**，原因不是矩阵不够好，而是**本仓的业务逻辑
+恰好是这两个矩阵不覆盖的那一层**。
+
+- oekit / oagentkit 是**通用基础设施矩阵**（微工具集、HTTP/RPC、缓存、并发、
+  熔断、日志、模型客户端、MCP、检索、Agent 编排）。它们**没有记忆内核**——
+  捕获 / 提炼 / 晋升 / 召回 / 实体归一 / 页面重生成 / 情节摘要 / 迁移包 /
+  生命周期这一整套语义，两个矩阵里一行都没有。
+- 本仓 10317 行非测试代码里，真正属于「通用轮子」的是约 800~1000 行
+  （TTL 缓存、手写排序、两份保序去重、手写日期边界、围栏剥离、掩码生成、
+  CLI 分发样板、JSON-RPC 帧、zip 容器 + 清单 + 体检）。
+
+故本轮的实际产出是：**采纳 6 处严格等价的替换 + 1 处真实能力补齐**，
+**并把矩阵的缺口提为 8 条上游 issue**。业务语义一行未动——那部分本来就不该
+被通用库接管。
+
+### 8.2 依赖地板（决定谁能进核心的硬事实）
+
+门禁 `memory-core-stdlib-only` 查的是**源码 import 面**，但依赖地板得先看模块
+的 `go.mod`（模块级 require 会进模块图，即便不参与构建）。逐模块核对结果：
+
+| 模块 | 版本 | 模块级 require | import 面 | 能否进核心 |
+|---|---|---|---|---|
+| `oekit/pkg` | v0.15.1 | **空** | 纯 stdlib | ✅ |
+| `oekit/concurrency` | v0.17.1 | `oekit/pkg`、`golang.org/x/time` | 除 ratelimit/retry-httpx 外纯 stdlib | ⚠️ 仅个别包 |
+| `oekit/core` | v0.9.2 | hertz、yaml.v3 | chain/transport/lifecycle/governance/network 纯 stdlib | ⚠️ 仅个别包 |
+| `oekit/logx` | v0.7.1 | `oekit/core`（→hertz） | 根包纯 stdlib | ⚠️ |
+| `oekit/timertask` | v0.1.9 | redis、logx… | **同包内带 redis** | ❌ |
+| `oagentkit/textx` | v0.5.0 | `oekit/pkg` | 纯 stdlib | ✅ |
+| `oagentkit/runtime` | v0.7.0 | `oekit/concurrency` | 随 concurrency | ⚠️ |
+| `oagentkit/guardx` | v0.5.0 | `oekit/logx`、`mvdan.cc/sh/v3` | logredact/fence/egress/permgate 纯 stdlib | ⚠️ 单包可入 |
+| `oagentkit/{llm,rag,obs,toolgate,skillkit}` | — | eino、milvus、hertz、yaml… | — | ❌ |
+| `oagentkit/queue` | v0.6.0 | lib/pq | worker 后端无关、pglease 绑定 PG | ⚠️ |
+
+两条由此得出的纪律：
+
+1. **矩阵不是「纯 stdlib 的集合」**。llms.txt 的措辞容易让人以为整包都是零依赖，
+   实际 `logx → core → hertz`、`guardx → logx + mvdan.cc/sh` 都会把第三方拖进
+   模块图。**判据要落到具体包的 import 面**。
+2. **「包级不可拆」是真实存在的形态**：`timertask` 的本地后端与 Redis 后端同包，
+   `import timertask` 即拉 redis——「有本地后端」在依赖面上并不存在。
+
+### 8.3 采纳（6 处，均已落地并有用例钉住）
+
+| # | 采纳 | 落点 | 等价性依据 |
+|---|---|---|---|
+| 1 | `oekit/pkg/timex` 的期初边界 | `pipeline/episode.Window` | `BeginningOfDay/Week/Month` 与原手写实现**逐字等价**（周一起始自然周、UTC）；`to` 侧**不取** `EndOfX`——那三个是闭区间末纳秒，而本仓窗口是半开区间 |
+| 2 | `oekit/pkg/container.Set` | `pipeline/recall`（suppress）、`lifecycle`、`pipeline/promotion` | 替掉 1 处手写 `map[string]bool` 与 2 份保序去重；保序由切片维持，Set 只当「已见集合」 |
+| 3 | `oekit/pkg/encoding.Sha256Hex` | `operations/portable` | 替掉 2 处手写 sha256+hex |
+| 4 | `oagentkit/guardx/logredact` | `ports.PatternRedactor` | **补齐四类形态**（Authorization 头、裸 Bearer、裸 JWT、截断私钥）与四个键名；与本仓兵底**互补而非包含** |
+| 5 | `oagentkit/textx/textutil.StripCodeFence` | `pipeline/extractor`、`pipeline/page` | 与原手写围栏剥离**逐条等价**；页面侧顺带补上围栏容错（原先每次模型重生成都失败一次） |
+| 6 | `oekit/pkg` 门禁白名单机制 | `tools/archcheck` + policy | 见 §8.4 |
+
+顺带（非 kit 驱动，但同批改）：`pipeline/recall` 的手写插入排序换成标准库
+`sort.SliceStable`——原注释写的理由是「不引第三方包到核心」，而 `sort` **是标准库**，
+那条理由本来就不成立。稳定性保留（同分片段的相对顺序是上游定的）。
+
+### 8.4 门禁改动：受控开口而非废除
+
+「核心零依赖」这条纪律的出发点是「SDK 那一类会拆掉降级路径」，而**纯 stdlib 的
+工具级模块不拆**。故开的不是废除，是**受控开口**：
+
+- policy 的 `memory-core-stdlib-only` 规则下新增 `allow_third_party` 段，
+  每条登记 `path` + `reason` + `until` + `removal`，可选 `paths` 限目录；
+- 门禁侧：路径匹配卡在路径分隔符上（`oekit/pkg` 不顺带放行 `oekit/pkg-evil`）、
+  **到期即红**（`memory-allowlist-expired`）、**缺字段在加载期即失败**
+  （缺字段的失效形态是「放行生效且永不过期」，危险的那侧）、
+  **有白名单却无执行体在加载期即失败**（那是死条款）；
+- 门禁自测新增 6 条，每条都测**坏代码上必须红**。
+
+### 8.5 不采纳（含理由，防重复评估）
+
+| 候选 | 不采纳的理由 |
+|---|---|
+| `oekit/pkg/cache.LocalCache` | ① `TTL>0` 时起后台 goroutine，撞「不引入宿主看不见的常驻件」；② 读命中返回**共享引用**，本仓必须返回副本（否则第二次命中即脏数据）；③ 淘汰是写序而非 LRU，热点靠读续命的场景不对。→ 已提 issue |
+| `oekit/pkg/errors`（`BizError`/`Wrap`） | `BizError` 带 HTTP 语义，本仓是内核不是 HTTP 服务；`Chain`/`In`/`Append` 与标准库 `errors.Join` 重叠。存储层现有 `fmt.Errorf("…: %w", err)` 风格已一致 |
+| `oagentkit/textx/textutil.EstTokensCJK` | 系数写死（≈1.5 CJK 字/token、3 ASCII 字符/token），与 octop 口径（2/4）差 **1.7 倍**——换过去等于同预算下召回条数少四成，是产品行为变更。→ 已提 issue |
+| `oagentkit/textx/textutil.Similarity` | 二元组 Jaccard ≠ 本仓的词元 Jaccard，同一对「已修复/未修复」的分数从 0.5 掉到 0.33，矛盾检测的阈值 0.6 判定会翻转 |
+| `oagentkit/guardx/injectband` | 早已裁定不借（转义规则与实际在用的 band 是一对，借错等于没有转义）。**本轮借的是 logredact 的规则表，与转义无关**——这条界线要守住 |
+| `oagentkit/{llm,obs,rag}` | 本仓的模型与向量化能力一律 `ports` 注入，内核不拥有模型客户端；向量面刻意不做 |
+| `oekit/concurrency/retry` | 本仓 SQLite 已设 `PRAGMA busy_timeout = 5000`，忙等问题已就地解决，引入退避重试是重复投资 |
+| `oagentkit/queue` | 实测 `worker` 是**后端无关**的（`TaskQueue`/`LeaseStore` 由调用方实现），无缺口；且本仓候选表无「running + 心跳」态，与队列模型不对位 |
+| `oekit/core/lifecycle.Manager` | 进程级关停编排；本仓 CLI 是短命的、bridge 读到 EOF 即退，用不上。而 `lifecycle` 包名撞车会让人分不清 `lifecycle.GC` 与 `lifecycle.Manager` |
+
+### 8.6 提给上游的 issue（8 条）
+
+| 仓 | issue | 要点 |
+|---|---|---|
+| oekit/pkg | [#24](https://github.com/oekit/pkg/issues/24) | 缺「归档容器」原语（zip + manifest + 每文件摘要 + 格式版本 + 体检） |
+| oekit/pkg | [#25](https://github.com/oekit/pkg/issues/25) | `LocalCache` 缺「无后台 goroutine」模式、缺「读命中返回副本」、淘汰非 LRU |
+| oekit/pkg | [#26](https://github.com/oekit/pkg/issues/26) | `stringx` 缺「正则 + 形态标签 + 保定位线索」的脱敏原语 |
+| oekit/pkg | [#27](https://github.com/oekit/pkg/issues/27) | 缺可单测的 CLI 子命令分发原语 |
+| oekit/timertask | [#14](https://github.com/oekit/timertask/issues/14) | 本地后端与 Redis 后端同包，import 即拉 redis |
+| oagentkit/textx | [#3](https://github.com/oagentkit/textx/issues/3) | `EstTokensCJK` 折算系数写死且不可配 |
+| oagentkit/textx | [#4](https://github.com/oagentkit/textx/issues/4) | 缺 CJK 逐字成词元 + 拉丁按词切的双语 tokenizer |
+| oagentkit/guardx | [#3](https://github.com/oagentkit/guardx/issues/3) | 规则表不可扩展/不可组合，且缺「保定位线索的不可逆掩码」 |
+
+### 8.7 顺带修掉的两个既有缺陷
+
+1. **掩码类型名撞敏感键名表**（`ports/redact.go`）。掩码形如 `«kind:****»`，
+   而 `kind` 后跟冒号：类型名 `url-credential` 里的 `credential` **本身就在
+   敏感键名表里**，于是 key=value 那条规则会把自己的掩码再打码一次，产出
+   `«url-«secret-assignment:****»»`。明文照样没了，但**审计失真**——读掩码的
+   人看到的形态标签和事实不是一回事。改名 `url-userinfo`，并加用例
+   `TestRedactorOutputHasNoNestedMask` 把「掩码必须惰性」变成可执行的约束。
+2. **门禁自身的三处**（`tools/archcheck`）：`severity` 字段声明了但**从未被执行**
+   （`warn` 与 `error` 行为相同）；`exceptions` 的 `until` 只解析不比较
+   （到期不豁免）；白名单的前缀匹配若用朴素 `HasPrefix`，`oekit/pkg` 会顺带
+   放行 `oekit/pkg-evil`。本轮修的是第三件（白名单从设计起就卡在分隔符上），
+   前两件记录在此待处置。
+
+---
+
 ## 附：本文事实来源
 
 | 事实 | 来源 |

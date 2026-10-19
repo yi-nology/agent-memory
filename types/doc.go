@@ -1,5 +1,5 @@
 // Package types 记忆领域的结构单源：捕获事件、提炼候选、事实卡、实体与页面、
-// 树投影、情节摘要与日志条目。
+// 情节摘要与日志条目。
 //
 // # 分层位置
 //
@@ -10,10 +10,10 @@
 // # 数据流（与 docs/AGENT_MEMORY_PLAN_20261019.md §1.1 对标 octop-memory）
 //
 //	RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard ──dirty/regen──→ EntityPage
-//	    └──episode extraction──→ Episode              └──AtomID 引用──→ tree leaf
+//	    └──episode extraction──→ Episode
 //
-// 树是**组织视图**：leaf 只持 AtomID，不复制内容，也不是独立的召回来源。
-// 事实的真源永远是 AtomCard。
+// 事实与情节是**两条独立的路**：一条走晋升、一条走摘要，互不依赖——
+// 没有情节一样能记住事实，反之亦然。
 //
 // # 与 octop-memory 的两处刻意偏离
 //
@@ -26,4 +26,8 @@
 //  2. **证据是必填的引用，不是可选的自由文本**。
 //     AtomCard.QuoteEventID 与 VerbatimQuote 成对存在：任何进入召回的事实
 //     都必须能回溯到一条具体的捕获事件，否则它无法被审计也无法被推翻。
+//
+//  3. **没有树投影**。octop 有 root/branch/leaf 的组织视图，本仓**刻意不做**
+//     （方案 §5：对本仓的适用场景价值有限，等真出现「同一事实挂多锚点」再启）。
+//     故本包不声明 MemoryNode——留着它等于让人以为那是个待启用的能力。
 package types

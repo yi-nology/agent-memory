@@ -21,6 +21,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oekit/pkg/container"
+
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
 )
@@ -35,6 +37,39 @@ type Store interface {
 	DeprecateAtom(ctx context.Context, ns store.Namespace, id string, at time.Time) error
 	ListEntities(ctx context.Context, ns store.Namespace, entityType types.EntityType, limit int) ([]*types.Entity, error)
 	AppendJournal(ctx context.Context, ns store.Namespace, e *types.JournalEntry) error
+}
+
+// Option 生命周期动作的可选项。
+type Option func(*opts)
+
+type opts struct {
+	now func() time.Time
+}
+
+// WithClock 注入时钟（测试用）。
+//
+// 为什么要注入：退役时刻与审计条目的时刻是**可断言的事实**——
+// 「这条事实是什么时候被退役的」是审计链上的一环。
+// 时钟写死成 time.Now() 时，测试只能断言「大概刚刚」，
+// 而「大概」在断言里等于「没断言」。
+//
+// 形参是 variadic，故既有调用点一行不动。
+func WithClock(now func() time.Time) Option {
+	return func(o *opts) {
+		if now != nil {
+			o.now = now
+		}
+	}
+}
+
+func newOpts(opt []Option) opts {
+	o := opts{now: func() time.Time { return time.Now().UTC() }}
+	for _, f := range opt {
+		if f != nil {
+			f(&o)
+		}
+	}
+	return o
 }
 
 // ── 回收 ──
@@ -54,7 +89,8 @@ type GCResult struct {
 // 一条事实的全部证据都被保留期清掉之后，它就成了一条**无法回溯**的断言——
 // 而无法回溯的记忆既不能审计也不能推翻（types.AtomCard 的不变量 1）。
 // 故 GC 顺带把这类事实退役：不是删，是标记为「证据已过期」。
-func GC(ctx context.Context, s Store, ns store.Namespace, before time.Time) (*GCResult, error) {
+func GC(ctx context.Context, s Store, ns store.Namespace, before time.Time, opt ...Option) (*GCResult, error) {
+	o := newOpts(opt)
 	if s == nil {
 		return nil, errors.New("lifecycle: 存储未装配")
 	}
@@ -90,12 +126,12 @@ func GC(ctx context.Context, s Store, ns store.Namespace, before time.Time) (*GC
 		if !allGone {
 			continue
 		}
-		if err := s.DeprecateAtom(ctx, ns, a.ID, time.Now().UTC()); err != nil {
+		if err := s.DeprecateAtom(ctx, ns, a.ID, o.now()); err != nil {
 			return res, err
 		}
 		res.AtomsRetired++
 		_ = s.AppendJournal(ctx, ns, &types.JournalEntry{
-			ID: "journal-gc-" + a.ID, At: time.Now().UTC(),
+			ID: "journal-gc-" + a.ID, At: o.now(),
 			Kind: types.JournalRetire, Subject: a.ID, Actor: types.DecidedRule,
 			Summary: "证据已过保留期，事实退役",
 		})
@@ -120,7 +156,8 @@ type ConsolidateResult struct {
 // 同一件事被反复记下时，事实面上会有多张同签名的卡。合并把它们归到一张，
 // 其余的**软退役**（SupersededBy 指向保留下来的那张），证据全部迁过去。
 // 退役而非删除的理由同包注释：被合并掉的那张卡曾经是真的。
-func Consolidate(ctx context.Context, s Store, ns store.Namespace) (*ConsolidateResult, error) {
+func Consolidate(ctx context.Context, s Store, ns store.Namespace, opt ...Option) (*ConsolidateResult, error) {
+	o := newOpts(opt)
 	if s == nil {
 		return nil, errors.New("lifecycle: 存储未装配")
 	}
@@ -156,7 +193,7 @@ func Consolidate(ctx context.Context, s Store, ns store.Namespace) (*Consolidate
 			}
 			merged := append(append([]string{}, keep.RawEventIDs...), a.RawEventIDs...)
 			keep.RawEventIDs = dedup(merged)
-			keep.UpdatedAt = time.Now().UTC()
+			keep.UpdatedAt = o.now()
 			if err := s.SaveAtom(ctx, ns, keep); err != nil {
 				return res, err
 			}
@@ -166,7 +203,7 @@ func Consolidate(ctx context.Context, s Store, ns store.Namespace) (*Consolidate
 			res.Merged++
 			res.EvidenceMoved += len(a.RawEventIDs)
 			_ = s.AppendJournal(ctx, ns, &types.JournalEntry{
-				ID: "journal-consolidate-" + a.ID, At: time.Now().UTC(),
+				ID: "journal-consolidate-" + a.ID, At: o.now(),
 				Kind: types.JournalSupersede, Subject: a.ID, Actor: types.DecidedRule,
 				Summary: "同签名事实合并到 " + keep.ID + "（签名 " + short(sig) + "）",
 			})
@@ -199,7 +236,8 @@ type RetentionResult struct {
 // 整条退役会误伤。只在「全部证据都标了运行期错误」时才退役——
 // 这与上游的措辞一致（「retire only automatic atoms whose evidence is entirely
 // marked as runtime failures」）。
-func Retention(ctx context.Context, s Store, ns store.Namespace) (*RetentionResult, error) {
+func Retention(ctx context.Context, s Store, ns store.Namespace, opt ...Option) (*RetentionResult, error) {
+	o := newOpts(opt)
 	if s == nil {
 		return nil, errors.New("lifecycle: 存储未装配")
 	}
@@ -209,15 +247,38 @@ func Retention(ctx context.Context, s Store, ns store.Namespace) (*RetentionResu
 	}
 	res := &RetentionResult{}
 	for _, a := range atoms {
-		if !a.Provenance.RuntimeError {
+		if len(a.RawEventIDs) == 0 {
 			continue
 		}
-		if err := s.DeprecateAtom(ctx, ns, a.ID, time.Now().UTC()); err != nil {
+		// 判据是「**全部**证据都来自运行期错误」，不是事实卡自己的那个标记。
+		//
+		// 这两者不等价：事实卡的来源凭证取自它的证据事件（见 promotion 落库），
+		// 但证据**后来被换掉/补上**时，事实卡自己的标记就过时了。
+		// 按文档说的「证据全部」判，才与上游的口径一致
+		// （「retire only automatic atoms whose evidence is entirely marked
+		// as runtime failures」）。
+		allRuntime := true
+		for _, id := range a.RawEventIDs {
+			ev, err := s.GetRaw(ctx, ns, id)
+			if err != nil {
+				// 查不动 ≠ 判定：存储故障时**不动**这条事实。
+				allRuntime = false
+				break
+			}
+			if !ev.Provenance.RuntimeError {
+				allRuntime = false
+				break
+			}
+		}
+		if !allRuntime {
+			continue
+		}
+		if err := s.DeprecateAtom(ctx, ns, a.ID, o.now()); err != nil {
 			return res, err
 		}
 		res.Retired++
 		_ = s.AppendJournal(ctx, ns, &types.JournalEntry{
-			ID: "journal-retention-" + a.ID, At: time.Now().UTC(),
+			ID: "journal-retention-" + a.ID, At: o.now(),
 			Kind: types.JournalRetire, Subject: a.ID, Actor: types.DecidedRule,
 			Summary: "证据全部为运行期错误，事实退役",
 		})
@@ -237,22 +298,33 @@ type Vacuumer interface {
 }
 
 // Vacuum 执行物理整理；后端不支持时返回明确的「不支持」而不是静默跳过。
-func Vacuum(ctx context.Context, s any) error {
-	v, ok := s.(Vacuumer)
-	if !ok {
+//
+// 参数是接口而不是 any：类型断言的责任应该在调用方，
+// 而调用方本来就知道自己拿的是哪个后端。
+func Vacuum(ctx context.Context, v Vacuumer) error {
+	if v == nil {
 		return fmt.Errorf("lifecycle: 该后端不支持物理整理")
 	}
 	return v.Vacuum(ctx)
 }
 
+// dedup 保序去重。
+//
+// 与 pipeline/promotion 的同名件是两份实现而非一处共享：两者分处平级包
+// （lifecycle 与 pipeline/promotion 之间不互相依赖），而合并它们需要先给
+// 这 10 行找一个「家」——而每个候选的家（types 是零依赖的地基、store 是
+// 持久化契约）都比这 10 行本身更不搭。故各留一份，语义保持一致。
+//
+// 保序是刻意的：证据列表的顺序承载「先发生的在前」，丢掉顺序就等于
+// 让审计读不出因果。
 func dedup(in []string) []string {
-	seen := map[string]bool{}
+	seen := container.NewSet[string]()
 	out := in[:0:0]
 	for _, s := range in {
-		if seen[s] {
+		if seen.Contains(s) {
 			continue
 		}
-		seen[s] = true
+		seen.Add(s)
 		out = append(out, s)
 	}
 	return out

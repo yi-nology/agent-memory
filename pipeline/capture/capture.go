@@ -13,6 +13,8 @@ package capture
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/yi-nology/agent-memory/ports"
@@ -114,6 +116,18 @@ func (c *Capturer) Capture(ctx context.Context, in Input) (*Outcome, error) {
 		ev.Timestamp = c.now()
 	}
 
+	// 闸：空白正文不收。
+	//
+	// 正文是事件在记忆流程里的唯一可检索载体（提炼的提示词只带正文、
+	// 全文索引只索引正文、召回片段也只有正文）。空白正文的事件一路可走
+	// 却处处无物：既提炼不出候选，也召不回片段——它只占存储、占索引。
+	//
+	// 拒收而不是报错：空白正文是宿主侧的常态失误（发了个空消息），
+	// 不是系统故障。与下面那道运行期错误闸同款处置。
+	if strings.TrimSpace(ev.Content) == "" {
+		return &Outcome{SkipReason: "正文为空：事件在记忆流程里无可提炼、无可召回的内容"}, nil
+	}
+
 	// 闸：自动捕获不收运行期错误。显式写入收——
 	// 人明确说「记这条」时，他的判断优先于自动判据。
 	if !in.Explicit && !ev.Capturable() {
@@ -137,8 +151,16 @@ func (c *Capturer) Capture(ctx context.Context, in Input) (*Outcome, error) {
 	}
 	ev.Payload = payload
 
+	// 载荷变没变：变了说明发生过脱敏处置，审计位要置真。
+	//
+	// 判据用**深比较**（reflect.DeepEqual），不是逐键比字符串：
+	// 载荷可以嵌套（map 里套 map、map 里套 []string），
+	// 而脱敏面会下探一层——嵌套里的凭据被打码后，
+	// 顶层看到的只是「某个 map 变了」，逐键比字符串会把它当成没变，
+	// 于是审计位（Provenance.Redacted）说「没脱敏过」，
+	// 而库里躺着的其实是一段被打码的文本。审计位撒谎比不打码更糟。
 	redacted := ports.RedactionApplied(in.Content, ev.Content)
-	if !redacted && !mapsEqual(in.Payload, ev.Payload) {
+	if !redacted && !reflect.DeepEqual(in.Payload, ev.Payload) {
 		redacted = true
 	}
 	// Provenance.Redacted 是审计位：导出、对外共享时按它决定能否带出去。
@@ -210,25 +232,4 @@ func redactPayload(ctx context.Context, r ports.Redactor, p map[string]any, ns, 
 		}
 	}
 	return out, nil
-}
-
-func mapsEqual(a, b map[string]any) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, av := range a {
-		bv, ok := b[k]
-		if !ok {
-			return false
-		}
-		as, aok := av.(string)
-		bs, bok := bv.(string)
-		if aok && bok {
-			if as != bs {
-				return false
-			}
-			continue
-		}
-	}
-	return true
 }

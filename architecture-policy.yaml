@@ -153,13 +153,16 @@ modules:
 
   - id: adapters-cli
     roots: [adapters/cli]
-    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall]
+    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall, pipeline-entity, lifecycle]
     owner: memory
     managed: true
     notes: |
       命令行面。`Run(args, stdout, stderr) int` 而非 `main()`——命令逻辑因此
-      可被单测直接调用，不用起子进程。CLI **不注入模型**：它是运维口
+      可被单测直接调用，不用起子进程。CLI **不注入模型**：它是管理口
       （看与搬），不是生成口。
+      requires 里的 pipeline-entity 与 lifecycle 是库管理面的依赖：
+      实体归一的修正（合并 / 登记别名）与生命周期四动作（回收 / 合并 /
+      保留期 / 物理整理）在内核里实现了却没有入口时，既不会被用也不会被验证。
 
   - id: cmd-memory
     roots: [cmd]
@@ -181,6 +184,31 @@ modules:
     owner: memory
     managed: true
     notes: JSON-RPC over stdio。跨语言/独立进程宿主的入口。
+
+  - id: integration
+    roots: [integration]
+    requires: [types, ports, store, pipeline-capture, pipeline-extractor, pipeline-promotion,
+               pipeline-recall, pipeline-entity, pipeline-page, pipeline-episode,
+               lifecycle, operations, operations-portable, application,
+               storage-sqlite, storage-parity]
+    owner: memory
+    managed: true
+    notes: |
+      跨包端到端测试的**专属位置**。
+
+      为什么要单列一个模块：架构门禁的依赖方向规则对 `_test.go` 同样生效，
+      而端到端用例天生要跨好几层（捕获 → 提炼 → 晋升 → 页面 → 情节 → 召回 → 迁移）。
+      没有这个位置时，那些用例要么写不进任何包（撞方向规则），
+      要么被塞进某个流水线包并顺手放宽它的 requires——
+      而「为了塞下一个测试而放宽生产包的依赖方向」是门禁最容易被绕过的一种方式。
+
+      故给它一块专门的 roots，并在这里放开全部需要的方向：
+      方向规则仍然对它生效（它不许反向依赖宿主与编排），
+      但它**可以**正当地把各层放在一起看。
+
+      它的价值是「接缝」：每条流水线各自单测都绿，
+      而主链在最后一环断掉（晋升不落库）这类缺陷，
+      只有走完整条链的用例才抓得到。
 
 # ── 规则段（由 tools/archcheck 逐条执行）──
 rules:
@@ -247,6 +275,22 @@ rules:
   # 只查 go.mod 的 require 段是不够的——require 是整个模块的账，而本仓的纪律
   # 是「核心零依赖、第三方只许出现在存储层」，两种纪律在同一份 go.mod 里并存
   # 是可接受的。判据必须落在 **import 面**上：谁真的引了它。
+  #
+  # ── 受控开口：allow_third_party ──
+  #
+  # 这条纪律不是「第三方一律不许进核心」，而是「第三方进核心必须逐条登记
+  # 理由与到期日」。理由是原纪律的出发点只关心**SDK 那一类**：模型 SDK、
+  # embedding SDK、HTTP 框架、数据库驱动——它们会把「没配模型时手工写入 +
+  # 词法召回必须能跑」这条降级路径拆掉。
+  #
+  # 而「纯 stdlib 的工具级模块」不破坏这条路径：它们不引模型、不联网、
+  # 不碰数据库，只把各仓都要重写一遍的轮子收进一处。故对这类模块开一个
+  # **受控开口**：默认仍然只许 stdlib 与本仓，每一条放行都必须写明
+  # 「放行什么 / 为什么 / 复核到哪天 / 什么条件下拆掉」，缺一条加载即失败。
+  #
+  # 门禁侧（tools/archcheck）：
+  #   - 路径匹配卡在路径分隔符上：pkg 不会顺带放行 pkg-evil；
+  #   - 到期即红（memory-allowlist-expired）：到期不豁免，例外不许无限期挂着。
   - id: memory-core-stdlib-only
     desc: |
       types / ports / store / pipeline / lifecycle / operations / application / adapters
@@ -256,10 +300,47 @@ rules:
       理由不是洁癖，是**降级路径**：没有模型时手工写入 + 词法召回必须能跑，
       没有数据库时领域模型必须能编译。核心一旦引了 SDK，这条路径就没了——
       而它塌了之后不会立刻暴露，它塌在「用户配了模型、装了数据库」的生产环境里。
+
+      受控开口：allow_third_party 段逐条登记的纯 stdlib 工具级模块可进核心。
+      每条带 reason + until + removal，缺一条门禁在加载期就失败。
     severity: error
     scope: ["types", "ports", "store", "pipeline", "lifecycle", "operations", "application", "adapters"]
     ignore_test: false
     forbid_third_party_in: ["types", "ports", "store", "pipeline", "lifecycle", "operations", "application", "adapters"]
+    allow_third_party:
+      - path: github.com/oekit/pkg
+        reason: |
+          纯 stdlib 微工具集（go.mod require 段为空，不引任何第三方）。
+          本仓用到三处：时间段的期初边界（timex，替掉手写的日/周/月墙钟算术）、
+          泛型集合（container，替掉两处重复的保序去重与两处手写已见集合）、
+          摘要入口（encoding，替掉两处手写 sha256+hex）。
+          三者都是「各仓都要重写一遍」且**边界易错**（大小月、闰年、周起始日）
+          的轮子，自研副本的漂移成本高于引用成本。
+        until: 2027-10-19
+        removal: |
+          该模块停更、出现不可接受的破坏性变更，或本仓自研出等价实现且
+          引用点回落到零时移除本条并回填自研实现。
+
+      - path: github.com/oagentkit/textx
+        reason: |
+          纯 stdlib（仅依赖 oekit/pkg）。用到 textutil 的代码围栏剥离：
+          模型输出常带 ``` 围栏，本仓在提炼面与页面重生成面各手写了一份，
+          而围栏形态（语言标记、闭合缺失、散文夹带）边界多。
+        until: 2027-10-19
+        removal: |
+          该模块停更，或本仓两处围栏处理都改走别的单源时移除。
+
+      - path: github.com/oagentkit/guardx/logredact
+        reason: |
+          凭据脱敏规则表，**单包 import 面纯 stdlib**（只用 regexp/strings/sort/sync）。
+          本仓自研兵底漏四类形态：Authorization 头、裸 Bearer、裸 JWT、
+          截断在中段的私钥块——而凭据一旦落库即不可逆（收录标准第三条），
+          漏报的代价是轮换都来不及。该包是上游单源，抄一份会立刻变成双源漂移。
+        until: 2027-10-19
+        removal: |
+          上游提供可组合/可扩展的规则表（见已提 issue）后改用组合式接入，
+          或本仓自研补齐那四类形态。
+        paths: ["ports"]
 
 thresholds:
   max_file_lines: 800

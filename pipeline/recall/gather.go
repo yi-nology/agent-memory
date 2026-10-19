@@ -37,18 +37,18 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 	var out []*candidate
 
 	if hasSource(p.cfg.Sources, SourceAtom) {
-		atoms, err := p.store.ListAtoms(ctx, req.Namespace, store.AtomFilter{
-			ActiveOnly: true,
-			Limit:      limit,
-		})
+		atoms, err := p.collectAtoms(ctx, req, limit)
 		if err != nil {
 			return nil, err
 		}
 		for _, a := range atoms {
-			c, err := p.snippet(ctx, SourceAtom, a.ID, a.EntityID, "记忆", a.Assertion,
+			c, ok, err := p.snippet(ctx, SourceAtom, a.ID, a.EntityID, "记忆", a.Assertion,
 				a.Importance, a.OccurredAt)
 			if err != nil {
 				return nil, err
+			}
+			if !ok {
+				continue // 空白断言：没有可注入的内容，跳过而不是崩掉
 			}
 			c.bucket = bucketAtom
 			c.dedupKey = a.EntityID + "\x00" + a.Signature()
@@ -63,10 +63,13 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 			return nil, err
 		}
 		for _, e := range raws {
-			c, err := p.snippet(ctx, SourceRaw, e.ID, "", "历史", e.Content,
+			c, ok, err := p.snippet(ctx, SourceRaw, e.ID, "", "历史", e.Content,
 				types.ImportanceLow, e.Timestamp)
 			if err != nil {
 				return nil, err
+			}
+			if !ok {
+				continue // 空白正文：没有可注入的内容
 			}
 			c.bucket = bucketQuote
 			c.dedupKey = "raw\x00" + e.ID
@@ -88,10 +91,13 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 			if page.Headline == "" {
 				continue
 			}
-			c, err := p.snippet(ctx, SourcePageHeadline, id, id, "画像", page.Headline,
+			c, ok, err := p.snippet(ctx, SourcePageHeadline, id, id, "画像", page.Headline,
 				types.ImportanceMed, page.UpdatedAt)
 			if err != nil {
 				return nil, err
+			}
+			if !ok {
+				continue // 空白画像：实体还没有实质画像
 			}
 			c.bucket = bucketHeadline
 			c.dedupKey = "headline\x00" + id
@@ -102,19 +108,92 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 	return out, nil
 }
 
+// collectAtoms 取事实卡候选：**查询命中 ∪ 高价值兜底**。
+//
+// # 为什么是两路而不是一路
+//
+// 早先这里只取一路（按重要度+新鲜度的前 N 条），查询词只参与**重排**。
+// 后果：候选池与「用户问了什么」无关——再相关的事实，只要排在池子之外，
+// 就永远进不了 prompt，而重排再准也无济于事。库越大，召回越不准。
+//
+// 现在两路各管一件事：
+//
+//   - 路 A 按**查询词**检索（「用户明确问的那件事」）；
+//   - 路 B 按**重要度/新鲜度**取（「最近与最重要的那些事」）。
+//
+// 路 B 保留的理由：召回不总是有查询词（Request.Query 可以为空），
+// 而且「最近发生的事」本身就是要召回的——用户问「那个盘的事」时，
+// 上一轮刚发生的相关事实即便字面不匹配也值得进 prompt。
+//
+// 两路合并后统一重排（rank），重排的排序键与路序无关。
+//
+// # 退役事实不进池
+//
+// 路 A 的检索**故意**能搜到已退役的事实（「当初为什么这么判」要能追问，
+// 见 store 的软退役约定），所以这里必须显式滤掉——
+// 否则一条被推翻的事实会照进 prompt，而它在数据上完全看不出异常。
+func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]*types.AtomCard, error) {
+	var hits []*types.AtomCard
+	if strings.TrimSpace(req.Query) != "" {
+		var err error
+		hits, err = p.store.SearchAtoms(ctx, req.Namespace, req.Query, limit)
+		if err != nil {
+			return nil, err
+		}
+	}
+	base, err := p.store.ListAtoms(ctx, req.Namespace, store.AtomFilter{
+		ActiveOnly: true,
+		Limit:      limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool, len(hits)+len(base))
+	out := make([]*types.AtomCard, 0, len(hits)+len(base))
+	add := func(a *types.AtomCard) {
+		if a == nil || seen[a.ID] {
+			return
+		}
+		if !a.Active() {
+			return // 退役/作废的事实不参与召回
+		}
+		seen[a.ID] = true
+		out = append(out, a)
+	}
+	for _, a := range hits {
+		add(a)
+	}
+	for _, a := range base {
+		add(a)
+	}
+	return out, nil
+}
+
 // snippet 造一个**已包裹**的候选片段。
 //
 // 包裹在这一层发生、而不是渲染时：片段一旦被造出来就是「可以进 prompt 的形态」，
 // 让它以明文形态存在等于给下游留了一条忘记包裹的路。
+//
+// # 第二个返回值：「有没有这一条」
+//
+// 空正文**不是错误，是「没有」**——所以它有自己一个返回值，而不是塞进 error。
+//
+// 早先这个位置返回 (nil, nil)，而三个调用点直接写 c.bucket = ...，
+// 于是一条空白正文的事件就让召回链解引用 nil 崩掉。空正文能落库是常态
+// （捕获层当时不校验正文非空），于是「一条空事件 → 之后每次召回都崩」。
+//
+// 现在两道防线：类型层拒绝空白正文（types.ErrRawEmptyContent），
+// 这里再挡一次，挡的是**绕过捕获层直接写库**的那条路径。
 func (p *Pipeline) snippet(ctx context.Context, src Source, refID, entityID, role, body string,
-	imp types.Importance, at time.Time) (*candidate, error) {
+	imp types.Importance, at time.Time) (*candidate, bool, error) {
 	if strings.TrimSpace(body) == "" {
-		return nil, nil
+		return nil, false, nil
 	}
 	wrapped := p.bander.WrapMemory(body)
 	n, err := p.est.Estimate(ctx, wrapped)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	return &candidate{
 		Snippet: Snippet{
@@ -122,7 +201,7 @@ func (p *Pipeline) snippet(ctx context.Context, src Source, refID, entityID, rol
 			Body: wrapped, Importance: imp, OccurredAt: at, Tokens: n,
 		},
 		plain: body,
-	}, nil
+	}, true, nil
 }
 
 // pushEntities 把本次召回命中的实体推进活跃实体栈。

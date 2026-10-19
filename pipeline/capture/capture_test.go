@@ -119,6 +119,48 @@ func TestPayloadSecretsAlsoRedacted(t *testing.T) {
 	}
 }
 
+// 审计位（Provenance.Redacted）在**嵌套**载荷被打码时也必须置真。
+//
+// 这条曾经是假的：审计位用「逐键比字符串」判断载荷变没变，
+// 而脱敏面会下探一层——嵌套里的凭据被打码后，顶层看到的只是
+// 「某个 map 变了」，逐键比字符串把它当成没变，于是审计位说「没脱敏过」。
+// 审计位撒谎比不打码更糟：导出时按它决定能不能带出去。
+func TestNestedPayloadRedactionSetsAuditBit(t *testing.T) {
+	s := &spyStore{}
+	c, _ := capture.New(s, ports.PatternRedactor{})
+	ipt := in("部署完成", types.Provenance{Origin: types.OriginTool})
+	// 只有嵌套层有凭据：顶层键值全是普通文本。
+	ipt.Payload = map[string]any{
+		"note":   "普通说明",
+		"nested": map[string]any{"token": "token=abcd1234efgh5678"},
+	}
+	out, err := c.Capture(context.Background(), ipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Redacted {
+		t.Fatal("嵌套载荷里的凭据被打码了，审计位必须置真")
+	}
+	if !s.saved[0].Provenance.Redacted {
+		t.Fatal("落库事件上的来源凭证也必须记下「已脱敏」")
+	}
+}
+
+// 载荷确实没被动时，审计位不该谎报「已脱敏」。
+func TestUnchangedPayloadKeepsAuditBitFalse(t *testing.T) {
+	s := &spyStore{}
+	c, _ := capture.New(s, ports.PatternRedactor{})
+	ipt := in("普通说明", types.Provenance{Origin: types.OriginUser})
+	ipt.Payload = map[string]any{"note": "普通说明", "count": 3}
+	out, err := c.Capture(context.Background(), ipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Redacted {
+		t.Fatal("没发生脱敏处置时审计位不该置真")
+	}
+}
+
 // ── 自动捕获的闸 ──
 
 // 合成的运行期错误不是「发生过的事」，不自动捕获。
@@ -139,6 +181,29 @@ func TestRuntimeErrorNotAutoCaptured(t *testing.T) {
 	}
 	if out.SkipReason == "" {
 		t.Fatal("拒收必须给理由：静默丢弃会让人以为记下来了")
+	}
+}
+
+// 空白正文的事件不收：正文是事件在记忆流程里的唯一可检索载体
+// （提炼的提示词只带正文、全文索引只索引正文、召回片段也只有正文）。
+// 空白正文落库后一路可走却处处无物，还会让召回链读它时崩溃。
+func TestEmptyContentNotCaptured(t *testing.T) {
+	for _, blank := range []string{"", "   ", "\n\t "} {
+		s := &spyStore{}
+		c, _ := capture.New(s, ports.PatternRedactor{})
+		out, err := c.Capture(context.Background(), in(blank, types.Provenance{Origin: types.OriginUser}))
+		if err != nil {
+			t.Fatalf("空白正文不该是错误（内容=%q）: %v", blank, err)
+		}
+		if out.Accepted {
+			t.Fatalf("空白正文不该入库（内容=%q）", blank)
+		}
+		if len(s.saved) != 0 {
+			t.Fatalf("被拒收的事件不该有任何写入（内容=%q）", blank)
+		}
+		if out.SkipReason == "" {
+			t.Fatalf("拒收必须给理由（内容=%q）", blank)
+		}
 	}
 }
 

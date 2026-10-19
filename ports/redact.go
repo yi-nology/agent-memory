@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/oagentkit/guardx/logredact"
 )
 
 // ErrNoRedactor 未注入脱敏器时的哨兵。
@@ -63,13 +65,25 @@ type Redactor interface {
 //
 // 收录标准三条同时成立：① 不认识任何领域词；② 误伤的代价只是少几个字符；
 // ③ 漏判的代价不可逆（凭据一旦落库就已经泄漏了）。
+//
+// # 类型名（kind）有一条硬约束
+//
+// **类型名里不许出现敏感键名表里的任何一个词**——掩码形如 `«kind:****»`，
+// 而 kind 后面跟着冒号：若 kind 里含 `credential`，那么 secret-assignment
+// 那条规则（键名表里有 credential）会**把自己的掩码再打码一次**，产出
+// `«url-«secret-assignment:****»»` 这种嵌套形态。
+//
+// 后果不是泄漏（明文照样没了），而是**审计失真**：读掩码的人看到的是
+// 「secret-assignment」，而实际被打码的是 URL 里的凭据——
+// 形态标签说的和事实不是一回事。故类型名一律避开键名表。
 var structuralPatterns = []struct {
 	name string
 	re   *regexp.Regexp
 	keep int // 保留前后各几个字符作为定位线索
 }{
 	// URL 里内嵌的凭据：https://user:pass@host
-	{"url-credential", regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@`), 0},
+	// 类型名用 userinfo（凭据所在的 URL 部位）而不用 credential——后者在键名表里。
+	{"url-userinfo", regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@`), 0},
 	// key=value / key: value 形态的敏感赋值。键名只收通用词。
 	{"secret-assignment", regexp.MustCompile(`(?i)\b(token|password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential)\b\s*[=:]\s*"?([^\s"',;]{4,})"?`), 0},
 	// 裸长十六进制串（≥32 位）：密钥/令牌的典型形态
@@ -97,9 +111,42 @@ var structuralPatterns = []struct {
 // 它存在的意义是：宿主没配自己的规则时，**凭据那一类仍然不出库**——
 // 而凭据是唯一一类「一旦落库即不可逆」的（其他内容删了就没了，凭据一旦进了
 // 备份与导出包，要靠轮换来补救，而轮换往往来不及）。
+//
+// # 两道处置，顺序是「本仓在前、上游在后」
+//
+// 本包的 5 条形态规则**不是**上游规则表的子集，两边各有独占形态：
+//
+//	形态              本仓          上游 guardx/logredact
+//	URL 内嵌凭据      任意 scheme   11 个 scheme 白名单（s3:// 等会漏）
+//	key=value 键名    8 个          更多（passphrase / secret_key / client_key）
+//	长十六进制 ≥32    有            **无**
+//	私钥块（完整）    有            有
+//	私钥块（截断）    **无**        有
+//	Authorization 头  **无**        有
+//	裸 Bearer        **无**        有
+//	裸 JWT           **无**        有
+//	已知前缀族        15 族         9 族（另有 sk-ant- / sk-proj- / xoxr- …）
+//
+// 故两道都跑，取并集。**顺序不可颠倒**，理由三条：
+//
+//  1. 本仓的掩码把整段匹配（含键名）换掉，键名随之消失，上游规则不会再
+//     命中它 → 不会二次打码；
+//  2. 反过来则相反：上游把 `token=xxx` 变成 `token=****`（键名还在、值已
+//     掩码），本仓的规则随后会再把它整段换成 `«secret-assignment:****»」——
+//     两层掩码叠在一起，形状变得不可预期；
+//  3. 本仓的掩码**保留首尾各 ≤4 字符**作定位线索，上游一律 `****`。
+//     本仓在前，已知前缀族（ghp_ / sk- / AKIA …）由本仓掩掉并留下线索；
+//     若上游在前，这几族会先被抹成 `****`，定位能力就此丢失。
+//
+// 代价：两种掩码风格会同时出现在一段文本里（`«secret-assignment:***»` 与
+// `Authorization=****`）。这是刻意的取舍——收录标准第三条说「漏报代价不可逆」，
+// 而定位线索只是「少几个字符就能补」的那一档。
 type PatternRedactor struct{}
 
 // Redact 逐条形态匹配并替换。
+//
+// 先跑本仓的 5 条形态规则，再跑上游 guardx/logredact 的规则表（取并集）。
+// 顺序理由见 PatternRedactor 的类型注释。
 func (PatternRedactor) Redact(_ context.Context, req RedactRequest) (string, error) {
 	out := req.Text
 	for _, p := range structuralPatterns {
@@ -107,7 +154,7 @@ func (PatternRedactor) Redact(_ context.Context, req RedactRequest) (string, err
 			return maskMatch(p.name, m, p.keep)
 		})
 	}
-	return out, nil
+	return logredact.Redact(out), nil
 }
 
 // maskMatch 把一处命中替换成可定位但不可复原的掩码。

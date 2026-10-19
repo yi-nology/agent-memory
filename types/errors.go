@@ -1,20 +1,15 @@
 package types
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
 
 // 本包的形状校验错误。
 //
 // 全部是**哨兵**（可 errors.Is），不用 fmt.Errorf 现场造字符串——
 // 造出来的错误值消费方判不出来，最后又退化成字符串匹配。
 var (
-	// ErrNodeNoID 节点缺标识。
-	ErrNodeNoID = errors.New("memory node: missing id")
-	// ErrLeafWithoutAtom 叶节点未持事实卡引用（正文无处投影）。
-	ErrLeafWithoutAtom = errors.New("memory node: leaf without atom reference")
-	// ErrNonLeafWithAtom 非叶节点持了事实卡引用（事实挂在不该在的位置）。
-	ErrNonLeafWithAtom = errors.New("memory node: non-leaf node carries atom reference")
-	// ErrNodeBadLevel 未知层级。
-	ErrNodeBadLevel = errors.New("memory node: unknown level")
 	// ErrAtomNoEvidence 事实卡无出处（QuoteEventID 为空）。
 	ErrAtomNoEvidence = errors.New("atom: missing evidence event reference")
 	// ErrAtomBadConfidence 置信档位非法。
@@ -23,6 +18,18 @@ var (
 	ErrAtomBadImportance = errors.New("atom: invalid importance level")
 	// ErrAtomDoubleRetired 同时被推翻且被作废。
 	ErrAtomDoubleRetired = errors.New("atom: superseded and deprecated at once")
+	// ErrAtomEmptyAssertion 事实卡断言为空白。
+	//
+	// 断言是事实卡**唯一的内容**——没有断言的事实卡既无法召回（召回片段
+	// 就是断言），也无法审计（审计看的是「它说了什么」）。
+	// 空白断言卡曾能落库，进而让召回链在读它时崩溃。
+	ErrAtomEmptyAssertion = errors.New("atom: empty assertion")
+	// ErrRawEmptyContent 捕获事件正文为空白。
+	//
+	// 正文是事件在记忆流程里的唯一可检索载体：提炼的提示词只带正文、
+	// 全文索引只索引正文、召回片段也只有正文。空白正文的事件落库后
+	// 一路可走却处处无物——它既提炼不出候选，也召不回片段。
+	ErrRawEmptyContent = errors.New("raw event: empty content")
 	// ErrCandidateNoSource 候选无素材来源。
 	ErrCandidateNoSource = errors.New("candidate: no raw event source")
 	// ErrCandidateUnknownStatus 候选状态未知。
@@ -52,6 +59,11 @@ func (a *AtomCard) Valid() error {
 	}
 	if a.SupersededBy != "" && !a.DeprecatedAt.IsZero() {
 		return ErrAtomDoubleRetired
+	}
+	// 空白断言的检查放在**最后**：它是内容面的瑕疵，而上面几条是状态面的
+	// 硬错误。让状态错误先报，调用方拿到的就是更可操作的那一个。
+	if strings.TrimSpace(a.Assertion) == "" {
+		return ErrAtomEmptyAssertion
 	}
 	return nil
 }
@@ -83,6 +95,11 @@ func (r *RawEvent) Valid() error {
 		EventToolResult, EventExternal, EventManual:
 	default:
 		return errors.New("raw event: unknown type")
+	}
+	// 空白正文的检查放在**最后**，理由同 AtomCard.Valid()：类型错是状态面的
+	// 硬错误，空白正文是内容面的瑕疵，前者更可操作。
+	if strings.TrimSpace(r.Content) == "" {
+		return ErrRawEmptyContent
 	}
 	return nil
 }

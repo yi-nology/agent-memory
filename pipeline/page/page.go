@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oagentkit/textx/textutil"
+
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
@@ -169,12 +171,24 @@ func (r *Regenerator) RegenerateOne(ctx context.Context, ns store.Namespace, ent
 // 它已经记进页面（失败原因 + 保持脏），不该让整轮重生成中断。
 // 只有存储故障才上抛。
 func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, entityID string, res *Result) error {
-	atoms, err := r.store.ListAtomsByEntity(ctx, ns, entityID)
+	all, err := r.store.ListAtomsByEntity(ctx, ns, entityID)
 	if err != nil {
 		return err
 	}
+	// 摘要只用**活跃**的事实：一条被推翻的事实进了画像，
+	// 画像就会同时说「磁盘长期偏小」和「磁盘已经扩容」——
+	// 而画像是给人看的一整段话，两句矛盾的话没法由读者分辨哪句算数。
+	//
+	// 被推翻的事实并没有丢：它仍在事实卡里，仍可被搜到并看到「已被谁取代」
+	// （见 types.AtomCard 的软退役约定）。摘要不必承担那份责任。
+	atoms := make([]*types.AtomCard, 0, len(all))
+	for _, a := range all {
+		if a.Active() {
+			atoms = append(atoms, a)
+		}
+	}
 	if len(atoms) == 0 {
-		// 没有事实就没有页面可写。标脏保持不变（事实将来会有），
+		// 没有活跃事实就没有页面可写。标脏保持不变（事实将来会有），
 		// 但这轮不算失败。
 		res.Skipped++
 		return nil
@@ -229,8 +243,13 @@ func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, ent
 //
 // 严格：只认 JSON 对象，字段缺失即失败。**不许**「解析不出来就当空页面」——
 // 那会把一次模型抖动变成「这个实体的画像没了」，而用户看不出区别。
+//
+// 围栏容忍不算「宽松」：模型被要求输出 JSON 时，经常连着 ```json 围栏一起
+// 给。不剥围栏的结果是每次模型重生成都失败一次，而失败保持脏标记、
+// 于是这个实体的画像永远重生成不出来。剥离交给 oekit/textx 的
+// textutil.StripCodeFence；「字段缺失即失败」那条不变。
 func parsePage(raw string) (headline, body string, err error) {
-	s := strings.TrimSpace(raw)
+	s := textutil.StripCodeFence(raw)
 	if i := strings.Index(s, "{"); i >= 0 {
 		if j := strings.LastIndex(s, "}"); j > i {
 			s = s[i : j+1]

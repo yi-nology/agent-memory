@@ -131,7 +131,7 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 	// 决定的，于是合并结果会随机变。同一类 bug 在原始事件面上修过一次
 	// （时间存纳秒 + id 次序），这里是同一课的第二处。
 	q := `SELECT ` + atomCols + ` FROM atoms WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY importance DESC, occurred_at DESC, id ASC LIMIT ?`
+		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT ?`
 	args = append(args, limitOf(f.Limit, 50))
 
 	rows, err := s.query(ctx, q, args...)
@@ -148,6 +148,42 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// importanceOrderExpr 重要度的排序表达式。
+//
+// 为什么不直接 `ORDER BY importance DESC`：importance 列是 TEXT，
+// 字典序下 'med' > 'low' > 'high'，于是**最重要的排在最后**——
+// 而召回的候选池就是 ListAtoms 的前 N 条（N 默认 50），
+// 事实卡一多，最重要的那批最先被裁掉，而它们恰恰是最该进 prompt 的。
+// 晋升的矛盾检测、生命周期三件套、迁移包导出也都走 ListAtoms，
+// 于是「按字典序取前 N 条」这件事会渗进所有依赖它的动作。
+//
+// 映射从 types.Importance 的枚举值**程序化**生成，而不是手写一遍：
+// 真源始终是 types.Importance.Rank()，不会出现「SQL 里一套、Go 里另一套」的漂移。
+//
+// 为什么不把列改成 INTEGER：那要一条迁移路径，而本仓的 schema 是
+// CREATE TABLE IF NOT EXISTS 建表、没有 ALTER 机制——改列会让**已有库**
+// 的形状与新代码对不上，而「旧形状的库被新代码按新形状读」正是本仓
+// 明确要防的失效（见 sqlite.go 的 schema_version 注释）。故列保持 TEXT，
+// 排序在此归一。
+func importanceOrderExpr() string {
+	parts := make([]string, 0, 3)
+	for _, imp := range []types.Importance{types.ImportanceHigh, types.ImportanceMed, types.ImportanceLow} {
+		parts = append(parts, fmt.Sprintf("WHEN '%s' THEN %d", imp, imp.Rank()))
+	}
+	return "CASE importance " + strings.Join(parts, " ") + " ELSE 0 END"
+}
+
+func (s *atomStore) ListAtomsByEntity(ctx context.Context, ns store.Namespace, entityID string) ([]*types.AtomCard, error) {
+	if entityID == "" {
+		return nil, nil
+	}
+	// 不按退役态过滤：实体合并要把名下**所有**卡（含已退役的）一起迁走。
+	return s.ListAtoms(ctx, ns, store.AtomFilter{
+		EntityIDs: []string{entityID},
+		Limit:     100000,
+	})
 }
 
 func (s *atomStore) FindAtomBySignature(ctx context.Context, ns store.Namespace, signature string) (*types.AtomCard, error) {
@@ -235,12 +271,11 @@ func (s *atomStore) CountStats(ctx context.Context, ns store.Namespace) (store.S
 		(SELECT COUNT(*) FROM entities    WHERE namespace = ?),
 		(SELECT COUNT(*) FROM entity_pages WHERE namespace = ?),
 		(SELECT COUNT(*) FROM entity_pages WHERE namespace = ? AND dirty = 1),
-		(SELECT COUNT(*) FROM episodes    WHERE namespace = ?),
-		(SELECT COUNT(*) FROM memory_nodes WHERE namespace = ?)`,
+		(SELECT COUNT(*) FROM episodes    WHERE namespace = ?)`,
 		nsOf(ns), nsOf(ns), nsOf(ns), string(types.CandidatePending), nsOf(ns),
-		nsOf(ns), nsOf(ns), nsOf(ns), nsOf(ns), nsOf(ns), nsOf(ns))
+		nsOf(ns), nsOf(ns), nsOf(ns), nsOf(ns), nsOf(ns))
 	err := row.Scan(&st.RawEvents, &st.Candidates, &st.Pending, &st.Atoms,
-		&st.ActiveAtoms, &st.Entities, &st.Pages, &st.DirtyPages, &st.Episodes, &st.Nodes)
+		&st.ActiveAtoms, &st.Entities, &st.Pages, &st.DirtyPages, &st.Episodes)
 	if err != nil {
 		return store.Stats{}, err
 	}

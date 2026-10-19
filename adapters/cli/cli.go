@@ -14,6 +14,15 @@
 //	export    导出成 .hmpkg
 //	import    导入 .hmpkg
 //	doctor    检查 .hmpkg 完整性
+//
+// 库管理面（见 admin.go）：
+//
+//	gc           按龄回收原始事件（并顺带退役证据全没的事实）
+//	consolidate  合并同签名事实
+//	retention    退役证据全来自运行期错误的事实
+//	vacuum       物理整理（后端专属）
+//	entity       实体归一面的修正：list / merge / alias
+//	episode      列出情节
 package cli
 
 import (
@@ -54,6 +63,21 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	cmd := args[0]
 	rest := args[1:]
 
+	// 子命令：entity 的三个子动作。
+	//
+	// 必须在建 FlagSet **之前**摘出来——flag 包遇到第一个非 flag 参数就停，
+	// 「entity merge --to X」里的 merge 会被留在 fs.Args() 里，
+	// 后面的 --to/--from 就再也解析不到了。
+	sub := ""
+	if cmd == "entity" {
+		if len(rest) == 0 {
+			fmt.Fprintln(stderr, "entity 需要一个子命令：list / merge / alias")
+			return 2
+		}
+		sub = rest[0]
+		rest = rest[1:]
+	}
+
 	fs := flag.NewFlagSet("memory "+cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
@@ -70,6 +94,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		limit     = fs.Int("limit", 10, "条数上限")
 		out       = fs.String("out", "", "导出包路径")
 		pkg       = fs.String("pkg", "", "迁移包路径")
+		before    = fs.Duration("before", 30*24*time.Hour, "回收保留期（早于此刻多久的原始事件）")
+		toID      = fs.String("to", "", "合并目标实体 ID")
+		fromID    = fs.String("from", "", "合并来源实体 ID")
+		entityID  = fs.String("entity", "", "实体 ID 或规范名")
+		alias     = fs.String("alias", "", "要登记的别名")
+		entType   = fs.String("entity-type", "", "实体类型（宿主给定）")
 	)
 	if err := fs.Parse(rest); err != nil {
 		return 2
@@ -106,6 +136,31 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return cmdDoctor(stdout, stderr, *pkg)
+
+	// ── 库管理面 ──
+	case "gc":
+		return cmdGC(ctx, opt, stdout, stderr, *before)
+	case "consolidate":
+		return cmdConsolidate(ctx, opt, stdout, stderr)
+	case "retention":
+		return cmdRetention(ctx, opt, stdout, stderr)
+	case "vacuum":
+		return cmdVacuum(ctx, opt, stdout, stderr)
+	case "entity":
+		switch sub {
+		case "list":
+			return cmdEntityList(ctx, opt, stdout, stderr, *limit)
+		case "merge":
+			return cmdEntityMerge(ctx, opt, stdout, stderr, *toID, *fromID)
+		case "alias":
+			return cmdEntityAlias(ctx, opt, stdout, stderr, *entityID, *alias, *entType)
+		default:
+			fmt.Fprintf(stderr, "entity 未知子命令: %s\n", sub)
+			return 2
+		}
+	case "episode":
+		return cmdEpisodeList(ctx, opt, stdout, stderr, *sessionID, *limit)
+
 	case "-h", "--help", "help":
 		usage(stdout)
 		return 0
@@ -127,6 +182,16 @@ func usage(w io.Writer) {
   memory export  --out <包路径>
   memory import  --pkg <包路径>
   memory doctor  --pkg <包路径>
+
+库管理面:
+  memory gc [--before 720h]              按龄回收原始事件（默认保留 30 天）
+  memory consolidate                     合并同签名事实
+  memory retention                       退役证据全来自运行期错误的事实
+  memory vacuum                          物理整理（后端专属）
+  memory entity list [--limit N]         列出实体
+  memory entity merge --to ID --from ID  合并两个实体
+  memory entity alias --entity ID --alias A [--entity-type T]
+  memory episode list [--session S]      列出情节
 
 全局选项:
   --db <路径>        记忆库文件（默认 memory.sqlite）

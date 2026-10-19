@@ -1,8 +1,11 @@
 package recall
 
 import (
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/oekit/pkg/container"
 
 	"github.com/yi-nology/agent-memory/types"
 )
@@ -22,16 +25,16 @@ import (
 // 刻意**不做**的：不按相似度做语义去重。那需要向量或模型，成本与不确定性都不小，
 // 而这里要的只是「别把明显重复的东西塞两遍」。
 func (p *Pipeline) suppress(in []*candidate, req Request) ([]*candidate, int) {
-	seen := map[string]bool{}
+	seen := container.NewSet[string]()
 	dup := 0
 	out := in[:0:0]
 	for _, c := range in {
 		if c.dedupKey != "" {
-			if seen[c.dedupKey] {
+			if seen.Contains(c.dedupKey) {
 				dup++ // 闸 3
 				continue
 			}
-			seen[c.dedupKey] = true
+			seen.Add(c.dedupKey)
 		}
 		if c.Source == SourceRaw && req.SessionID != "" && c.rawSession == req.SessionID {
 			continue // 闸 1
@@ -152,17 +155,12 @@ func diversify(cands []*candidate, perEntityMax int) ([]*candidate, int) {
 }
 
 func sortByScore(cands []*candidate) {
-	// 插入排序：候选池上限 50，且大部分时候已经接近有序（存储层已按重要度排过）。
-	// 上排序库在这里是纯开销，而本仓的纪律是不引第三方包到核心。
-	for i := 1; i < len(cands); i++ {
-		x := cands[i]
-		j := i - 1
-		for j >= 0 && cands[j].score < x.score {
-			cands[j+1] = cands[j]
-			j--
-		}
-		cands[j+1] = x
-	}
+	// 用标准库的稳定排序。手写插入排序在这里曾是「不引第三方包到核心」的
+	// 产物——而 sort 是**标准库**，那条理由本来就不成立。
+	//
+	// 稳定性必须保留：同分的片段之间的相对顺序是上游定的（存储层按重要度
+	// 排过），换成不稳定排序会在同分时悄悄换序，而那在结果里看不出来。
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score < cands[j].score })
 }
 
 var _ = types.ImportanceMed

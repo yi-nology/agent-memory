@@ -43,6 +43,44 @@ jobs:
       - name: make check
         run: make check
 
+  # PG 后端的行为一致性：必须对着**真实服务器**跑。
+  #
+  # 为什么单独一段而不是塞进 check 段：PG 用例要连一个真库，
+  # 而「本地跑得动 make check」不该被「本机有没有装 PG」绑架。
+  # 但它又是**必须在 CI 里真跑**的——「skipped 的 PG 用例不证明兼容」，
+  # 若 CI 里不跑，「SQLite 与 PG 行为一致」这句话就永远没人验过。
+  #
+  # 环境变量名与 storage/postgres 的 DsnEnv 一致（见该包的 DsnEnv 注释）。
+  pg:
+    name: PG 后端行为断言（真库）
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BQ_MEMORY_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: PG parity（真库）
+        run: go test ./storage/postgres/ -count=1 -v
+
   # 发布物自检：tag 打出来的东西必须能被「下游按版本号引入」的方式解析。
   #
   # 为什么单独一段：主模块的 go.mod 刻意零第三方依赖（结构性地可验证），

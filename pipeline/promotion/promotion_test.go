@@ -17,13 +17,16 @@ func now() time.Time { return time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC) }
 
 // fakeStore 记下每次调用，用于断言「五道检查各自碰了哪些表」。
 type fakeStore struct {
-	raws    map[string]*types.RawEvent
-	atoms   []*types.AtomCard
-	ents    map[string]*types.Entity
-	savedA  []*types.AtomCard
-	merged  []*types.AtomCard
-	status  map[string]types.CandidateStatus
-	failGet bool
+	raws     map[string]*types.RawEvent
+	atoms    []*types.AtomCard
+	ents     map[string]*types.Entity
+	savedA   []*types.AtomCard
+	merged   []*types.AtomCard
+	status   map[string]types.CandidateStatus
+	journal  []*types.JournalEntry
+	counts   map[string]int
+	failGet  bool
+	failSave bool
 }
 
 func newFake() *fakeStore {
@@ -31,6 +34,7 @@ func newFake() *fakeStore {
 		raws:   map[string]*types.RawEvent{},
 		ents:   map[string]*types.Entity{},
 		status: map[string]types.CandidateStatus{},
+		counts: map[string]int{},
 	}
 }
 
@@ -79,15 +83,40 @@ func (f *fakeStore) SaveEntity(_ context.Context, _ store.Namespace, e *types.En
 	return nil
 }
 
+// ListEntities 供升级通道消歧用。
+func (f *fakeStore) ListEntities(_ context.Context, _ store.Namespace, _ types.EntityType, limit int) ([]*types.Entity, error) {
+	out := make([]*types.Entity, 0, len(f.ents))
+	for _, e := range f.ents {
+		out = append(out, e)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// Transaction 窄事务：把**自己**交给回调。
+//
+// 真实后端给的是「事务内的那一份」存储；测试里给同一份即可——
+// 「回调拿到的存储在不在事务里」是存储层的责任，
+// 晋升层只负责**用回调给的那份**而不是外层那份。
+func (f *fakeStore) Transaction(ctx context.Context, fn func(context.Context, promotion.Store) error) error {
+	return fn(ctx, f)
+}
+
 func (f *fakeStore) SaveAlias(context.Context, store.Namespace, *types.Alias) error { return nil }
 
 func (f *fakeStore) SaveAtom(_ context.Context, _ store.Namespace, a *types.AtomCard) error {
+	if f.failSave {
+		return errors.New("写事实卡失败：磁盘满")
+	}
 	f.savedA = append(f.savedA, a)
 	f.atoms = append(f.atoms, a)
 	return nil
 }
 
-func (f *fakeStore) BumpEntityAtomCount(context.Context, store.Namespace, string, int) error {
+func (f *fakeStore) BumpEntityAtomCount(_ context.Context, _ store.Namespace, entityID string, delta int) error {
+	f.counts[entityID] += delta
 	return nil
 }
 
@@ -97,7 +126,8 @@ func (f *fakeStore) UpdateCandidateStatus(_ context.Context, _ store.Namespace, 
 	return nil
 }
 
-func (f *fakeStore) AppendJournal(context.Context, store.Namespace, *types.JournalEntry) error {
+func (f *fakeStore) AppendJournal(_ context.Context, _ store.Namespace, e *types.JournalEntry) error {
+	f.journal = append(f.journal, e)
 	return nil
 }
 

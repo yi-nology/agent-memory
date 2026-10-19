@@ -6,6 +6,13 @@
 //	      → diversify（去同质）→ budget（分桶配额）→ thread_state（活跃实体栈）
 //	      → cache（TTL 缓存）
 //
+// # 取数是两路：查询命中 ∪ 高价值兜底
+//
+// 事实卡这一路的取数走两条线（见 gather.collectAtoms）：
+// 按**查询词**检索的那一路，以及按**重要度/新鲜度**取的那一路。
+// 查询词只参与重排是不够的——那样候选池与「用户问了什么」无关，
+// 再相关的事实只要排在池子之外就永远进不了 prompt。
+//
 // # 两条不可协商的纪律
 //
 //  1. **召回内容是不可信内容。** 它来自别的会话、别的用户、别的宿主。
@@ -203,7 +210,7 @@ func (c Config) normalize() (Config, error) {
 
 // Reader 召回链用到的存储面。
 //
-// 刻意**不直接吃 store.Store**：召回只用得到 5 个方法，声明全量接口会让
+// 刻意**不直接吃 store.Store**：召回只用得到 6 个方法，声明全量接口会让
 // 单元测试被迫实现 40 多个方法，也让「召回依赖了存储的哪些面」在类型上看不出来。
 // store/store.go 的包注释里写了这条纪律（「阶段只声明自己需要的子接口」），
 // 这里是对它自己的遵守。
@@ -212,6 +219,13 @@ func (c Config) normalize() (Config, error) {
 // page_headline），而这里说的是「数据从哪读」，两个概念挨太近反而容易混谈。
 type Reader interface {
 	ListAtoms(ctx context.Context, ns store.Namespace, f store.AtomFilter) ([]*types.AtomCard, error)
+	// SearchAtoms 按查询词检索事实卡。
+	//
+	// 它是**取数**的一面（不是重排）：查询词必须参与「捞哪几条」，
+	// 否则召回对「用户问了什么」只有排序上的响应、没有取数上的响应——
+	// 候选池之外再相关的事实也进不来。
+	// 故这一条不能省，尽管它让接口从 5 个方法变成 6 个。
+	SearchAtoms(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.AtomCard, error)
 	ListRaw(ctx context.Context, ns store.Namespace, before time.Time, p store.Page) ([]*types.RawEvent, error)
 	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string) (*types.EntityPage, error)
 	UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error
@@ -248,11 +262,14 @@ func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*
 	if err != nil {
 		return nil, err
 	}
-	return &Pipeline{
+	p := &Pipeline{
 		cfg: norm, store: s, est: est, bander: bander,
-		cache: newCache(norm.CacheTTL),
-		now:   func() time.Time { return time.Now().UTC() },
-	}, nil
+		now: func() time.Time { return time.Now().UTC() },
+	}
+	// 缓存用流水线自己的时钟：两处时间不一致时，「缓存过期」这条行为
+	// 就没法在测试里复现。
+	p.cache = newCache(norm.CacheTTL, p.now)
+	return p, nil
 }
 
 // Config 取归一后的配置（供装配层自检与测试）。

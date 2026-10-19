@@ -19,6 +19,11 @@ import (
 // 同一问题在 TTL 内仍会拿到旧答案。写入路径要能立刻失效，见 CacheTTL 字段注释。
 type cache struct {
 	ttl time.Duration
+	// now 时钟。刻意注入而不是直接 time.Now()：
+	// 流水线自己有可注入的时钟（p.now），缓存却用真实时间，
+	// 于是「缓存过期」这条行为在测试里不可控——
+	// 而它恰好是召回面最容易出「第二次问同一问题才显现」的那类问题。
+	now func() time.Time
 	mu  sync.Mutex
 	m   map[string]entry
 }
@@ -28,11 +33,14 @@ type entry struct {
 	expiresAt time.Time
 }
 
-func newCache(ttl time.Duration) *cache {
+func newCache(ttl time.Duration, now func() time.Time) *cache {
 	if ttl <= 0 {
 		return nil // nil 接收者的方法全部安全，这是 Go 的惯用法
 	}
-	return &cache{ttl: ttl, m: make(map[string]entry)}
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
+	return &cache{ttl: ttl, now: now, m: make(map[string]entry)}
 }
 
 func (c *cache) get(key string) (*Result, bool) {
@@ -45,7 +53,7 @@ func (c *cache) get(key string) (*Result, bool) {
 	if !ok {
 		return nil, false
 	}
-	if time.Now().After(e.expiresAt) {
+	if c.now().After(e.expiresAt) {
 		delete(c.m, key)
 		return nil, false
 	}
@@ -60,7 +68,7 @@ func (c *cache) put(key string, res *Result) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.m[key] = entry{res: cloneResult(res), expiresAt: time.Now().Add(c.ttl)}
+	c.m[key] = entry{res: cloneResult(res), expiresAt: c.now().Add(c.ttl)}
 }
 
 // purge 清过期项。
@@ -74,7 +82,7 @@ func (c *cache) purge() int {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := time.Now()
+	now := c.now()
 	n := 0
 	for k, e := range c.m {
 		if now.After(e.expiresAt) {
