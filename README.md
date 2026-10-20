@@ -7,12 +7,15 @@
 把召回结果取走。这条分工对标 [TencentCloud/octop-memory](https://github.com/TencentCloud/octop-memory)
 的自我定位，完整设计与裁定见 [`docs/AGENT_MEMORY_PLAN_20261019.md`](docs/AGENT_MEMORY_PLAN_20261019.md)。
 
+> **要动手改这个仓？** 先读 [`docs/AI_GUIDE.md`](docs/AI_GUIDE.md)——
+> 改造落点地图、改动后的验证路径、症状→病因索引。
+
 ```
 RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard ──dirty/regen──→ EntityPage
     └──episode extraction──→ Episode
 ```
 
-## 现在有什么（v0.4.0）
+## 现在有什么（v0.5.1）
 
 | 面 | 状态 | 位置 |
 |---|---|---|
