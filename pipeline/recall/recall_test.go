@@ -41,6 +41,11 @@ func (f *fakeReader) ListAtoms(_ context.Context, _ store.Namespace, flt store.A
 		if len(flt.EntityIDs) > 0 && !containsStr(flt.EntityIDs, a.EntityID) {
 			continue
 		}
+		// 归属过滤同理：假存储必须真的按归属筛，
+		// 否则「取数层生效」这条用例是靠召回层的兜底蒙对的。
+		if flt.Scope != "" && !a.Scope.VisibleTo(flt.Scope) {
+			continue
+		}
 		if flt.Limit > 0 && len(out) >= flt.Limit {
 			break
 		}
@@ -58,15 +63,24 @@ func containsStr(list []string, want string) bool {
 	return false
 }
 
-func (f *fakeReader) ListRaw(_ context.Context, _ store.Namespace, _ time.Time, _ store.Page) ([]*types.RawEvent, error) {
-	return f.raws, nil
+func (f *fakeReader) ListRaw(_ context.Context, _ store.Namespace, scope types.Scope,
+	_ time.Time, _ store.Page) ([]*types.RawEvent, error) {
+	var out []*types.RawEvent
+	for _, e := range f.raws {
+		if scope != "" && !e.Scope.VisibleTo(scope) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // SearchAtoms 按查询词检索事实卡（假实现：子串匹配即可）。
 //
 // 假实现只要求能区分「命中」与「不命中」：召回测试关心的正是
 // 「查询词参与了**取数**」这件事，而不是检索算法本身好不好。
-func (f *fakeReader) SearchAtoms(_ context.Context, _ store.Namespace, query string, limit int) ([]*types.AtomCard, error) {
+func (f *fakeReader) SearchAtoms(_ context.Context, _ store.Namespace, query string,
+	flt store.AtomFilter) ([]*types.AtomCard, error) {
 	q := strings.TrimSpace(query)
 	if q == "" {
 		return nil, nil
@@ -79,8 +93,14 @@ func (f *fakeReader) SearchAtoms(_ context.Context, _ store.Namespace, query str
 		if !strings.Contains(a.Assertion, q) {
 			continue
 		}
+		if len(flt.EntityIDs) > 0 && !containsStr(flt.EntityIDs, a.EntityID) {
+			continue
+		}
+		if flt.Scope != "" && !a.Scope.VisibleTo(flt.Scope) {
+			continue
+		}
 		out = append(out, a)
-		if limit > 0 && len(out) >= limit {
+		if flt.Limit > 0 && len(out) >= flt.Limit {
 			break
 		}
 	}
@@ -125,7 +145,9 @@ func atom(id, entity, text string, imp types.Importance) *types.AtomCard {
 	}
 }
 
-func newPipe(t *testing.T, f *fakeReader, cfg recall.Config) *recall.Pipeline {
+// newPipe 造一条召回流水线。存储面吃 recall.Reader（不是具体类型）——
+// 于是用例可以塞进各种假存储（记过滤条件的、无视过滤条件的…）。
+func newPipe(t *testing.T, f recall.Reader, cfg recall.Config) *recall.Pipeline {
 	t.Helper()
 	if cfg.Sources == nil && cfg.TotalBudget == 0 {
 		cfg = recall.DefaultConfig()

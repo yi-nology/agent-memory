@@ -139,11 +139,16 @@ func (s *Service) Recall(ctx context.Context, req recall.Request) (*recall.Resul
 }
 
 // Search 检索事实卡。
-func (s *Service) Search(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.AtomCard, error) {
+//
+// 带过滤条件（而不是只带 limit）：归属过滤必须在**取数层**生效，
+// 交给调用方后置过滤的话，被别家占掉的 TopK 配额已经花掉了。
+// 条件里最要紧的是 AtomFilter.Scope（读者归属，空=不隔离）。
+func (s *Service) Search(ctx context.Context, ns store.Namespace, query string,
+	f store.AtomFilter) ([]*types.AtomCard, error) {
 	if ns == "" {
 		ns = s.cfg.Namespace
 	}
-	return s.store.SearchAtoms(ctx, ns, query, limit)
+	return s.store.SearchAtoms(ctx, ns, query, f)
 }
 
 // Get 取一条事实卡。

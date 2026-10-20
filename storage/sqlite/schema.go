@@ -20,7 +20,7 @@
 package sqlite
 
 // schemaVersion 当前 schema 版本。新增迁移时 +1，并在 migrations 里追加一段。
-const schemaVersion = 1
+const schemaVersion = 2
 
 // schema 建表语句。
 //
@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS raw_events (
   session_id     TEXT NOT NULL DEFAULT '',
   thread_id      TEXT NOT NULL DEFAULT '',
   user           TEXT NOT NULL DEFAULT '',
+  scope          TEXT NOT NULL DEFAULT '',
   ts             INTEGER NOT NULL,
   type           TEXT NOT NULL,
   content        TEXT NOT NULL DEFAULT '',
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   promotion_reason    TEXT NOT NULL DEFAULT '',
   extractor_version   TEXT NOT NULL DEFAULT '',
   session_id          TEXT NOT NULL DEFAULT '',
+  scope               TEXT NOT NULL DEFAULT '',
   created_at          INTEGER NOT NULL,
   decided_at          INTEGER,
   decided_by          TEXT NOT NULL DEFAULT '',
@@ -94,10 +96,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS candidate_fts USING fts5(
 );
 
 -- 事实卡：长期记忆的真源。superseded_by 与 deprecated_at 至多其一非空。
+-- scope 是记录级归属（空=全局可见，非空=仅同归属可见，见 types/scope.go）。
+--
+-- ⚠️ 这一列的**索引**不在本文件里，而在迁移里（见 migrate.go）：
+-- 本文件的 DDL 每次打开都跑，而旧库（v1 形状）的 atoms 表还没有这一列——
+-- 建索引的语句会当场失败，整个库就都打不开了。
 CREATE TABLE IF NOT EXISTS atoms (
   namespace       TEXT NOT NULL,
   id              TEXT NOT NULL,
   entity_id       TEXT NOT NULL DEFAULT '',
+  scope           TEXT NOT NULL DEFAULT '',
   candidate_id    TEXT NOT NULL DEFAULT '',
   raw_event_ids   TEXT NOT NULL DEFAULT '[]',
   assertion       TEXT NOT NULL DEFAULT '',

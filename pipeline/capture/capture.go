@@ -46,6 +46,11 @@ type Input struct {
 	ThreadID string
 	// User 用户标识。
 	User string
+	// Scope 记录级归属（空=全局）。
+	//
+	// 归属在**捕获时**定下来，一路继承到候选与事实卡：
+	// 中途不让模型参与（模型看不见归属，让它写只会写出一个编的值）。
+	Scope types.Scope
 	// Type 事件类型。
 	Type types.RawEventType
 	// Content 正文。
@@ -106,6 +111,7 @@ func (c *Capturer) Capture(ctx context.Context, in Input) (*Outcome, error) {
 		SessionID:  in.SessionID,
 		ThreadID:   in.ThreadID,
 		User:       in.User,
+		Scope:      in.Scope,
 		Timestamp:  in.At,
 		Type:       in.Type,
 		Content:    in.Content,

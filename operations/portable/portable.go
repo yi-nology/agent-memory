@@ -27,6 +27,15 @@
 //
 // doctor 存在的原因是迁移是**最容易出静默错误**的环节：包缺了一半，
 // 导入「成功」了，而宿主从此拥有一段残缺的记忆——而记忆库不会告诉你它缺了什么。
+//
+// # 归属与向量在包里的位置
+//
+//   - **归属**（types.Scope）随行：每条记录带自己的归属，导入时原样还原。
+//     导出是库管理动作，故**不按归属筛选**——要的是全量。
+//   - **向量**（types.AtomCard.Vector）默认**不在包里**（`omitempty`）：
+//     本仓的两个后端都不落向量，故包里的记录也永远没有向量。
+//     若拿到一个带向量的外来包，导入会**响亮失败**
+//     （见 store.AtomStore.SaveAtom：向量不落库，静默丢掉更坏）。
 package portable
 
 import (
@@ -103,7 +112,10 @@ var ErrCorrupt = errors.New("portable: 包已损坏")
 
 // Source 导出面用到的存储。
 type Source interface {
-	ListRaw(ctx context.Context, ns store.Namespace, before time.Time, p store.Page) ([]*types.RawEvent, error)
+	// ListRaw 列出原始事件。**归属不隔离**（传空值）：
+	// 导出是库管理动作，要的是全量——各组的事件在包里各带各的归属，
+	// 导入时原样还原。
+	ListRaw(ctx context.Context, ns store.Namespace, scope types.Scope, before time.Time, p store.Page) ([]*types.RawEvent, error)
 	ListCandidates(ctx context.Context, ns store.Namespace, f store.CandidateFilter) ([]*types.Candidate, error)
 	ListAtoms(ctx context.Context, ns store.Namespace, f store.AtomFilter) ([]*types.AtomCard, error)
 	ListEntities(ctx context.Context, ns store.Namespace, entityType types.EntityType, limit int) ([]*types.Entity, error)
@@ -134,7 +146,7 @@ func Export(ctx context.Context, src Source, ns store.Namespace, w io.Writer, op
 		limit = 100000
 	}
 
-	raws, err := src.ListRaw(ctx, ns, time.Time{}, store.Page{Limit: limit})
+	raws, err := src.ListRaw(ctx, ns, "", time.Time{}, store.Page{Limit: limit})
 	if err != nil {
 		return nil, err
 	}

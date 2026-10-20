@@ -27,6 +27,13 @@ type AtomCard struct {
 	ID string
 	// EntityID 归属实体标识（无归属时为空串——全局事实是合法记忆）。
 	EntityID string
+	// Scope 记录级归属（空=全局可见，非空=仅同归属可见）。
+	//
+	// 与 EntityID 是两回事：EntityID 说「这条事实说的是谁」，
+	// Scope 说「这条事实对谁可见」。见 types/scope.go。
+	//
+	// 零值即全局：既有事实卡全是全局的，故加这个维度不改变老数据的可见性。
+	Scope Scope
 	// CandidateID 晋升自哪条候选（审计链闭合）。
 	CandidateID string
 	// RawEventIDs 证据来源事件标识。
@@ -58,6 +65,30 @@ type AtomCard struct {
 	DeprecatedAt time.Time
 	// Provenance 来源凭证。
 	Provenance Provenance
+	// Vector 可选向量（**当前不进默认持久化**）。
+	//
+	// # 它为什么在这儿
+	//
+	// 走语义轨的宿主需要一个「向量放哪儿」的落脚点。
+	// 没有它，宿主只能在自己的模型上**另加一列**（另加一个平行结构），
+	// 于是本仓的领域结构与宿主的模型对不上，两边都要维护。
+	//
+	// # 它为什么是「可选的」
+	//
+	// 本仓的定案是「向量轨不接」（见 AGENTS.md）：向量检索是第二阶段的替换件，
+	// 不是第一阶段的前提。故默认序列化**不含**它（`omitempty`），
+	// 持久化形态一字不变。
+	//
+	// # 不许把它交给本仓的存储
+	//
+	// 两个后端都不落向量（见 store.AtomStore.SaveAtom 的说明）：
+	// 写了会被**静默丢掉**——那比报错更坏（宿主以为存上了，
+	// 症状是「相似度检索永远空」）。
+	// 故 SaveAtom 见到非空向量**直接报错**。
+	//
+	// 留着的意义：宿主可以在**内存里**用本仓的结构带着向量
+	// （自己落库、自己检索），不必为了带一个向量而复制一份平行模型。
+	Vector []float32 `json:"Vector,omitempty"`
 }
 
 // Active 事实卡是否参与召回。
@@ -85,13 +116,40 @@ func (a *AtomCard) SoftRetired() bool {
 // 且它是控制字符，实际文本里不会出现——与用 NUL 的原意相同。
 const SignatureSep = "\x1f"
 
-// Signature 事实签名：实体 + 断言的归一形式。
+// Signature 事实签名：实体 + 归属 + 断言的归一形式。
 //
 // 用途是**重复检测**：同一件事被反复记录时，签名相同即候选重复，
 // 晋升层据此合并而不是新增一卡。
 //
+// 归属参与签名：同一条断言在两个归属下是**两张不同的卡**
+// （它们说的是各自环境里的事实）。签名不含归属的话，跨归属的重复检测
+// 会把一组的卡片并进另一组的卡片——那是**内容泄漏**，不是重复。
+//
 // 归一规则刻意保守（只做空白折叠与首尾裁剪）：过度归一会把「磁盘剩 2G」与
 // 「磁盘剩 3G」判成同一条，而它们恰恰互相矛盾——该走的是送审不是合并。
 func (a *AtomCard) Signature() string {
-	return a.EntityID + SignatureSep + NormalizeAssertion(a.Assertion)
+	return AtomSignature(a.EntityID, a.Scope, a.Assertion)
+}
+
+// AtomSignature 事实签名（实体 + 归属 + 断言的归一形式）。
+//
+// 与 AtomCard.Signature **同规则**，收成一处的原因：晋升层要在事实卡存在
+// **之前**算出签名（用来查重），那时没有卡片可调方法——
+// 两处各写一份，规则一改就漂，而漂了的后果是「跨归属的卡被并成一张」。
+//
+// # 归属为空时不插那一段
+//
+// 早期签名只有「实体 + 断言」。加了归属维度之后若无条件插一段，
+// 已落库事实卡的签名就全变了——而签名是**存起来的列**，
+// 变了就意味着「旧卡再也查不到」→ 同一件事被重新记一次时会多出一张重复卡。
+// 故归属为空时保持字节级一致（旧的全局卡照常查得到），非空时才插。
+//
+// 残留的碰撞面：全局卡的签名是「实体 + 断言」，带归属的是「实体 + 归属 + 断言」，
+// 两者相等当且仅当断言里含分隔符（0x1F）——实际文本里不会出现。
+func AtomSignature(entityID string, scope Scope, assertion string) string {
+	norm := NormalizeAssertion(assertion)
+	if scope == "" {
+		return entityID + SignatureSep + norm
+	}
+	return entityID + SignatureSep + string(scope) + SignatureSep + norm
 }

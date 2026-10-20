@@ -75,7 +75,7 @@ func tAtomSignature(t *testing.T, s store.Store) {
 func tAtomSearch(t *testing.T, s store.Store) {
 	_ = s.SaveAtom(bg(), nsA, atom("m1", "e1", "磁盘剩余 2G", "ev1", types.ImportanceHigh))
 	_ = s.SaveAtom(bg(), nsA, atom("m2", "e1", "内存占用偏高", "ev1", types.ImportanceHigh))
-	hits, err := s.SearchAtoms(bg(), nsA, "磁盘", 5)
+	hits, err := s.SearchAtoms(bg(), nsA, "磁盘", store.AtomFilter{Limit: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func tAtomSearch(t *testing.T, s store.Store) {
 		t.Fatalf("应只命中 m1，实得 %+v", hits)
 	}
 	// 子串不在词首：中文查询常是词中的一部分（「剩余」「占用」）。
-	hits2, err := s.SearchAtoms(bg(), nsA, "剩余", 5)
+	hits2, err := s.SearchAtoms(bg(), nsA, "剩余", store.AtomFilter{Limit: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func tAtomSearch(t *testing.T, s store.Store) {
 	}
 	// 英文侧不能被中文归一化带坏。
 	_ = s.SaveAtom(bg(), nsA, atom("m3", "e1", "the disk is almost full", "ev1", types.ImportanceHigh))
-	en, err := s.SearchAtoms(bg(), nsA, "disk", 5)
+	en, err := s.SearchAtoms(bg(), nsA, "disk", store.AtomFilter{Limit: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func tAtomSearch(t *testing.T, s store.Store) {
 func tAtomSearchChineseSubstring(t *testing.T, s store.Store) {
 	_ = s.SaveAtom(bg(), nsA, atom("c1", "e1", "磁盘长期偏小需要清理旧文件", "ev1", types.ImportanceHigh))
 	for _, q := range []string{"磁盘", "长期", "清理", "旧文件"} {
-		hits, err := s.SearchAtoms(bg(), nsA, q, 5)
+		hits, err := s.SearchAtoms(bg(), nsA, q, store.AtomFilter{Limit: 5})
 		if err != nil {
 			t.Fatalf("检索 %q 失败: %v", q, err)
 		}
@@ -117,7 +117,7 @@ func tAtomSearchChineseSubstring(t *testing.T, s store.Store) {
 		}
 	}
 	// 不在正文里的子串不得命中。
-	hits, err := s.SearchAtoms(bg(), nsA, "扩容", 5)
+	hits, err := s.SearchAtoms(bg(), nsA, "扩容", store.AtomFilter{Limit: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +201,20 @@ func tAtomOrderIsDeterministic(t *testing.T, s store.Store) {
 	}
 }
 
+// 带向量的事实卡必须被拒。
+//
+// 本仓的定案是「向量轨不接」：两个后端都不落向量。
+// 静默丢掉的话，症状是「相似度检索永远空」——
+// 而它与「存错了地方」毫无相似之处，极难归因。
+// 故带向量的卡入库时**必须报错**。
+func tAtomVectorNotStored(t *testing.T, s store.Store) {
+	a := atom("v1", "e1", "磁盘长期偏小", "ev1", types.ImportanceHigh)
+	a.Vector = []float32{0.1, 0.2, 0.3}
+	if err := s.SaveAtom(bg(), nsA, a); err == nil {
+		t.Fatal("带向量的卡必须被拒：后端不落向量，静默丢掉比报错更坏")
+	}
+}
+
 // 按实体取事实卡：必须**包含已退役的**。
 //
 // 实体合并要把该实体名下所有卡（含已退役的）一起迁到新归属——
@@ -281,7 +295,7 @@ func tAtomRetiredStillSearchable(t *testing.T, s store.Store) {
 	if err := s.DeprecateAtom(bg(), nsA, "a1", base); err != nil {
 		t.Fatal(err)
 	}
-	hits, err := s.SearchAtoms(bg(), nsA, "磁盘", 5)
+	hits, err := s.SearchAtoms(bg(), nsA, "磁盘", store.AtomFilter{Limit: 5})
 	if err != nil {
 		t.Fatal(err)
 	}

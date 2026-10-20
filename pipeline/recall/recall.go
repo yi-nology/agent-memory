@@ -141,6 +141,21 @@ type Request struct {
 	ThreadID string
 	// Entities 宿主已解析出的实体 ID；非空时补 page_headline 源。
 	Entities []string
+	// Scope 读者归属（空=不隔离）。
+	//
+	// 非空时只召回「全局事实 + 同归属事实」：归属为空的卡是全局的，
+	// 人人都该看到；归属非空且不等于本值的卡**一条都不进 prompt**。
+	//
+	// # 过滤在**取数层**生效，这里是给它的那个值
+	//
+	// 归属条件进存储层的查询，与 TopK 配额同一次求值——
+	// 交给调用方后置过滤的话，被滤掉的条目已经占掉了配额，
+	// 于是「该给我的那条」根本没进候选池，而症状只是「召回变少了」。
+	//
+	// ⚠️ 空值 = **不隔离**（不是「只看全局」）：这条语义与
+	// store.AtomFilter.Scope 一致，两边必须一致，否则「传了没用」。
+	// 不隔离是**显式选择**：宿主在调用点写不写得出这一栏，代码里看得见。
+	Scope types.Scope
 	// Limit 条数上限（0=用配置）。
 	Limit int
 }
@@ -194,6 +209,15 @@ type Config struct {
 	// 是两种不同的意图——前者是「这一轮不该带任何事实」，
 	// 后者是「不限」。退化成全库会把「限定」变成「装饰」。
 	RestrictAtomsToEntities bool
+	// Ranker 打分器（可 nil：nil = 用 ports.LexicalRanker 的缺省权重）。
+	//
+	// 注入它即可换排序口径（如走语义轨），**不必绕开整条召回链自造一套**——
+	// 两套排序口径并存，后续无论往哪边收敛都要付迁移成本。
+	//
+	// 契约见 ports.Ranker：分数与候选一一对应且同序，长度不符即报错；
+	// 打分失败**上抛**，不许静默回退到缺省（静默回退的失效形态是
+	// 「排序悄悄变回老样子」，而调用方看不出发生了什么）。
+	Ranker ports.Ranker
 	// NoCaptureFace 宿主**没有捕获面**（只蒸馏终稿，不采集原始事件）。
 	//
 	// 缺省 false = 有捕获面。置 true 时：
@@ -248,6 +272,13 @@ func (c Config) normalize() (Config, error) {
 	if c.MaxRaw <= 0 {
 		c.MaxRaw = 5
 	}
+	// 缺省打分器：词面 + 重要度 + 新鲜度（权重 0.6/0.25/0.15）。
+	//
+	// 填在这里（而不是在调用点现取）是为了让「默认」这件事只有一个地方：
+	// Config 归一后拿到的一定是可用的打分器，链上不必判 nil。
+	if c.Ranker == nil {
+		c.Ranker = ports.LexicalRanker{}
+	}
 	// 无捕获面：raw 源**不出现在路由里**。
 	//
 	// 这一步放在默认来源之后：Sources 为空时先补上默认（atom + raw），
@@ -288,7 +319,11 @@ type Reader interface {
 	// 否则召回对「用户问了什么」只有排序上的响应、没有取数上的响应——
 	// 候选池之外再相关的事实也进不来。
 	// 故这一条不能省，尽管它让接口从 5 个方法变成 6 个。
-	SearchAtoms(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.AtomCard, error)
+	//
+	// 带过滤条件：归属过滤必须在这条路上生效——
+	// 只在 ListAtoms 上过滤是不够的，检索路会绕过滤面直接取 TopK，
+	// 被别家的卡占掉配额（症状是「召回变少了」，看着像排序问题）。
+	SearchAtoms(ctx context.Context, ns store.Namespace, query string, f store.AtomFilter) ([]*types.AtomCard, error)
 	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string) (*types.EntityPage, error)
 	UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error
 	EvictActiveEntities(ctx context.Context, ns store.Namespace, threadID string, keep int) ([]types.ActiveEntity, error)
@@ -304,7 +339,12 @@ type Reader interface {
 // 故它是**可选实现**：存储实现了它，raw 源才进路由；
 // 没实现而配置又要 raw 源，New 会**响亮失败**（见 New）。
 type RawReader interface {
-	ListRaw(ctx context.Context, ns store.Namespace, before time.Time, p store.Page) ([]*types.RawEvent, error)
+	// ListRaw 按时间倒序列出原始事件。
+	//
+	// scope 是读者归属（空=不隔离）：原始事件也是召回的兜底源，
+	// 一次就取 MaxRaw 条，被别家占掉之后就没有自己的了——
+	// 故归属过滤必须在这一层生效。
+	ListRaw(ctx context.Context, ns store.Namespace, scope types.Scope, before time.Time, p store.Page) ([]*types.RawEvent, error)
 }
 
 // Pipeline 召回流水线。
@@ -417,7 +457,9 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 		return nil, err
 	}
 	cands, droppedByDuplicate := p.suppress(cands, req)
-	rank(cands, req.Query, p.now())
+	if err := p.rank(ctx, cands, req.Query, p.now()); err != nil {
+		return nil, err
+	}
 	cands, droppedByDiversity := diversify(cands, p.cfg.PerEntityMax)
 
 	ents := p.pushEntities(ctx, req, cands)

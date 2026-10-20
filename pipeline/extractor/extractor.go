@@ -195,7 +195,10 @@ func (e *Extractor) toCandidate(r rawCandidate, idx int, sessionID string,
 		RecommendedAction: types.ActionStore,
 		ExtractorVersion:  e.version,
 		SessionID:         sessionID,
-		CreatedAt:         now,
+		// 归属**从证据事件继承**，不由模型给：模型看不见归属，
+		// 让它写只会写出一个编的值（编出来的归属会把事实挂到别人名下）。
+		Scope:     ev.Scope,
+		CreatedAt: now,
 	}
 	if c.VerbatimQuote == "" {
 		c.RecommendedAction = types.ActionUnsure

@@ -109,8 +109,9 @@ func (n noRawReader) ListAtoms(ctx context.Context, ns store.Namespace, flt stor
 	return n.f.ListAtoms(ctx, ns, flt)
 }
 
-func (n noRawReader) SearchAtoms(ctx context.Context, ns store.Namespace, q string, limit int) ([]*types.AtomCard, error) {
-	return n.f.SearchAtoms(ctx, ns, q, limit)
+func (n noRawReader) SearchAtoms(ctx context.Context, ns store.Namespace, q string,
+	flt store.AtomFilter) ([]*types.AtomCard, error) {
+	return n.f.SearchAtoms(ctx, ns, q, flt)
 }
 
 func (n noRawReader) GetEntityPage(ctx context.Context, ns store.Namespace, id string) (*types.EntityPage, error) {

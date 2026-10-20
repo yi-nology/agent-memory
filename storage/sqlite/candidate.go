@@ -15,7 +15,7 @@ import (
 const candidateCols = `id, raw_event_ids, candidate_type, status, title, assertion,
 	verbatim_quote, quote_event_id, subject_name, subject_entity_type, target_entity_id,
 	confidence, importance, recommended_action, promotion_reason, extractor_version,
-	session_id, created_at, decided_at, decided_by, payload`
+	session_id, scope, created_at, decided_at, decided_by, payload`
 
 func (s *candidateStore) scanCandidate(rows *sql.Rows) (*types.Candidate, error) {
 	var (
@@ -28,7 +28,7 @@ func (s *candidateStore) scanCandidate(rows *sql.Rows) (*types.Candidate, error)
 	if err := rows.Scan(&c.ID, &rawIDs, &c.Type, &c.Status, &c.Title, &c.Assertion,
 		&c.VerbatimQuote, &c.QuoteEventID, &c.SubjectName, &c.SubjectEntityType,
 		&c.TargetEntityID, &c.Confidence, &c.Importance, &c.RecommendedAction,
-		&c.PromotionReason, &c.ExtractorVersion, &c.SessionID, &created, &decided,
+		&c.PromotionReason, &c.ExtractorVersion, &c.SessionID, &c.Scope, &created, &decided,
 		&c.DecidedBy, &payload); err != nil {
 		return nil, err
 	}
@@ -43,8 +43,9 @@ func (s *candidateStore) scanCandidate(rows *sql.Rows) (*types.Candidate, error)
 //
 // 用「主体名 + 断言」而不是完整签名（types.AtomCard.Signature 带 EntityID）：
 // 候选阶段实体还没归一，EntityID 此时是空的，用它会让所有未归一候选撞成同一签名。
+// candidateSignature 候选签名（规则在 types 那一处，勿在这里另写一份）。
 func candidateSignature(c *types.Candidate) string {
-	return types.NormalizeAssertion(c.SubjectName + types.SignatureSep + c.Assertion)
+	return types.CandidateSignature(c.SubjectName, c.Scope, c.Assertion)
 }
 
 func (s *candidateStore) SaveCandidate(ctx context.Context, ns store.Namespace, c *types.Candidate) error {
@@ -55,13 +56,13 @@ func (s *candidateStore) SaveCandidate(ctx context.Context, ns store.Namespace, 
 		(namespace, id, raw_event_ids, candidate_type, status, title, assertion,
 		 verbatim_quote, quote_event_id, subject_name, subject_entity_type, target_entity_id,
 		 confidence, importance, recommended_action, promotion_reason, extractor_version,
-		 session_id, created_at, decided_at, decided_by, payload, signature)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 session_id, scope, created_at, decided_at, decided_by, payload, signature)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nsOf(ns), c.ID, stringsJSON(c.RawEventIDs), string(c.Type), string(c.Status), c.Title,
 		c.Assertion, c.VerbatimQuote, c.QuoteEventID, c.SubjectName, string(c.SubjectEntityType),
 		c.TargetEntityID, string(c.Confidence), string(c.Importance), string(c.RecommendedAction),
-		c.PromotionReason, c.ExtractorVersion, c.SessionID, ts(c.CreatedAt), tsPtr(c.DecidedAt),
-		string(c.DecidedBy), mapJSON(c.Payload), candidateSignature(c),
+		c.PromotionReason, c.ExtractorVersion, c.SessionID, string(c.Scope), ts(c.CreatedAt),
+		tsPtr(c.DecidedAt), string(c.DecidedBy), mapJSON(c.Payload), candidateSignature(c),
 	); err != nil {
 		return err
 	}
@@ -192,7 +193,7 @@ func isValidCandidateStatus(st types.CandidateStatus) bool {
 }
 
 func (s *candidateStore) SearchCandidates(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.Candidate, error) {
-	ids, err := s.searchFTS(ctx, "candidate_fts", nsOf(ns), query, limit)
+	ids, err := s.searchFTS(ctx, "candidate_fts", nsOf(ns), query, limit, "")
 	if err != nil || len(ids) == 0 {
 		return nil, err
 	}

@@ -44,6 +44,11 @@ type Candidate struct {
 	ExtractorVersion string
 	// SessionID 来源会话。
 	SessionID string
+	// Scope 记录级归属（空=全局）。
+	//
+	// 由**证据事件**继承而来，不由抽取模型决定——模型看不见归属，
+	// 让它写只会写出一个编的值。见 types/scope.go。
+	Scope Scope
 	// CreatedAt 创建时刻。
 	CreatedAt time.Time
 	// DecidedAt 判定时刻（未判定为零值）。
@@ -52,6 +57,21 @@ type Candidate struct {
 	DecidedBy DecidedBy
 	// Payload 附加载荷。
 	Payload map[string]any
+}
+
+// CandidateSignature 候选签名（主体名 + 归属 + 断言的归一形式）。
+//
+// 与事实签名同一条纪律：**归属参与身份**——同一条断言在两个归属下
+// 是两张不同的候选（各自环境里的事实），签名不含归属的话，
+// 跨归属的重复检测会把一组的候选并掉。
+//
+// 归属为空时保持旧格式（字节级一致），理由见 AtomSignature：
+// 签名是**存起来的列**，变了就意味着旧候选再也查不到。
+func CandidateSignature(subjectName string, scope Scope, assertion string) string {
+	if scope == "" {
+		return NormalizeAssertion(subjectName + SignatureSep + assertion)
+	}
+	return NormalizeAssertion(subjectName + SignatureSep + string(scope) + SignatureSep + assertion)
 }
 
 // RecommendedAction 抽取侧的建议处置。

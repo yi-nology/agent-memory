@@ -71,7 +71,7 @@ func TestFTS5QueryTreatsUserInputAsLiteral(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			hits, err := s.SearchAtoms(context.Background(), ns, tc.query, 10)
+			hits, err := s.SearchAtoms(context.Background(), ns, tc.query, store.AtomFilter{Limit: 10})
 			if err != nil {
 				t.Fatalf("查询 %q 不得报错: %v", tc.query, err)
 			}
@@ -102,14 +102,14 @@ func TestFTS5CJKSubstringSearch(t *testing.T) {
 	if err := s.SaveAtom(context.Background(), ns, ftsAtom("c2", "内存剩余很多")); err != nil {
 		t.Fatal(err)
 	}
-	hits, err := s.SearchAtoms(context.Background(), ns, "剩余", 10)
+	hits, err := s.SearchAtoms(context.Background(), ns, "剩余", store.AtomFilter{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(hits) != 1 || hits[0].ID != "c2" {
 		t.Fatalf("「剩余」应命中 c2，实得 %v", hitIDs(hits))
 	}
-	hits, err = s.SearchAtoms(context.Background(), ns, "磁盘", 10)
+	hits, err = s.SearchAtoms(context.Background(), ns, "磁盘", store.AtomFilter{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

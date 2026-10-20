@@ -76,12 +76,18 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 	}
 
 	if hasSource(p.cfg.Sources, SourceRaw) && p.raw != nil {
-		raws, err := p.raw.ListRaw(ctx, req.Namespace, time.Time{},
+		raws, err := p.raw.ListRaw(ctx, req.Namespace, req.Scope, time.Time{},
 			store.Page{Limit: p.cfg.MaxRaw})
 		if err != nil {
 			return nil, err
 		}
 		for _, e := range raws {
+			// 归属复查（纵深防御）：存储层已经按归属过滤了原始事件，
+			// 这里再挡一道——原始事件是**对话原文**，漏一条就是
+			// 把别人说过的话塞进当前 prompt。
+			if !e.Scope.VisibleTo(req.Scope) {
+				continue
+			}
 			c, ok, err := p.snippet(ctx, SourceRaw, e.ID, "", "历史", e.Content,
 				types.ImportanceLow, e.Timestamp)
 			if err != nil {
@@ -168,13 +174,19 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 	var hits []*types.AtomCard
 	if strings.TrimSpace(req.Query) != "" {
 		var err error
-		hits, err = p.store.SearchAtoms(ctx, req.Namespace, req.Query, limit)
+		hits, err = p.store.SearchAtoms(ctx, req.Namespace, req.Query, store.AtomFilter{
+			Scope:      req.Scope,
+			EntityIDs:  entityIDs,
+			ActiveOnly: true,
+			Limit:      limit,
+		})
 		if err != nil {
 			return nil, err
 		}
 	}
 	base, err := p.store.ListAtoms(ctx, req.Namespace, store.AtomFilter{
 		ActiveOnly: true,
+		Scope:      req.Scope,
 		EntityIDs:  entityIDs,
 		Limit:      limit,
 	})
@@ -191,8 +203,14 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 		if !a.Active() {
 			return // 退役/作废的事实不参与召回
 		}
-		// 检索路**不受**存储层过滤保护（SearchAtoms 没有实体过滤维度），
-		// 所以限定在这一侧再兜一道。
+		// 归属复查（纵深防御）：存储层已经按归属过滤了，
+		// 这里再挡一道——万一某个后端把过滤条件漏了，
+		// 后果是**别家的环境事实进了 prompt**，而那在结果里完全看不出来。
+		//
+		// 实体范围同理：限定在这一侧再兜一道。
+		if !a.Scope.VisibleTo(req.Scope) {
+			return
+		}
 		if scope != nil && !scope[a.EntityID] {
 			return
 		}

@@ -245,6 +245,11 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			Payload    map[string]any   `json:"payload"`
 			Provenance types.Provenance `json:"provenance"`
 			Explicit   bool             `json:"explicit"`
+			// Scope 记录级归属（空=全局）。
+			//
+			// 归属在**捕获时**定下：事件带着它走，候选与事实卡从它继承。
+			// 事后补是补不上的——事实在晋升那一刻就已经没有归属了。
+			Scope string `json:"scope"`
 		}
 		if err := decodeParams(params, &p); err != nil {
 			return nil, err
@@ -254,6 +259,7 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			SessionID: p.SessionID, ThreadID: p.ThreadID, User: p.User,
 			Type: types.RawEventType(p.Type), Content: p.Content, Payload: p.Payload,
 			Provenance: p.Provenance, Explicit: p.Explicit,
+			Scope: types.Scope(p.Scope),
 		})
 		if err != nil {
 			return nil, err
@@ -270,6 +276,11 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			ThreadID  string   `json:"thread_id"`
 			Entities  []string `json:"entities"`
 			Limit     int      `json:"limit"`
+			// Scope 读者归属（空=不隔离）。
+			//
+			// 与 memory.search 同一个口径：注入面与检索面读的是同一批卡，
+			// 一处过滤一处不过滤，失效形态是「模型引用了别的组的事实」。
+			Scope string `json:"scope"`
 		}
 		if err := decodeParams(params, &p); err != nil {
 			return nil, err
@@ -278,6 +289,7 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			Namespace: store.Namespace(p.Namespace), Query: p.Query,
 			SessionID: p.SessionID, ThreadID: p.ThreadID,
 			Entities: p.Entities, Limit: p.Limit,
+			Scope: types.Scope(p.Scope),
 		})
 		if err != nil {
 			return nil, err
@@ -295,11 +307,20 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			Namespace string `json:"namespace"`
 			Query     string `json:"query"`
 			Limit     int    `json:"limit"`
+			// Scope 读者归属（空=不隔离）。
+			//
+			// 检索面与召回面**必须**用同一个归属口径：
+			// 两处读同一张表、同一个字段，一处过滤一处不过滤，
+			// 失效形态是「搜到了别的组的事实」而调用方看不出来。
+			Scope string `json:"scope"`
 		}
 		if err := decodeParams(params, &p); err != nil {
 			return nil, err
 		}
-		atoms, err := s.svc.Search(ctx, store.Namespace(p.Namespace), p.Query, p.Limit)
+		atoms, err := s.svc.Search(ctx, store.Namespace(p.Namespace), p.Query, store.AtomFilter{
+			Limit: p.Limit,
+			Scope: types.Scope(p.Scope),
+		})
 		if err != nil {
 			return nil, err
 		}

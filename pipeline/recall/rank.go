@@ -1,12 +1,14 @@
 package recall
 
 import (
+	"context"
+	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/oekit/pkg/container"
 
+	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/types"
 )
 
@@ -47,78 +49,55 @@ func (p *Pipeline) suppress(in []*candidate, req Request) ([]*candidate, int) {
 	return out, dup
 }
 
-// rank 重排：相关度 + 重要度 + 新鲜度。
+// rank 重排：按打分器给的分数排序。
 //
-// # 为什么不用向量
+// # 打分器可注入，默认**零漂移**
+//
+// Config.Ranker 为 nil 时用 ports.LexicalRanker{}（词面 + 重要度 + 新鲜度，
+// 权重 0.6/0.25/0.15）——与打分器这个端口出现之前**逐条等价**。
+// 宿主要换口径（走语义轨）时注入自己的打分器即可，
+// 不必绕开整条召回链自造一套——两套排序口径并存，后续收敛都要付迁移成本。
+//
+// # 为什么默认仍不用向量
 //
 // 上游把向量检索放在可选面，且自承真实集成未验证；本仓的判断相同——
 // 先把「该捞哪几层」「怎么排」这件事做对，语义相似度是第二阶段的替换件，
 // 不是第一阶段的前提。相关度用词面重叠，是够用且零成本的基线。
+// （缝留出来了：宿主要接语义轨，注入打分器就行。）
 //
-// # 三项权重是经验值，不是标定值
+// # 打分失败一律上抛
 //
-// 调它之前先看 Result.Dropped：预算被打满时，提高某一项的权重只是在
-// 三者之间挪位置，不改变「装不下」这个事实。
-func rank(cands []*candidate, query string, now time.Time) {
-	terms := tokenize(query)
-	for _, c := range cands {
-		c.score = 0.6*lexical(c.plain, terms) +
-			0.25*float64(c.Importance.Rank())/3 +
-			0.15*recency(c.OccurredAt, now)
+// 不许静默回退到默认打分器：静默回退的失效形态是「排序悄悄变回老样子」，
+// 而调用方看不出发生了什么。
+func (p *Pipeline) rank(ctx context.Context, cands []*candidate, query string, now time.Time) error {
+	views := make([]ports.RankCandidate, len(cands))
+	for i, c := range cands {
+		views[i] = ports.RankCandidate{
+			RefID:          c.RefID,
+			Source:         string(c.Source),
+			EntityID:       c.EntityID,
+			Role:           c.Role,
+			Body:           c.plain, // 未包裹的正文：标签词每段都有，算进去会拉平得分
+			Importance:     string(c.Importance),
+			ImportanceRank: c.Importance.Rank(),
+			OccurredAt:     c.OccurredAt,
+			Tokens:         c.Tokens,
+		}
+	}
+	scores, err := p.cfg.Ranker.Score(ctx, query, views, now)
+	if err != nil {
+		return err
+	}
+	if len(scores) != len(cands) {
+		// 分数与候选错位不会崩，只会静默换序——而换序在结果里完全看不出来
+		//（内容都还在，只是次序变了）。故这里响亮失败。
+		return fmt.Errorf("打分器返回的分数条数与候选数不符（%d vs %d）", len(scores), len(cands))
+	}
+	for i, c := range cands {
+		c.score = scores[i]
 	}
 	sortByScore(cands)
-}
-
-// lexical 词面重叠度：命中词数 / 查询词数。
-//
-// 匹配的是去包裹的原文（candidate.plain）而不是带标签的 Body：标签词「记忆」
-// 「画像」每次都出现在每一段里，算进去会让所有片段得分虚高且完全同分。
-func lexical(body string, terms []string) float64 {
-	if len(terms) == 0 || body == "" {
-		return 0
-	}
-	hit := 0
-	for _, t := range terms {
-		if strings.Contains(body, t) {
-			hit++
-		}
-	}
-	return float64(hit) / float64(len(terms))
-}
-
-// recency 新鲜度：近一天的取 1，线性衰减到 30 天取 0。
-//
-// 刻意用线性而非指数：记忆的时效判断是粗粒度的（「这是刚发生的还是老账」），
-// 指数衰减会在头几小时里把排序几乎完全交给新鲜度，而那恰恰是噪声最大的时段。
-func recency(at, now time.Time) float64 {
-	if at.IsZero() {
-		return 0
-	}
-	age := now.Sub(at)
-	switch {
-	case age <= 0:
-		return 1
-	case age >= 30*24*time.Hour:
-		return 0
-	default:
-		return 1 - age.Seconds()/(30*24*3600)
-	}
-}
-
-// tokenize 粗分词：按空白与标点切，中文整段保留（召回查询本来就短，
-// 不值得引分词器；整段包含匹配对短查询反而更稳）。
-func tokenize(s string) []string {
-	fields := strings.FieldsFunc(s, func(r rune) bool {
-		return r == ' ' || r == '\t' || r == '\n' || r == ',' || r == '，' ||
-			r == '?' || r == '？' || r == '!' || r == '！' || r == '。' || r == ';'
-	})
-	out := make([]string, 0, len(fields))
-	for _, f := range fields {
-		if f != "" {
-			out = append(out, f)
-		}
-	}
-	return out
+	return nil
 }
 
 // diversify 限制单个实体的贡献条数。

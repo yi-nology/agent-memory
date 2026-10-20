@@ -74,6 +74,12 @@ func Run(t *testing.T, open OpenFn) {
 		{"事实卡：并列时的返回顺序确定", tAtomOrderIsDeterministic},
 		{"事实卡：重要度排序按语义序而非字典序", tAtomImportanceOrder},
 		{"事实卡：按实体取全部（含已退役）", tAtomListByEntity},
+		{"事实卡：带向量的卡不入库（后端不落向量）", tAtomVectorNotStored},
+		{"事实卡：归属隔离（全局 + 同归属）", tAtomScopeIsolation},
+		{"事实卡：检索路也按归属隔离", tAtomScopeSearchIsolation},
+		{"事实卡：归属过滤在取数层（配额不被别家吃掉）", tAtomScopeSearchQuota},
+		{"捕获事件：归属隔离", tRawScopeIsolation},
+		{"候选：归属往返", tCandidateScopeRoundTrip},
 		{"实体：规范名与别名两条路径都能查到", tEntityLookupBothPaths},
 		{"实体：计数钳到 0 不报错", tEntityCountClamp},
 		{"活跃实体栈：钉住项不参与淘汰", tActiveEntityPin},
@@ -198,7 +204,7 @@ func tRawListCursor(t *testing.T, s store.Store) {
 			t.Fatal(err)
 		}
 	}
-	all, err := s.ListRaw(bg(), nsA, time.Time{}, store.Page{Limit: 10})
+	all, err := s.ListRaw(bg(), nsA, "", time.Time{}, store.Page{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +215,7 @@ func tRawListCursor(t *testing.T, s store.Store) {
 		t.Fatalf("倒序应从最新开始，实得首条 %s", all[0].ID)
 	}
 	// 游标翻页：以 all[0] 的时刻为界，不应再包含它自身
-	next, err := s.ListRaw(bg(), nsA, all[0].Timestamp, store.Page{Limit: 10})
+	next, err := s.ListRaw(bg(), nsA, "", all[0].Timestamp, store.Page{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +238,7 @@ func tRawSearch(t *testing.T, s store.Store) {
 			t.Fatal(err)
 		}
 	}
-	hits, err := s.SearchRaw(bg(), nsA, "磁盘", 5)
+	hits, err := s.SearchRaw(bg(), nsA, "", "磁盘", 5)
 	if err != nil {
 		t.Fatalf("检索失败: %v", err)
 	}
@@ -240,7 +246,7 @@ func tRawSearch(t *testing.T, s store.Store) {
 		t.Fatalf("应只命中 s1，实得 %+v", hits)
 	}
 	// 词中子串同样要命中。
-	hits2, err := s.SearchRaw(bg(), nsA, "占用", 5)
+	hits2, err := s.SearchRaw(bg(), nsA, "", "占用", 5)
 	if err != nil {
 		t.Fatalf("检索失败: %v", err)
 	}
@@ -269,7 +275,7 @@ func tRawDeleteBefore(t *testing.T, s store.Store) {
 		t.Fatalf("应清理 2 条，实得 %d", n)
 	}
 	// 索引必须同步清：漏清会留下「搜得到但取不到」的幽灵。
-	hits, err := s.SearchRaw(bg(), nsA, "旧事件", 5)
+	hits, err := s.SearchRaw(bg(), nsA, "", "旧事件", 5)
 	if err != nil {
 		t.Fatal(err)
 	}

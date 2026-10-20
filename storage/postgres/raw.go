@@ -11,7 +11,7 @@ import (
 	"github.com/yi-nology/agent-memory/types"
 )
 
-const rawCols = `id, host, session_id, thread_id, user_name, ts, type, content, payload, provenance`
+const rawCols = `id, host, session_id, thread_id, user_name, scope, ts, type, content, payload, provenance`
 
 func (s *rawStore) scanRaw(rows *sql.Rows) (*types.RawEvent, error) {
 	var (
@@ -20,7 +20,7 @@ func (s *rawStore) scanRaw(rows *sql.Rows) (*types.RawEvent, error) {
 		payload string
 		prov    provenanceFields
 	)
-	if err := rows.Scan(&ev.ID, &ev.Host, &ev.SessionID, &ev.ThreadID, &ev.User,
+	if err := rows.Scan(&ev.ID, &ev.Host, &ev.SessionID, &ev.ThreadID, &ev.User, &ev.Scope,
 		&tsVal, &ev.Type, &ev.Content, &payload, provScan{&prov}); err != nil {
 		return nil, err
 	}
@@ -108,15 +108,16 @@ func (s *rawStore) SaveRaw(ctx context.Context, ns store.Namespace, ev *types.Ra
 	}
 	body := ftsBody(ev.Content, ev.User)
 	_, err := s.exec(ctx, `INSERT INTO raw_events
-		(namespace, id, host, session_id, thread_id, user_name, ts, type, content, payload, provenance,
+		(namespace, id, host, session_id, thread_id, user_name, scope, ts, type, content, payload, provenance,
 		 body, body_tsv)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, to_tsvector('simple', $12))
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, to_tsvector('simple', $13))
 		ON CONFLICT(namespace, id) DO UPDATE SET
 			host = excluded.host, session_id = excluded.session_id, thread_id = excluded.thread_id,
-			user_name = excluded.user_name, ts = excluded.ts, type = excluded.type, content = excluded.content,
+			user_name = excluded.user_name, scope = excluded.scope,
+			ts = excluded.ts, type = excluded.type, content = excluded.content,
 			payload = excluded.payload, provenance = excluded.provenance,
 			body = excluded.body, body_tsv = excluded.body_tsv`,
-		nsOf(ns), ev.ID, ev.Host, ev.SessionID, ev.ThreadID, ev.User,
+		nsOf(ns), ev.ID, ev.Host, ev.SessionID, ev.ThreadID, ev.User, string(ev.Scope),
 		ts(ev.Timestamp), string(ev.Type), ev.Content, mapJSON(ev.Payload),
 		provenanceJSON(provenanceOf(ev.Provenance)), body)
 	return err
@@ -180,11 +181,18 @@ func (s *rawStore) GetRawByIDs(ctx context.Context, ns store.Namespace, ids []st
 	return out, rows.Err()
 }
 
-func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, before time.Time, p store.Page) ([]*types.RawEvent, error) {
+func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, scope types.Scope,
+	before time.Time, p store.Page) ([]*types.RawEvent, error) {
 	q := `SELECT ` + rawCols + ` FROM raw_events WHERE namespace = $1`
 	args := []any{nsOf(ns)}
+	if scope != "" {
+		// 归属条件：**全局的 + 同归属的**，别家的不给。
+		// 语义见 store.AtomFilter.Scope。
+		q += ` AND (scope = '' OR scope = $` + fmt.Sprint(len(args)+1) + `)`
+		args = append(args, string(scope))
+	}
 	if !before.IsZero() {
-		q += ` AND ts < $2`
+		q += ` AND ts < $` + fmt.Sprint(len(args)+1)
 		args = append(args, ts(before))
 	}
 	q += ` ORDER BY ts DESC, id DESC LIMIT $` + fmt.Sprint(len(args)+1) + ` OFFSET $` + fmt.Sprint(len(args)+2)
@@ -205,8 +213,17 @@ func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, before time.
 	return out, rows.Err()
 }
 
-func (s *rawStore) SearchRaw(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.RawEvent, error) {
-	ids, err := s.searchFTS(ctx, "raw_events", nsOf(ns), query, limit)
+func (s *rawStore) SearchRaw(ctx context.Context, ns store.Namespace, scope types.Scope,
+	query string, limit int) ([]*types.RawEvent, error) {
+	extra := ""
+	var extraArgs []any
+	if scope != "" {
+		// 归属条件进 SQL，与 LIMIT 同一次求值（理由见 ListRaw 同处）。
+		// 占位符：$1 是 namespace，$2 是 tsquery，条件从 $3 起。
+		extra = "(scope = '' OR scope = $3)"
+		extraArgs = []any{string(scope)}
+	}
+	ids, err := s.searchFTS(ctx, "raw_events", nsOf(ns), query, limit, extra, extraArgs...)
 	if err != nil || len(ids) == 0 {
 		return nil, err
 	}
@@ -269,17 +286,31 @@ func (s *rawStore) rawByIDsOrdered(ctx context.Context, ns store.Namespace, ids 
 // 查询串**先在 Go 侧切成词元**（store.LexicalTokens），再用 plainto_tsquery 合取：
 // 与 FTS5 的空格分词语义一致（隐式 AND），且任意用户输入都不会变成语法
 // （词元里只有字母/数字/汉字）。
-func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int) ([]string, error) {
+//
+// # extra 是附加条件（可选）
+//
+// 供**必须在取数层**生效的过滤用（归属过滤，见 atom.go 的 SearchAtoms）：
+// 后置过滤会让被滤掉的条目先占掉 LIMIT 配额，于是「该给我的那条」根本没进候选池。
+//
+// extra 为空串时行为与从前一字不差（这是绝大多数调用点的路径）。
+func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int,
+	extra string, extraArgs ...any) ([]string, error) {
 	tokens := store.LexicalTokens(query)
 	if len(tokens) == 0 {
 		// 查询里没有可检索的词元（全是标点/空白）：不是错误，是「没得可查」。
 		return nil, nil
 	}
+	where := "namespace = $1 AND body_tsv @@ plainto_tsquery('simple', $2)"
+	args := []any{namespace, ftsQuery(tokens)}
+	if extra != "" {
+		where += " AND " + extra
+		args = append(args, extraArgs...)
+	}
 	rows, err := s.query(ctx,
 		`SELECT id FROM `+table+`
-		 WHERE namespace = $1 AND body_tsv @@ plainto_tsquery('simple', $2)
-		 ORDER BY ts_rank(body_tsv, plainto_tsquery('simple', $2)) DESC LIMIT $3`,
-		namespace, ftsQuery(tokens), limitOf(limit, 10))
+		 WHERE `+where+`
+		 ORDER BY ts_rank(body_tsv, plainto_tsquery('simple', $2)) DESC LIMIT $`+fmt.Sprint(len(args)+1),
+		append(args, limitOf(limit, 10))...)
 	if err != nil {
 		return nil, err
 	}

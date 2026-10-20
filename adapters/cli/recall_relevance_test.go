@@ -70,7 +70,7 @@ func TestRecallMustBeQuerySensitive(t *testing.T) {
 	}
 
 	// 佐证一：索引在维护——用**完整词组**能查到目标。
-	hits, err := s.SearchAtoms(ctx, ns, "磁盘扩容流程必须先停机再操作", 10)
+	hits, err := s.SearchAtoms(ctx, ns, "磁盘扩容流程必须先停机再操作", store.AtomFilter{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

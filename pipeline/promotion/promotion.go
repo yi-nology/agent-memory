@@ -228,7 +228,11 @@ func (p *Promoter) promote(ctx context.Context, ns store.Namespace, c *types.Can
 	}
 
 	// 4 重复：同签名即并入，不新增
-	sig := atomSignature(entityID, c.Assertion)
+	//
+	// 签名含归属（见 types.AtomSignature）：同一条断言在两个归属下是
+	// **两张不同的卡**（各自环境里的事实）。签名不含归属的话，
+	// 这里的并入会把一组的卡片并进另一组的卡片——那是内容泄漏，不是去重。
+	sig := types.AtomSignature(entityID, c.Scope, c.Assertion)
 	existing, err := p.store.FindAtomBySignature(ctx, ns, sig)
 	switch {
 	case err == nil && existing != nil:
@@ -278,6 +282,9 @@ func (p *Promoter) promoteToAtom(ctx context.Context, ns store.Namespace, c *typ
 		Importance:    c.Importance,
 		CreatedAt:     now,
 		UpdatedAt:     now,
+		// 归属继承自候选（候选的归属又继承自证据事件）：
+		// 归属在**捕获时**定下，中途不让模型参与。
+		Scope: c.Scope,
 		// 来源凭证取自**证据事件**：审计链要能从事实回到那条事件，
 		// 而事件才带 origin/host/tool 这些字段。
 		Provenance: ev.Provenance,
@@ -477,8 +484,17 @@ func (p *Promoter) merge(ctx context.Context, ns store.Namespace,
 // 三条同时成立才算冲突——只看相似度会把「A 和 B 都是磁盘相关」判成矛盾，
 // 只看否定词会把两件不相干的事判成矛盾。
 //
-// 判出冲突**不自动裁决**：模型和规则都分不清「已修复」与「未修复」哪个是
-// 新的。这种情况送人工，由看过现场的人决定。
+// # 只与**同一归属**的事实比
+//
+// 归属不同的两张卡说的是**各自环境里的事实**：一组的内核版本与另一组的
+// 内核版本本来就该不一样，拿它们当矛盾是把「环境差异」当成「有人搞错了」。
+// 故归属必须**逐字相同**才算可比——
+// 连「全局的」也不参与比较（全局事实是通则，与某组的事实不一致未必是错）。
+//
+// # 判出冲突**不自动裁决**
+//
+// 模型和规则都分不清「已修复」与「未修复」哪个是新的。
+// 这种情况送人工，由看过现场的人决定。
 func (p *Promoter) checkConflict(ctx context.Context, ns store.Namespace,
 	entityID string, c *types.Candidate) (*Verdict, error) {
 
@@ -491,6 +507,9 @@ func (p *Promoter) checkConflict(ctx context.Context, ns store.Namespace,
 		return nil, err
 	}
 	for _, a := range atoms {
+		if a.Scope != c.Scope {
+			continue // 归属不同 = 不同环境，不是矛盾
+		}
 		sim := similarity(c.Assertion, a.Assertion)
 		if sim < p.cfg.ConflictSimilarity {
 			continue
@@ -502,13 +521,6 @@ func (p *Promoter) checkConflict(ctx context.Context, ns store.Namespace,
 			Reason: fmt.Sprintf("与既有事实 %s 相似度 %.2f 且否定方向相反，不自动裁决", a.ID, sim)}, nil
 	}
 	return nil, nil
-}
-
-// atomSignature 事实签名（与 types.AtomCard.Signature 同规则）。
-//
-// 在此重算而不调 a.Signature()：候选还没有 FactCard，签名是晋升时才产生的。
-func atomSignature(entityID, assertion string) string {
-	return entityID + types.SignatureSep + types.NormalizeAssertion(assertion)
 }
 
 // negationTokens 否定词表。

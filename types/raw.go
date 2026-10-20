@@ -81,6 +81,12 @@ type RawEvent struct {
 	ThreadID string
 	// User 用户标识。
 	User string
+	// Scope 记录级归属（空=全局）。
+	//
+	// 事件带着它走，是为了让**下游的事实卡继承同一份归属**：
+	// 归属在捕获时定下来，一路带到候选与事实卡，中途不让模型参与
+	// （模型不知道归属，写进去只可能是编的）。
+	Scope Scope
 	// Timestamp 发生时刻。
 	Timestamp time.Time
 	// Type 事件类型。

@@ -82,8 +82,12 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 
 | 你要改什么 | 落在哪 | 连带要改 | 门禁注意 |
 |---|---|---|---|
-| 领域结构（加字段/加枚举） | `types/` | 两个后端的 `storage/{sqlite,postgres}/` | `types` 零依赖，加字段要同步 `schema.go` |
-| 模型调用/向量化/向量索引/脱敏/防伪 | `ports/` | 注入它的 `application.Deps` | 新增第三方须登记 `allow_third_party` |
+| 领域结构（加字段/加枚举） | `types/` | 两个后端的 `storage/{sqlite,postgres}/` | `types` 零依赖，加字段要同步 `schema.go` + **迁移** |
+| 记录级归属（多组共用一套库） | `types/scope.go` | `store.AtomFilter.Scope` + 两个后端的查询 + `pipeline/recall/gather.go` | 过滤**在取数层**（进 SQL）；签名必须含归属 |
+| schema 加列 | `storage/{sqlite,postgres}/schema.go` | `storage/{sqlite,postgres}/migrate.go` | 建表脚本**没有 ALTER**；迁移**必须幂等**；索引归迁移管 |
+| 排序口径（打分器） | `ports/rank.go` | `pipeline/recall/rank.go` + `recall.Config.Ranker` | 缺省**零漂移**（旧公式在测试里重写一遍当期望值） |
+| 模型调用/脱敏/防伪 | `ports/` | 注入它的 `application.Deps` | 新增第三方须登记 `allow_third_party` |
+| 向量化/向量索引 | `ports/index.go` | — | **reserved：当前无消费点**（别让后人照着它接线） |
 | 分桶配额与丢弃计数 | `ports/budget.go` | `pipeline/recall/recall.go` | `BucketID` 是**字符串**，别改成枚举 |
 | 存储接口 | `store/store.go` | **两个后端 + `storage/parity/` 都要动** | 加接口方法 = parity 加断言，两个后端都真跑 |
 | 检索口径钉子 | `store/lexical.go` | 两个后端的索引/查询侧 | `LexicalTokens` / `FTS5Query` 是**单源**，别绕过 |

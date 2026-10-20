@@ -8,8 +8,8 @@ import (
 
 // schemaVersion 本后端的库形状版本号。
 //
-// 记在 meta 表的 schema_version 键里，迁移按版本号线性追加。
-const schemaVersion = 1
+// 记在 meta 表的 schema_version 键里，迁移按版本号线性追加（见 migrate.go）。
+const schemaVersion = 2
 
 // schema 是本后端的建表脚本。
 //
@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS raw_events (
   session_id  TEXT NOT NULL DEFAULT '',
   thread_id   TEXT NOT NULL DEFAULT '',
   user_name   TEXT NOT NULL DEFAULT '',
+  scope       TEXT NOT NULL DEFAULT '',
   ts          TIMESTAMPTZ,
   type        TEXT NOT NULL DEFAULT '',
   content     TEXT NOT NULL DEFAULT '',
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   promotion_reason     TEXT NOT NULL DEFAULT '',
   extractor_version    TEXT NOT NULL DEFAULT '',
   session_id           TEXT NOT NULL DEFAULT '',
+  scope                TEXT NOT NULL DEFAULT '',
   created_at           TIMESTAMPTZ,
   decided_at           TIMESTAMPTZ,
   decided_by           TEXT NOT NULL DEFAULT '',
@@ -77,6 +79,7 @@ CREATE TABLE IF NOT EXISTS atoms (
   namespace       TEXT NOT NULL,
   id              TEXT NOT NULL,
   entity_id       TEXT NOT NULL DEFAULT '',
+  scope           TEXT NOT NULL DEFAULT '',
   candidate_id    TEXT NOT NULL DEFAULT '',
   raw_event_ids   TEXT NOT NULL DEFAULT '[]',
   assertion       TEXT NOT NULL DEFAULT '',
@@ -201,18 +204,31 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `
 
-// ensureSchema 建表并记 schema 版本。
+// ensureSchema 建表、跑迁移、记版本。
+//
+// 顺序不能换：先建表（老库的表已存在，IF NOT EXISTS 让它变成空操作），
+// 再跑迁移（迁移要 ALTER 老库的表），最后记版本号。
+//
+// schema_version 记在全局行（namespace=”）上：它描述的是**库**的形状，
+// 不是某个记忆库的内容，故不按 namespace 分行。
 func ensureSchema(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("建表失败: %w", err)
 	}
-	// schema_version 记在全局行（namespace=''）上：它描述的是**库**的形状，
-	// 不是某个记忆库的内容，故不按 namespace 分行。
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO meta (namespace, key, value) VALUES ('', 'schema_version', $1)
-		 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value`,
-		fmt.Sprint(schemaVersion)); err != nil {
-		return fmt.Errorf("写 schema_version 失败: %w", err)
+	cur, err := schemaVersionOf(ctx, db)
+	if err != nil {
+		return err
 	}
-	return nil
+	for _, m := range migrations {
+		if m.version <= cur {
+			continue
+		}
+		if err := m.apply(ctx, db); err != nil {
+			return fmt.Errorf("迁移到 schema v%d 失败: %w", m.version, err)
+		}
+		if err := setSchemaVersion(ctx, db, m.version); err != nil {
+			return err
+		}
+	}
+	return setSchemaVersion(ctx, db, schemaVersion)
 }

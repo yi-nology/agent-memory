@@ -55,6 +55,13 @@ type Options struct {
 	Namespace string
 	// Host 宿主标识。
 	Host string
+	// Scope 记录级归属（空=全局）。
+	//
+	// 捕获时定下（事件带着它走，候选与事实卡从它继承），
+	// 召回与检索时是读者归属（只看得见「全局 + 同归属」）。
+	// 一条命令一个含义：**写**的时候是「这条属于谁」，
+	// **读**的时候是「我要看谁的」。
+	Scope types.Scope
 	// Model 模型接入配置（**按需**：只有要模型的命令才用得上）。
 	Model ModelOptions
 }
@@ -165,11 +172,13 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		entityID  = fs.String("entity", "", "实体 ID 或规范名")
 		alias     = fs.String("alias", "", "要登记的别名")
 		entType   = fs.String("entity-type", "", "实体类型（宿主给定）")
+		scope     = fs.String("scope", "", "记录级归属（空=全局；写=这条属于谁，读=我要看谁的）")
 	)
 	if err := fs.Parse(rest); err != nil {
 		return 2
 	}
-	opt := Options{DB: *db, Namespace: *ns, Host: *host, Model: readModelEnv()}
+	opt := Options{DB: *db, Namespace: *ns, Host: *host, Scope: types.Scope(*scope),
+		Model: readModelEnv()}
 
 	switch cmd {
 	case "capture":
@@ -302,7 +311,9 @@ func cmdExtract(ctx context.Context, opt Options, stdout, stderr io.Writer,
 	defer func() { _ = st.Close() }()
 
 	ns := store.Namespace(opt.Namespace)
-	evs, err := svc.Store().ListRaw(ctx, ns, time.Time{}, store.Page{Limit: limit})
+	// 归属不隔离（传空值）：提炼要覆盖库里全部事件，
+	// 每条事件带自己的归属，候选与事实卡从它继承。
+	evs, err := svc.Store().ListRaw(ctx, ns, "", time.Time{}, store.Page{Limit: limit})
 	if err != nil {
 		fmt.Fprintln(stderr, "读原始事件失败:", err)
 		return 1
@@ -471,6 +482,7 @@ func cmdCapture(ctx context.Context, opt Options, stdout, stderr io.Writer,
 		Type: types.RawEventType(evType), Content: content,
 		Provenance: types.Provenance{Origin: types.OriginOperator},
 		Explicit:   explicit,
+		Scope:      opt.Scope,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "捕获失败:", err)
@@ -497,6 +509,7 @@ func cmdRecall(ctx context.Context, opt Options, stdout, stderr io.Writer,
 	res, err := svc.Recall(ctx, recall.Request{
 		Namespace: store.Namespace(opt.Namespace), Query: query,
 		SessionID: sessionID, ThreadID: threadID, Limit: limit,
+		Scope: opt.Scope,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "召回失败:", err)
@@ -521,7 +534,10 @@ func cmdSearch(ctx context.Context, opt Options, stdout, stderr io.Writer, query
 	}
 	defer func() { _ = st.Close() }()
 
-	atoms, err := svc.Search(ctx, store.Namespace(opt.Namespace), query, limit)
+	atoms, err := svc.Search(ctx, store.Namespace(opt.Namespace), query, store.AtomFilter{
+		Limit: limit,
+		Scope: opt.Scope,
+	})
 	if err != nil {
 		fmt.Fprintln(stderr, "检索失败:", err)
 		return 1

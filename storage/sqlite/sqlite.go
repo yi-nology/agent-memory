@@ -119,19 +119,33 @@ func OpenMemory(name string) (*Store, error) {
 	return s, nil
 }
 
+// ensureSchema 建表、跑迁移、记版本。
+//
+// 顺序不能换：先建表（老库的表已存在，IF NOT EXISTS 让它变成空操作），
+// 再跑迁移（迁移要 ALTER 老库的表），最后记版本号。
+//
+// schema_version 记在全局行（namespace=”）上：它描述的是**库**的形状，
+// 不是某个记忆库的内容，故不按 namespace 分行。
 func ensureSchema(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("建表失败: %w", err)
 	}
-	// schema_version 记在全局行（namespace=''）上：它描述的是**库**的形状，
-	// 不是某个记忆库的内容，故不按 namespace 分行。
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO meta (namespace, key, value) VALUES ('', 'schema_version', ?)
-		 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value`,
-		fmt.Sprint(schemaVersion)); err != nil {
-		return fmt.Errorf("写 schema_version 失败: %w", err)
+	cur, err := schemaVersionOf(ctx, db)
+	if err != nil {
+		return err
 	}
-	return nil
+	for _, m := range migrations {
+		if m.version <= cur {
+			continue
+		}
+		if err := m.apply(ctx, db); err != nil {
+			return fmt.Errorf("迁移到 schema v%d 失败: %w", m.version, err)
+		}
+		if err := setSchemaVersion(ctx, db, m.version); err != nil {
+			return err
+		}
+	}
+	return setSchemaVersion(ctx, db, schemaVersion)
 }
 
 // Vacuum 物理整理（VACUUM）。
@@ -403,16 +417,31 @@ func (s *Store) indexDelete(ctx context.Context, table, namespace, ref string) e
 // 用户原文直接拼进 MATCH 就是一处注入面——查询里的引号与运算符会被当成语法。
 // 本层无法区分「用户想按语法检索」与「用户输入恰好含语法」，故一律按字面量
 // 处理：切词 + 逐词加引号（见 ftsQuery）。
-func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int) ([]string, error) {
+//
+// # extra 是附加条件（可选）
+//
+// 形如 "atom_id IN (SELECT ...)" 的 SQL 片段与它的参数，供**必须在取数层**
+// 生效的过滤用（归属过滤，见 atom.go 的 SearchAtoms）：
+// 后置过滤会让被滤掉的条目先占掉 LIMIT 配额，于是「该给我的那条」根本没进候选池。
+//
+// extra 为空串时行为与从前一字不差（这是绝大多数调用点的路径）。
+func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int,
+	extra string, extraArgs ...any) ([]string, error) {
 	match := ftsQuery(query)
 	if match == "" {
 		// 查询里没有可检索的词元（全是标点/空白）：不是错误，是「没得可查」。
 		return nil, nil
 	}
+	where := "namespace = ? AND " + table + " MATCH ?"
+	args := []any{namespace, match}
+	if extra != "" {
+		where += " AND " + extra
+		args = append(args, extraArgs...)
+	}
 	rows, err := s.query(ctx,
 		`SELECT `+refCol(table)+` FROM `+table+`
-		 WHERE namespace = ? AND `+table+` MATCH ? ORDER BY rank LIMIT ?`,
-		namespace, match, limitOf(limit, 10))
+		 WHERE `+where+` ORDER BY rank LIMIT ?`,
+		append(args, limitOf(limit, 10))...)
 	if err != nil {
 		// MATCH 语法错误不该炸掉整条召回路径——退回空结果，让上层决定要不要兜底。
 		//

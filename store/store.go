@@ -54,6 +54,31 @@ type (
 	AtomFilter struct {
 		// EntityIDs 限定实体集合（空=全部）。
 		EntityIDs []string
+		// Scope 读者归属（空=不隔离）。
+		//
+		// 非空时取「**全局事实 + 同归属事实**」：归属为空的卡是全局的，
+		// 人人都该看到；归属非空且不等于读者的卡**一条都不给**。
+		// 判据见 types.Scope.VisibleTo。
+		//
+		// # 为什么空值是「不隔离」而不是「只看全局」
+		//
+		// 两种语义都自洽，但**失效方向相反**：
+		//
+		//   - 空=不隔离：宿主忘了传归属 → 看到全部（含别人的卡）→ **泄漏**；
+		//   - 空=只看全局：宿主忘了传归属 → 只看到全局卡 → **少取**（看起来正常）。
+		//
+		// 本仓取「空=不隔离」，理由是**与既有过滤面一致**
+		// （EntityIDs 空=不限、Importance 空=不限）：
+		// 同一份过滤条件里两种空值语义会让调用点读错。
+		// 泄漏的风险不靠这条语义兜，而靠**归属是显式参数**：
+		// 宿主在调用点写不写得出这一栏，代码里看得见；
+		// 且读取侧还有一道兜底（召回层复查可见性，见 pipeline/recall）。
+		//
+		// ⚠️ 隔离**必须在取数层生效**，不能交给调用方后置过滤：
+		// 后置过滤时，被滤掉的条目已经占掉了取数配额（TopK），
+		// 于是「该给我的那条」根本没进候选池——而症状是「召回变少了」，
+		// 看着像排序问题，根因却在取数。
+		Scope types.Scope
 		// ActiveOnly 只要活跃事实（软退役排除）。
 		//
 		// 召回路径**必须**置位：默认值 false 意味着「忘了过滤就捞到已作废事实」，
@@ -82,9 +107,15 @@ type RawStore interface {
 	GetRaw(ctx context.Context, ns Namespace, id string) (*types.RawEvent, error)
 	GetRawByIDs(ctx context.Context, ns Namespace, ids []string) ([]*types.RawEvent, error)
 	// ListRaw 按时间倒序列出。before 非零时只取更早的（分页游标）。
-	ListRaw(ctx context.Context, ns Namespace, before time.Time, p Page) ([]*types.RawEvent, error)
+	//
+	// scope 是读者归属（空=不隔离），语义同 AtomFilter.Scope：
+	// 非空时只取「全局 + 同归属」的事件。
+	//
+	// 它必须在这里生效而不能后置过滤：原始事件是召回的兜底源，
+	// 一次就取 MaxRaw 条——被别家占掉之后就没有自己的了。
+	ListRaw(ctx context.Context, ns Namespace, scope types.Scope, before time.Time, p Page) ([]*types.RawEvent, error)
 	// SearchRaw 词法检索。
-	SearchRaw(ctx context.Context, ns Namespace, query string, limit int) ([]*types.RawEvent, error)
+	SearchRaw(ctx context.Context, ns Namespace, scope types.Scope, query string, limit int) ([]*types.RawEvent, error)
 	// DeleteRawBefore 清理早于 before 的事件，返回删除条数。
 	DeleteRawBefore(ctx context.Context, ns Namespace, before time.Time) (int, error)
 }
@@ -108,6 +139,13 @@ type CandidateStore interface {
 
 // AtomStore 事实卡存取。
 type AtomStore interface {
+	// SaveAtom 落库一条事实卡。
+	//
+	// **向量不在落库范围内**：本仓的定案是「向量轨不接」，
+	// 两个后端都不存向量（见 types.AtomCard.Vector）。
+	// 故卡上带着非空向量时**必须报错**——
+	// 静默丢掉的话，宿主的症状是「相似度检索永远空」，
+	// 而它与「存错了地方」毫无相似之处。
 	SaveAtom(ctx context.Context, ns Namespace, a *types.AtomCard) error
 	GetAtom(ctx context.Context, ns Namespace, id string) (*types.AtomCard, error)
 	ListAtoms(ctx context.Context, ns Namespace, f AtomFilter) ([]*types.AtomCard, error)
@@ -124,7 +162,15 @@ type AtomStore interface {
 	// FindAtomBySignature 按签名查事实（签名定义见 types.AtomCard.Signature）。
 	FindAtomBySignature(ctx context.Context, ns Namespace, signature string) (*types.AtomCard, error)
 	// SearchAtoms 词法检索。
-	SearchAtoms(ctx context.Context, ns Namespace, query string, limit int) ([]*types.AtomCard, error)
+	//
+	// 带过滤条件（而不是只带 limit）是**刻意的**：检索是取数面的一条路，
+	// 归属过滤必须在这条路上生效——只在 ListAtoms 上过滤是不够的，
+	// 因为检索路会绕过滤面直接取 TopK，被别家的卡占掉配额。
+	//
+	// 过滤条件的其余各项语义与 ListAtoms 相同（零值=不过滤）：
+	// ActiveOnly 默认 false，故「退役事实仍可搜到」这条约定保持不变
+	// （追问「当初为什么这么判」要能搜到）。
+	SearchAtoms(ctx context.Context, ns Namespace, query string, f AtomFilter) ([]*types.AtomCard, error)
 	// SupersedeAtom 软退役：被继任者推翻。旧卡保留可查。
 	SupersedeAtom(ctx context.Context, ns Namespace, id, supersededBy string) error
 	// DeprecateAtom 软退役：人工作废。

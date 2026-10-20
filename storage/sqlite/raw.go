@@ -10,7 +10,7 @@ import (
 	"github.com/yi-nology/agent-memory/types"
 )
 
-const rawCols = `id, host, session_id, thread_id, user, ts, type, content, payload, provenance`
+const rawCols = `id, host, session_id, thread_id, user, scope, ts, type, content, payload, provenance`
 
 func (s *rawStore) scanRaw(rows *sql.Rows) (*types.RawEvent, error) {
 	var (
@@ -19,7 +19,7 @@ func (s *rawStore) scanRaw(rows *sql.Rows) (*types.RawEvent, error) {
 		payload string
 		prov    provenanceFields
 	)
-	if err := rows.Scan(&ev.ID, &ev.Host, &ev.SessionID, &ev.ThreadID, &ev.User,
+	if err := rows.Scan(&ev.ID, &ev.Host, &ev.SessionID, &ev.ThreadID, &ev.User, &ev.Scope,
 		&tsVal, &ev.Type, &ev.Content, &payload, provScan{&prov}); err != nil {
 		return nil, err
 	}
@@ -75,9 +75,9 @@ func (s *rawStore) SaveRaw(ctx context.Context, ns store.Namespace, ev *types.Ra
 		return err
 	}
 	if _, err := s.exec(ctx, `INSERT INTO raw_events
-		(namespace, id, host, session_id, thread_id, user, ts, type, content, payload, provenance)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		nsOf(ns), ev.ID, ev.Host, ev.SessionID, ev.ThreadID, ev.User,
+		(namespace, id, host, session_id, thread_id, user, scope, ts, type, content, payload, provenance)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		nsOf(ns), ev.ID, ev.Host, ev.SessionID, ev.ThreadID, ev.User, string(ev.Scope),
 		ts(ev.Timestamp), string(ev.Type), ev.Content, mapJSON(ev.Payload),
 		provenanceJSON(provenanceOf(ev.Provenance)),
 	); err != nil {
@@ -146,9 +146,16 @@ func (s *rawStore) GetRawByIDs(ctx context.Context, ns store.Namespace, ids []st
 	return out, rows.Err()
 }
 
-func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, before time.Time, p store.Page) ([]*types.RawEvent, error) {
+func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, scope types.Scope,
+	before time.Time, p store.Page) ([]*types.RawEvent, error) {
 	q := `SELECT ` + rawCols + ` FROM raw_events WHERE namespace = ?`
 	args := []any{nsOf(ns)}
+	if scope != "" {
+		// 归属条件：**全局的 + 同归属的**，别家的不给。
+		// 语义见 store.AtomFilter.Scope。
+		q += ` AND (scope = '' OR scope = ?)`
+		args = append(args, string(scope))
+	}
 	if !before.IsZero() {
 		q += ` AND ts < ?`
 		args = append(args, ts(before))
@@ -171,8 +178,16 @@ func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, before time.
 	return out, rows.Err()
 }
 
-func (s *rawStore) SearchRaw(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.RawEvent, error) {
-	ids, err := s.searchFTS(ctx, "raw_fts", nsOf(ns), query, limit)
+func (s *rawStore) SearchRaw(ctx context.Context, ns store.Namespace, scope types.Scope,
+	query string, limit int) ([]*types.RawEvent, error) {
+	extra := ""
+	var extraArgs []any
+	if scope != "" {
+		// 归属条件进 SQL，与 LIMIT 同一次求值（理由见 ListRaw 同处）。
+		extra = "event_id IN (SELECT id FROM raw_events WHERE namespace = ? AND (scope = '' OR scope = ?))"
+		extraArgs = []any{nsOf(ns), string(scope)}
+	}
+	ids, err := s.searchFTS(ctx, "raw_fts", nsOf(ns), query, limit, extra, extraArgs...)
 	if err != nil || len(ids) == 0 {
 		return nil, err
 	}

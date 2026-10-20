@@ -15,18 +15,18 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
     └──episode extraction──→ Episode
 ```
 
-## 现在有什么（v0.5.1）
+## 现在有什么（v0.5.1 + 未发布改动）
 
 | 面 | 状态 | 位置 |
 |---|---|---|
 | 领域结构单源 | ✅ | `types/` —— 捕获事件/候选/事实卡/实体/别名/页面/情节/审计条目 |
-| 外部能力端口 | ✅ | `ports/` —— 模型调用/向量化/向量索引/脱敏/注入防伪/词元计量，接口 + 纯标准库默认实现；**分桶配额与丢弃计数**（`ports.Budget`）与召回实现解耦，宿主自造召回可复用同一套 |
-| 持久化契约 | ✅ | `store/` —— 按消费面拆成 8 个小接口（`RawStore`/`CandidateStore`/`AtomStore`/`EntityStore`/`PageStore`/`EpisodeStore`/`JournalStore`/`MetaStore`），22 个模块的方向已登记 |
+| 外部能力端口 | ✅ | `ports/` —— 模型调用/脱敏/注入防伪/词元计量，接口 + 纯标准库默认实现；**分桶配额与丢弃计数**（`ports.Budget`）与召回实现解耦，宿主自造召回可复用同一套；**排序打分器**（`ports.Ranker`）可注入换口径，缺省权重下**逐条等价于**原实现 |
+| 持久化契约 | ✅ | `store/` —— 按消费面拆成 8 个小接口（`RawStore`/`CandidateStore`/`AtomStore`/`EntityStore`/`PageStore`/`EpisodeStore`/`JournalStore`/`MetaStore`），22 个模块的方向已登记；**归属维度**（记录级隔离）进过滤面，两条取数路都在**取数层**生效 |
 | 架构门禁 | ✅ | `architecture-policy.yaml` + `tools/archcheck/`（**独立模块**，5 条规则 + 2 条阈值 / 18 个自证用例） |
-| SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑**（单套表 + namespace 列隔离，非表前缀） |
+| SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑**（单套表 + namespace 列隔离，非表前缀）；带**版本化迁移**（老库打开即升级，迁移幂等） |
 | PostgreSQL 后端 | ✅ | `storage/postgres/` —— tsvector + GIN + 事务，与 SQLite **同一组行为断言** |
-| 跨后端行为断言 | ✅ | `storage/parity/` —— **31 条断言，两个后端都真跑**（PG 对着真实服务器） |
-| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测、**取数两路**（查询命中 ∪ 高价值兜底）、可按宿主实体限定、可无捕获面运行 |
+| 跨后端行为断言 | ✅ | `storage/parity/` —— **36 条断言，两个后端都真跑**（PG 对着真实服务器） |
+| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测、**取数两路**（查询命中 ∪ 高价值兜底）、可按宿主实体限定、**可按归属隔离**、可无捕获面运行、**排序可注入** |
 | 注入防伪 | ✅ | `ports.MemoryBand` —— 转义全部 `<`，9 条攻击载荷用例钉住 |
 | 脱敏 | ✅ | `ports.PatternRedactor` —— 形态兵底 + `guardx/logredact` 规则表，**掩码长度不泄露原值长度** |
 | 捕获面 | ✅ | `pipeline/capture/` —— **落库前打码**（Redactor 必需）、运行期错误与空白正文拒收 |
@@ -39,8 +39,13 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 | 迁移包 / bridge / CLI | ✅ | `operations/portable/`（.hmpkg，体检与导入走 `oekit/pkg/pack`）`adapters/bridge`（JSON-RPC）`adapters/cli` |
 | 跨包端到端测试 | ✅ | `integration/` —— 主链走一遍（真实后端，不 mock 任何一层） |
 
+> **下一次发版是 v0.6.0，且含破坏性变更**：`store` 的三个方法签名变了
+> （`SearchAtoms` / `ListRaw` / `SearchRaw` 都要带过滤条件或归属），
+> `application.Service.Search` 改成吃 `store.AtomFilter`。
+> 下游跟着改的清单见 issue #10 / #11 的回写。
+
 > **PG 那一行不再是「未验证」**：v0.2.0 起 PG 后端是**完整实现**，
-> 31 条 parity 断言对着**真实 PostgreSQL** 跑通，且 CI 里加了 `postgres` service
+> 36 条 parity 断言对着**真实 PostgreSQL** 跑通，且 CI 里加了 `postgres` service
 > 让它每次推送都真跑——「skipped 的 PG 用例不证明兼容」，所以它不许被 skip 掉。
 
 ## 设计取舍（先看这几条，其余都在方案文档里）
@@ -56,7 +61,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
    不破坏那条降级路径；每条登记带 `reason` + `until` + `removal`，缺一条加载即失败、
    到期即红。
 
-2. **行为一致性由共享断言保证，不由各自的单测保证。** `storage/parity` 里 31 条断言，
+2. **行为一致性由共享断言保证，不由各自的单测保证。** `storage/parity` 里 36 条断言，
    两个后端跑**同一份**，且**两个都必须真跑过**（PG 那个对着真实服务器）。
    各自单测都绿 ≠ 行为一致：软退役过滤漏一列、分页游标用
    `<=` 还是 `<`、时间窗闭开区间——这类不一致在各自单测里全都看不出来，
@@ -104,6 +109,24 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
    钉子的必要性在 v0.4.0 被验证过一次：查询侧一度直接调上游而绕过钉子，
    两者当时行为一致（不是当下的错），但上游一改就是**静默漏命中**。
 
+10. **归属是记录级的，过滤必须在取数层。** `Namespace` 是**整库级**隔离；
+    多组共用一套库时还需要**记录级**归属（`types.Scope`）：
+    空 = 全局可见（人人都该看到），非空 = 仅同归属可见。
+    用 `Namespace` 表达第二层意味着「一条全局事实」得向每个组复制一份——
+    写放大，且全局事实一新增就得回头补所有组的副本。那是不可行的建模。
+    > ⚠️ 归属过滤**必须在取数层**（进 SQL，与 TopK 配额同一次求值）：
+    > 交给调用方后置过滤的话，被别家占掉的配额已经花掉了，
+    > 于是「该给我的那条」根本没进候选池——症状只是「召回变少了」，
+    > 看着像排序问题，根因却在取数。召回层另有一道复查兜底（纵深防御）。
+
+11. **排序要留注入缝，默认零漂移。** 打分器是宿主的事（走语义轨的宿主有自己的口径），
+    没有注入缝它只能**绕开整条召回链自造一套**，两套排序口径并存，
+    后续收敛都要付迁移成本。故 `ports.Ranker` 是端口，缺省实现是本仓的
+    词面+重要度+新鲜度（权重 0.6/0.25/0.15）——
+    缺省下与注入前**逐条等价**（`ports` 包的用例把旧公式重写一遍当期望值钉住）。
+    契约只有一条要紧的：分数与候选**一一对应且同序**，长度不符即报错
+    ——错位不会崩，只会静默换序，而换序在结果里完全看不出来。
+
 ## 开发
 
 ```bash
@@ -145,7 +168,12 @@ memory episode list                # 列出情节
 ```
 
 全局旗标（所有子命令通用）：`--db`（记忆库路径，缺省 `memory.sqlite`）、
-`--namespace`（记忆库名，缺省 `default`）、`--host`（宿主标识，缺省 `cli`）。
+`--namespace`（记忆库名，缺省 `default`）、`--host`（宿主标识，缺省 `cli`）、
+`--scope`（记录级归属，缺省空=全局）。
+
+`--scope` 在**写**的命令（`capture`）与**读**的命令（`recall` / `search`）
+里是同一个旗标、两种含义：写的时候是「这条属于谁」，读的时候是「我要看谁的」
+（空 = 不隔离；非空 = 只看「全局 + 同归属」）。
 
 CLI 多数命令是**管理口**（看与搬），不注入模型；`extract` 与 `promote` 例外——
 它们要模型，端点从环境变量读（`MEMORY_LLM_BASE_URL` / `MEMORY_LLM_API_KEY` /
@@ -176,6 +204,10 @@ go test ./storage/postgres/ -count=1
 - **不认识领域。** 记忆认识「事实/实体/会话」，不认识「那台机器/那个集群/那次巡检」。
   宿主把运维对象投影成 `Entity` 交给本仓，门禁 `memory-no-domain-vocabulary` 强制。
 - **向量索引默认关。** 上游自己也标为「默认关闭、测试全 mock、真实集成未验证」。
+  但**缝留出来了**：`ports.Ranker` 可注入换排序口径，`types.AtomCard.Vector`
+  是类型层的落脚点（默认不进持久化），`ports.Embedder` / `ports.VectorIndex`
+  明确标注为 **reserved（当前无消费点）**——
+  一个定义了却零消费者的导出接口，读起来像能力，实际不是，故写明。
 - **写入面与召回面都不借 harness。** budget / pii / guardx 三处形态都对不上，且借道会
   同时撞破 `memory-no-harness-dependency` 与 `memory-core-stdlib-only` 两条红线。
   共享的是纪律，不是代码。详见 AGENTS.md「已定案、勿重复评估」。

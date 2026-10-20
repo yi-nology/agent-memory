@@ -374,3 +374,57 @@ func TestNewRejectsNilStore(t *testing.T) {
 		t.Fatal("未装配存储必须让构造失败")
 	}
 }
+
+// ── 归属维度 ──
+
+// 归属要**从候选继承到事实卡**：归属在捕获时定下，一路带过来。
+//
+// 断在中间那一站的后果是「这一组的事实变成了全局的」——
+// 那是**泄漏**，而症状只是「别的组也看得见这条事实」。
+func TestAtomInheritsCandidateScope(t *testing.T) {
+	f := newFake()
+	f.raws["e1"] = &types.RawEvent{ID: "e1", Content: "机器甲的磁盘长期偏小"}
+	f.ents["e1"] = &types.Entity{ID: "e1", CanonicalName: "机器甲"}
+	p := newPromoter(t, f, nil)
+
+	c := cand("机器甲的磁盘长期偏小需要清理", "e1", "机器甲")
+	c.Scope = "scope-a"
+	v, err := p.Promote(ctx2(), ns, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Atom == nil {
+		t.Fatalf("该晋升为事实: %+v", v)
+	}
+	if v.Atom.Scope != "scope-a" {
+		t.Fatalf("事实卡没继承候选的归属: %q", v.Atom.Scope)
+	}
+}
+
+// 跨归属**不许并入**：签名含归属，两组的同一条断言是两张不同的卡。
+//
+// 不含归属的话，一组的候选会被并进另一组的卡片——那是内容泄漏，不是去重。
+func TestNoMergeAcrossScopes(t *testing.T) {
+	f := newFake()
+	f.raws["e1"] = &types.RawEvent{ID: "e1", Content: "机器甲的磁盘长期偏小"}
+	f.ents["e1"] = &types.Entity{ID: "e1", CanonicalName: "机器甲"}
+	// 既有事实卡属于另一组。
+	f.atoms = append(f.atoms, &types.AtomCard{
+		ID: "atom-old", EntityID: "e1", Scope: "scope-b",
+		Assertion: "机器甲的磁盘长期偏小需要清理",
+	})
+	p := newPromoter(t, f, nil)
+
+	c := cand("机器甲的磁盘长期偏小需要清理", "e1", "机器甲")
+	c.Scope = "scope-a"
+	v, err := p.Promote(ctx2(), ns, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Decision == promotion.DecisionMerge {
+		t.Fatalf("跨归属不许并入（那是泄漏）: %+v", v)
+	}
+	if v.Atom != nil && v.Atom.Scope != "scope-a" {
+		t.Fatalf("新卡的归属应是本组: %q", v.Atom.Scope)
+	}
+}

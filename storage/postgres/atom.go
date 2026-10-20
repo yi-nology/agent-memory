@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -11,7 +12,15 @@ import (
 	"github.com/yi-nology/agent-memory/types"
 )
 
-const atomCols = `id, entity_id, candidate_id, raw_event_ids, assertion, verbatim_quote,
+// errAtomVectorNotStored 向量不落库时的哨兵。
+//
+// 本仓的定案是「向量轨不接」：两个后端都不存向量。
+// 卡上带着向量来存时**必须报错**——静默丢掉的话，症状是
+// 「相似度检索永远空」，而它与「存错了地方」毫无相似之处。
+var errAtomVectorNotStored = errors.New("事实卡带了向量，但本后端不落向量（向量轨未接）：" +
+	"请把它留在自己的存储里，或换一个会落向量的后端")
+
+const atomCols = `id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,
 	quote_event_id, search_terms, occurred_at, confidence, importance,
 	created_at, updated_at, superseded_by, deprecated_at, provenance`
 
@@ -24,7 +33,7 @@ func (s *atomStore) scanAtom(rows *sql.Rows) (*types.AtomCard, error) {
 		deprecated                 sql.NullTime
 		prov                       provenanceFields
 	)
-	if err := rows.Scan(&a.ID, &a.EntityID, &a.CandidateID, &rawIDs, &a.Assertion,
+	if err := rows.Scan(&a.ID, &a.EntityID, &a.Scope, &a.CandidateID, &rawIDs, &a.Assertion,
 		&a.VerbatimQuote, &a.QuoteEventID, &terms, &occurred, &a.Confidence, &a.Importance,
 		&created, &updated, &a.SupersededBy, &deprecated, provScan{&prov}); err != nil {
 		return nil, err
@@ -49,6 +58,12 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 	if err := a.Valid(); err != nil {
 		return err
 	}
+	if len(a.Vector) > 0 {
+		// 向量不落库（见 store.AtomStore.SaveAtom 与 types.AtomCard.Vector）：
+		// 静默丢掉的话，症状是「相似度检索永远空」——
+		// 而它与「存错了地方」毫无相似之处。故响亮失败。
+		return errAtomVectorNotStored
+	}
 	now := a.UpdatedAt
 	if now.IsZero() {
 		now = a.CreatedAt
@@ -57,14 +72,15 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 	// upsert 而不是纯 INSERT：事实卡会被更新——晋升并入时补证据、
 	// 退役时改状态、合并时迁移归属。
 	_, err := s.exec(ctx, `INSERT INTO atoms
-		(namespace, id, entity_id, candidate_id, raw_event_ids, assertion, verbatim_quote,
+		(namespace, id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,
 		 quote_event_id, search_terms, occurred_at, confidence, importance,
 		 created_at, updated_at, superseded_by, deprecated_at, provenance, signature,
 		 body, body_tsv)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-		        to_tsvector('simple', $19))
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+		        to_tsvector('simple', $20))
 		ON CONFLICT(namespace, id) DO UPDATE SET
-			entity_id = excluded.entity_id, candidate_id = excluded.candidate_id,
+			entity_id = excluded.entity_id, scope = excluded.scope,
+			candidate_id = excluded.candidate_id,
 			raw_event_ids = excluded.raw_event_ids, assertion = excluded.assertion,
 			verbatim_quote = excluded.verbatim_quote, quote_event_id = excluded.quote_event_id,
 			search_terms = excluded.search_terms, occurred_at = excluded.occurred_at,
@@ -73,9 +89,9 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 			superseded_by = excluded.superseded_by, deprecated_at = excluded.deprecated_at,
 			provenance = excluded.provenance, signature = excluded.signature,
 			body = excluded.body, body_tsv = excluded.body_tsv`,
-		nsOf(ns), a.ID, a.EntityID, a.CandidateID, stringsJSON(a.RawEventIDs), a.Assertion,
-		a.VerbatimQuote, a.QuoteEventID, stringsJSON(a.SearchTerms), ts(a.OccurredAt),
-		string(a.Confidence), string(a.Importance), ts(a.CreatedAt), ts(now),
+		nsOf(ns), a.ID, a.EntityID, string(a.Scope), a.CandidateID, stringsJSON(a.RawEventIDs),
+		a.Assertion, a.VerbatimQuote, a.QuoteEventID, stringsJSON(a.SearchTerms),
+		ts(a.OccurredAt), string(a.Confidence), string(a.Importance), ts(a.CreatedAt), ts(now),
 		a.SupersededBy, tsPtr(a.DeprecatedAt),
 		provenanceJSON(provenanceOf(a.Provenance)), a.Signature(), body)
 	return err
@@ -95,33 +111,12 @@ func (s *atomStore) GetAtom(ctx context.Context, ns store.Namespace, id string) 
 }
 
 func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.AtomFilter) ([]*types.AtomCard, error) {
-	var (
-		where = []string{"namespace = $1"}
-		args  = []any{nsOf(ns)}
-	)
-	if len(f.EntityIDs) > 0 {
-		where = append(where, "entity_id IN ("+numberedPlaceholders(len(args)+1, len(f.EntityIDs))+")")
-		for _, e := range f.EntityIDs {
-			args = append(args, e)
-		}
-	}
-	if f.ActiveOnly {
-		// 软退役两态合起来才是「不参与召回」：只看其中一列会漏掉另一种。
-		where = append(where, "superseded_by = ''", "deprecated_at IS NULL")
-	}
-	if len(f.Importance) > 0 {
-		where = append(where, "importance IN ("+numberedPlaceholders(len(args)+1, len(f.Importance))+")")
-		for _, i := range f.Importance {
-			args = append(args, string(i))
-		}
-	}
-	if !f.OccurredFrom.IsZero() {
-		where = append(where, "occurred_at >= $"+fmt.Sprint(len(args)+1))
-		args = append(args, ts(f.OccurredFrom))
-	}
-	if !f.OccurredTo.IsZero() {
-		where = append(where, "occurred_at < $"+fmt.Sprint(len(args)+1))
-		args = append(args, ts(f.OccurredTo))
+	where := []string{"namespace = $1"}
+	args := []any{nsOf(ns)}
+	cond, condArgs := atomConditions(f, len(args)+1)
+	if cond != "" {
+		where = append(where, cond)
+		args = append(args, condArgs...)
 	}
 	// 末尾的 id ASC 是**并列时的稳定序**：重要度与发生时刻都相同的两张卡，
 	// 没有它时返回顺序不确定——而「同签名合并时保留哪一张」正是由这个顺序
@@ -149,6 +144,59 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 	return out, rows.Err()
 }
 
+// atomConditions 事实卡的过滤条件（SQL 片段 + 参数）。
+//
+// **单独成一处**，因为两条取数路都要用它们：列表路（ListAtoms）与
+// 检索路（SearchAtoms）。两处各写一遍的话，改了其中一处就会让
+// 「列表看到的」与「搜到的」口径分叉——而那种分叉在数据上完全看不出来。
+//
+// start 是第一个占位符的编号：PG 的占位符带号，两条路的起号不同
+// （列表路 $1 是 namespace，检索路 $1/$2 是 namespace 与 tsquery）。
+func atomConditions(f store.AtomFilter, start int) (string, []any) {
+	var (
+		where = []string{}
+		args  = []any{}
+	)
+	if len(f.EntityIDs) > 0 {
+		where = append(where, "entity_id IN ("+numberedPlaceholders(start, len(f.EntityIDs))+")")
+		for _, e := range f.EntityIDs {
+			args = append(args, e)
+		}
+		start += len(f.EntityIDs)
+	}
+	if f.Scope != "" {
+		// 归属条件：**全局的 + 同归属的**，别家的不给。
+		//
+		// 「归属为空=不过滤」这条语义在 store.AtomFilter.Scope 的注释里，
+		// 这里是它的可执行形态。
+		where = append(where, "(scope = '' OR scope = $"+fmt.Sprint(start)+")")
+		args = append(args, string(f.Scope))
+		start++
+	}
+	if f.ActiveOnly {
+		// 软退役两态合起来才是「不参与召回」：只看其中一列会漏掉另一种。
+		where = append(where, "superseded_by = ''", "deprecated_at IS NULL")
+	}
+	if len(f.Importance) > 0 {
+		where = append(where, "importance IN ("+numberedPlaceholders(start, len(f.Importance))+")")
+		for _, i := range f.Importance {
+			args = append(args, string(i))
+		}
+		start += len(f.Importance)
+	}
+	if !f.OccurredFrom.IsZero() {
+		where = append(where, "occurred_at >= $"+fmt.Sprint(start))
+		args = append(args, ts(f.OccurredFrom))
+		start++
+	}
+	if !f.OccurredTo.IsZero() {
+		where = append(where, "occurred_at < $"+fmt.Sprint(start))
+		args = append(args, ts(f.OccurredTo))
+		start++
+	}
+	return strings.Join(where, " AND "), args
+}
+
 func (s *atomStore) ListAtomsByEntity(ctx context.Context, ns store.Namespace, entityID string) ([]*types.AtomCard, error) {
 	if entityID == "" {
 		return nil, nil
@@ -174,12 +222,29 @@ func (s *atomStore) FindAtomBySignature(ctx context.Context, ns store.Namespace,
 	return s.scanAtom(rows)
 }
 
-func (s *atomStore) SearchAtoms(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.AtomCard, error) {
-	ids, err := s.searchFTS(ctx, "atoms", nsOf(ns), query, limit)
+func (s *atomStore) SearchAtoms(ctx context.Context, ns store.Namespace, query string, f store.AtomFilter) ([]*types.AtomCard, error) {
+	ids, err := s.searchAtomIDs(ctx, ns, query, f)
 	if err != nil || len(ids) == 0 {
 		return nil, err
 	}
 	return s.atomsByIDsOrdered(ctx, ns, ids)
+}
+
+// searchAtomIDs 事实卡检索：取标识（带过滤条件）。
+//
+// # 过滤条件在**这条 SQL 里**生效
+//
+// 归属过滤尤其不能后置：后置的话，被别家占掉的 TopK 配额已经花掉了，
+// 于是「该给我的那条」根本没进候选池——症状是「召回变少了」，
+// 看着像排序问题，根因却在取数。
+//
+// PG 侧正文与词元向量都在 atoms 表本身，故条件直接进同一条 WHERE，
+// 与 LIMIT 同一次求值。
+func (s *atomStore) searchAtomIDs(ctx context.Context, ns store.Namespace,
+	query string, f store.AtomFilter) ([]string, error) {
+	// 占位符起号：$1 是 namespace，$2 是 tsquery，条件从 $3 起。
+	cond, condArgs := atomConditions(f, 3)
+	return s.searchFTS(ctx, "atoms", nsOf(ns), query, f.Limit, cond, condArgs...)
 }
 
 func (s *atomStore) SupersedeAtom(ctx context.Context, ns store.Namespace, id, supersededBy string) error {
