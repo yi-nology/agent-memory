@@ -20,10 +20,10 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 | 面 | 状态 | 位置 |
 |---|---|---|
 | 领域结构单源 | ✅ | `types/` —— 捕获事件/候选/事实卡/实体/别名/页面/情节/审计条目 |
-| 外部能力端口 | ✅ | `ports/` —— 模型调用/向量化/向量索引/脱敏/注入防伪，接口 + 纯标准库默认实现；**分桶配额与丢弃计数**（`ports.Budget`）与召回实现解耦，宿主自造召回可复用同一套 |
-| 持久化契约 | ✅ | `store/` —— 按消费面拆成小接口，22 个模块的方向已登记 |
-| 架构门禁 | ✅ | `architecture-policy.yaml` + `tools/archcheck/`（**独立模块**，5 条规则 / 18 个自证用例） |
-| SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑** |
+| 外部能力端口 | ✅ | `ports/` —— 模型调用/向量化/向量索引/脱敏/注入防伪/词元计量，接口 + 纯标准库默认实现；**分桶配额与丢弃计数**（`ports.Budget`）与召回实现解耦，宿主自造召回可复用同一套 |
+| 持久化契约 | ✅ | `store/` —— 按消费面拆成 8 个小接口（`RawStore`/`CandidateStore`/`AtomStore`/`EntityStore`/`PageStore`/`EpisodeStore`/`JournalStore`/`MetaStore`），22 个模块的方向已登记 |
+| 架构门禁 | ✅ | `architecture-policy.yaml` + `tools/archcheck/`（**独立模块**，5 条规则 + 2 条阈值 / 18 个自证用例） |
+| SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑**（单套表 + namespace 列隔离，非表前缀） |
 | PostgreSQL 后端 | ✅ | `storage/postgres/` —— tsvector + GIN + 事务，与 SQLite **同一组行为断言** |
 | 跨后端行为断言 | ✅ | `storage/parity/` —— **31 条断言，两个后端都真跑**（PG 对着真实服务器） |
 | 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测、**取数两路**（查询命中 ∪ 高价值兜底）、可按宿主实体限定、可无捕获面运行 |
@@ -43,7 +43,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 > 31 条 parity 断言对着**真实 PostgreSQL** 跑通，且 CI 里加了 `postgres` service
 > 让它每次推送都真跑——「skipped 的 PG 用例不证明兼容」，所以它不许被 skip 掉。
 
-## 设计取舍（先看这三条，其余都在方案文档里）
+## 设计取舍（先看这几条，其余都在方案文档里）
 
 1. **核心零依赖，可机检。** 默认第三方包只许出现在 `storage/`（纯 Go SQLite 驱动）；
    其余模块只准 stdlib 与本仓，由门禁 `memory-core-stdlib-only` 在**源码 import 面**
@@ -56,7 +56,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
    不破坏那条降级路径；每条登记带 `reason` + `until` + `removal`，缺一条加载即失败、
    到期即红。
 
-1. **行为一致性由共享断言保证，不由各自的单测保证。** `storage/parity` 里 31 条断言，
+2. **行为一致性由共享断言保证，不由各自的单测保证。** `storage/parity` 里 31 条断言，
    两个后端跑**同一份**，且**两个都必须真跑过**（PG 那个对着真实服务器）。
    各自单测都绿 ≠ 行为一致：软退役过滤漏一列、分页游标用
    `<=` 还是 `<`、时间窗闭开区间——这类不一致在各自单测里全都看不出来，
@@ -66,37 +66,39 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
    > （`TEXT` 列下 `'med' > 'low' > 'high'`，最重要的排最后）。
    > 两条都是 SQLite 侧永远绿的——**契约的可移植性要靠第二个实现来暴露**。
 
-2. **没注入模型就必须报错。** 提炼、页面重生成、情节摘要在无模型时返回 `ErrNoLLM`，
+3. **没注入模型就必须报错。** 提炼、页面重生成、情节摘要在无模型时返回 `ErrNoLLM`，
    **不许返回空串假装成功**——空串会被下游当成「模型说没什么」，
    从而静默丢弃整批候选。无模型时手工 store + 词法召回照常工作。
 
-3. **排序不是存储层的承诺。** 后端给出的是相关度顺序（bm25 之类），「哪条该进
+4. **排序不是存储层的承诺。** 后端给出的是相关度顺序（bm25 之类），「哪条该进
    prompt」是召回层重排的职责。把 bm25 名次钉进跨后端断言，等于把实现细节写成
    产品契约——换个后端就假红，召回质量却一点没变。
 
-4. **转义必须匹配实际在用的那条 band。** 实现期间曾把转义「借」给
+5. **转义必须匹配实际在用的那条 band。** 实现期间曾把转义「借」给
    `guardx/injectband.SanitizeBody`（通用安全原语、单源、不重复造），用例当场打穿：
    它的 `tagRe` 是写死的、只认 `<system-reminder>` 家族，拿它守 `<memory-context>` 时
-   伪造的闭合标签原样穿过。集成与依赖一并撤掉，转义归本仓——门禁这关守的是
-   **安全性质**，不是代码量。详见方案 §4.3。
+   伪造的闭合标签原样穿过。集成与依赖一并撤掉，转义归本仓 `ports.MemoryBand`
+   （转义全部 `<`）——门禁这关守的是**安全性质**，不是代码量。详见方案 §4.3。
+   > ⚠️ 但**脱敏**是另一回事：本仓借的是 `guardx/logredact` 的**规则表**（只认形态、
+   > 与 band 无关），不是转义。借规则表 ≠ 借转义规则，这条界线别混。
 
-5. **脱敏是必需依赖，不是可选项。** 记忆是留存资产，一旦落库就能被导出复制。
+6. **脱敏是必需依赖，不是可选项。** 记忆是留存资产，一旦落库就能被导出复制。
    `capture.New` 传 nil 直接失败——缺失的默认值不是宽容，是事故。兵底只认
    **形态**（已知凭据前缀、URL 内嵌凭据、key=value、长十六进制、私钥块），
    它是地板不是天花板，宿主必须叠自己的领域规则：凭据是唯一一类漏报即不可逆的。
 
-6. **判定面能换成结构就别拿文本匹配。** 两处刻意偏离上游：
-   召回结果**不**直接拼 prompt（过 `guardx/injectband` 身份防伪，记忆是跨会话
+7. **判定面能换成结构就别拿文本匹配。** 两处刻意偏离上游：
+   召回结果**不**直接拼 prompt（过 `ports.MemoryBand` 身份防伪，记忆是跨会话
    跨用户的不可信内容）；`Provenance` 做成**类型**而不是 payload 里的字符串键。
    这两条各配一个「不接会怎样」的用例钉住——否则后人会照着上游改回去。
 
-7. **上游修好了，自己那份兜底就得撤。** 脱敏的长度地板先后有两层本地兜底
+8. **上游修好了，自己那份兜底就得撤。** 脱敏的长度地板先后有两层本地兜底
    （声明式 `minLen` + 运行期预扫），而上游 `oekit/pkg` v0.17.0 已原生
    「短值整段全量打码」。本仓把两层**全部撤除**——留着它们不只是双源漂移，
    更危险的是让人误以为「这条是本仓保证的」，上游真回退时没人去查。
    撤除后该保证改由**依赖契约测试**钉住：把依赖降到修复前的版本，用例立刻变红。
 
-8. **口径要单源，且钉在一处。** 检索切词与 token 折算都走上游，但本仓在
+9. **口径要单源，且钉在一处。** 检索切词与 token 折算都走上游，但本仓在
    `store` 层各留一个钉子（`LexicalTokens` / `FTS5Query`）——上游改了切法，
    本仓在这一处吸收并复核，而不是各处各自跟着变。
    钉子的必要性在 v0.4.0 被验证过一次：查询侧一度直接调上游而绕过钉子，
@@ -105,12 +107,19 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 ## 开发
 
 ```bash
-make check        # fmt + vet + test + 架构门禁，提交前的完整闸
+make check        # fmt + vet + test + 架构门禁 + tidy，提交前的完整闸
 make test         # 只跑主模块测试
-make tidy-check   # 核对主模块仍然零依赖
+make tidy-check   # 核对主模块的 go.mod require 段
+make architecture-check   # 只跑门禁（规则 + 门禁自证用例）
+make release-check TAG=v0.5.1   # 按下游的真实路径验证已发布版本可被引进来
 ```
 
 需要 Go 1.27+。全程 `CGO_ENABLED=0`（SQLite 走纯 Go 驱动，不依赖 cgo）。
+
+> `make check` 里有**两段**门禁：主模块 + `tools/archcheck/`（独立模块，带一个 YAML
+> 解析依赖）。主模块绿不代表门禁绿——门禁失效是静默的，所以两段都要跑。
+> 架构门禁**自带单测**（`tools/archcheck/gate_test.go`）：它测的不是「好代码上通过」，
+> 而是「坏代码上必须红」。它绿了才说明门禁本身没坏。
 
 ### 命令行面
 
@@ -125,7 +134,7 @@ memory export --out <包路径>        # 导出成 .hmpkg
 memory import --pkg <包路径>        # 导入
 memory doctor --pkg <包路径>        # 检查包完整性
 
-memory gc [--before 720h]          # 按龄回收原始事件
+memory gc [--before 720h]          # 按龄回收原始事件（缺省保留 30 天）
 memory consolidate                 # 合并同签名事实
 memory retention                   # 退役证据全来自运行期错误的事实
 memory vacuum                      # 物理整理（后端专属）
@@ -135,11 +144,16 @@ memory entity alias --entity ID --alias A # 登记别名
 memory episode list                # 列出情节
 ```
 
+全局旗标（所有子命令通用）：`--db`（记忆库路径，缺省 `memory.sqlite`）、
+`--namespace`（记忆库名，缺省 `default`）、`--host`（宿主标识，缺省 `cli`）。
+
 CLI 多数命令是**管理口**（看与搬），不注入模型；`extract` 与 `promote` 例外——
 它们要模型，端点从环境变量读（`MEMORY_LLM_BASE_URL` / `MEMORY_LLM_API_KEY` /
 `MEMORY_LLM_MODEL` / `MEMORY_LLM_TIMEOUT`），**密钥不进命令行**。
 未配置模型时这两个命令显式报错，其余命令零影响。
-页面重生成与周期摘要仍由宿主触发。
+页面重生成与周期摘要**不**走 CLI——它们要模型，走 bridge
+（`memory.page.regen` / `memory.episode.extract` / `memory.episode.digest`），
+未装配模型时返回 `CodeUnavailable` 而不是空结果。
 
 ### 跑 PG 的行为断言
 
@@ -158,9 +172,13 @@ go test ./storage/postgres/ -count=1
 
 - **与 agent-harness 平级，不是父子。** 编排归 harness，记忆归本仓，两侧互不 import
   （门禁 `memory-no-harness-dependency` 强制）。要交换的东西走宿主。
+  → 接线现状与宿主要做什么，见 [`docs/HOST_WIRING_20261020.md`](docs/HOST_WIRING_20261020.md)。
 - **不认识领域。** 记忆认识「事实/实体/会话」，不认识「那台机器/那个集群/那次巡检」。
   宿主把运维对象投影成 `Entity` 交给本仓，门禁 `memory-no-domain-vocabulary` 强制。
 - **向量索引默认关。** 上游自己也标为「默认关闭、测试全 mock、真实集成未验证」。
+- **写入面与召回面都不借 harness。** budget / pii / guardx 三处形态都对不上，且借道会
+  同时撞破 `memory-no-harness-dependency` 与 `memory-core-stdlib-only` 两条红线。
+  共享的是纪律，不是代码。详见 AGENTS.md「已定案、勿重复评估」。
 
 ## License
 

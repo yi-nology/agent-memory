@@ -38,7 +38,7 @@
   当前登记：`oekit/pkg`、`oagentkit/textx`、`oagentkit/guardx/logredact`。
 - 需要解析 YAML 的门禁工具单独成模块（`tools/archcheck/`），好让这条纪律
   成立时不把依赖带进核心。
-- `CGO_ENABLED=0` 是硬要求：SQLite 只能走纯 Go 驱动（`modernc.org/sqlite`，
+- `CGO_ENABLED=0` 是硬要求：SQLite 只能走纯 Go 驱动（`modernc.org/sqlite v1.40.1`，
   编译进来带 FTS5，实测 SQLite 3.50.4）。
 
 ## 存储层的四条实弹教训（M1，2026-10-19 全部踩到）
@@ -60,7 +60,8 @@
 4. **god object 门禁对本仓也生效。** M1 首轮 SQLite 的 `Store` 平铺 9 个接口 =
    73 个方法，被 `threshold-god-object` 逮住。修法与扁鹊那边同款：
    **按表拆成内嵌窄结构**（`rawStore`/`atomStore`/…，各自内嵌 `*Store` 复用
-   exec/query 路由），最大的子结构降到 12 个方法。光把代码分文件不算降数。
+   exec/query 路由），最大的子结构降到 12 个方法（`entityStore`/`atomStore`）。
+   光把代码分文件不算降数——**真正的降数是改接收者与结构形状**。
 
 ## 排序不是存储层的承诺
 
@@ -109,8 +110,12 @@
 
 1. **脱敏必须早于持久化，且是必需依赖。** `capture.New` 传 nil 直接失败。
    处置点在注入面（recall）做已经没有意义——那一刻明文已在库里，且能被导出带走。
-   本仓实现期间发现的宿主缺陷：那条蒸馏路径至今没有接线（方案 §7.1），
-   **改本仓不会自动修好它**，宿主侧要单列一批。
+   **宿主侧的对应缺口已于 2026-10-19 清偿**（扁鹊仓提交 `ad3ada51`：
+   在宿主自己的「构造事实卡」动作上收口，先脱敏再算签名，用例
+   `TestMemoryRedactedBeforeStore` 钉住「从库里读出来也是脱敏后的」）。
+   ⚠️ 但**扁鹊仍未接本仓的 `capture` 流水线**——它的蒸馏产物走自己的老路。
+   两条别混：「落库那一刻没打码」已修，「接入内核捕获面」未做。
+   宿主侧现状见 [`docs/HOST_WIRING_20261020.md`](docs/HOST_WIRING_20261020.md) §4。
 
 2. **脱敏兵底只认形态，且收录标准是「漏报不可逆」。**
    `ports.PatternRedactor` 收：已知凭据前缀、URL 内嵌凭据、key=value 敏感赋值、
@@ -194,7 +199,8 @@
    - **词元切分**：汉字逐字成词元是中文子串检索能用的关键，两个后端必须同一套
      切法，否则「换个部署形态召回结果不变」这条承诺就破了。切法走上游
      `textutil.Tokens`，本仓在 `store.LexicalTokens` **钉住一处**（上游改切法时
-     在这一处吸收并复核，而不是四个调用点各自跟着变）。
+     在这一处吸收并复核，而不是六个调用点各自跟着变——现调用点：
+     `pipeline/promotion`、`storage/sqlite` 两处、`storage/postgres` 三处）。
      ⚠️ 下划线是**分隔符**，与 FTS5 的 unicode61 实际分词一致；本仓早先的一版
      当它是词内字符，两侧口径对不上（索引里 `api_key` 实际存成 `api`+`key`）。
      之所以一直没出事，是因为 FTS5 对加引号的查询串会**重新分词**——那是
@@ -220,12 +226,18 @@
   三边的形态都对不上（prompt 组装面 / 策略注册表+执行面 / 写死自己那条 band），
   且借道会同时撞破 `memory-no-harness-dependency` 与 `memory-core-stdlib-only`
   两条红线。共享的是纪律不是代码。
+  ⚠️ 注意「不借 guardx」指的是**转义**（`injectband.SanitizeBody`）；
+  **脱敏借的是 `guardx/logredact` 的规则表**——借规则表 ≠ 借转义规则，
+  这条界线在下面「召回面的四条纪律」第 2 条里。
 - **召回不借 harness/budget**（2026-10-19 M2 推翻方案 §三 的「借道」裁定）：
   两边的词表不同（System/Tools/Conversation vs atoms/quotes/headlines），
   且借道会同时撞破 `memory-no-harness-dependency` 与 `memory-core-stdlib-only`
   两条红线。共享的是纪律不是代码；计量改走 `ports.TokenEstimator` 注入。
 - **召回的存储依赖面是 `recall.Reader`（5 个方法）**，不是 `store.Store`：
   兑现 store/store.go 里「阶段只声明自己需要的子接口」那条纪律。
+  原始事件面**另立** `recall.RawReader`（可选，1 个方法）——只有采集原始事件的
+  宿主才有捕获面，让那种宿主实现 `ListRaw` 只能给一个「永远返回空集」的桩，
+  那是**契约洗白**。
 - **树（root/branch/leaf）暂不做**：对运维域价值有限（实体两态够用）。
   等真出现「同一事实挂多锚点」再启（方案 §5）。
 - **向量索引不接**：上游自己标为「默认关闭、测试全 mock、真实集成未验证」。
@@ -237,6 +249,15 @@
   三条机制。
 - **事实卡只软退役不硬删**：被推翻的事实曾经是真的，硬删会让「当初为什么这么判」
   无从查证。清理走 lifecycle 按龄执行。
+- **通用件的验收标准是「本仓自己在用」**（2026-10-20 定案，issue #9）：
+  `ports.Budget` 这件契约件（桶标识 + 配额 + 计数 + 丢弃原因）由本仓召回**先用起来**
+  （`allocate` 走它，`Result.Drops` / `Result.Buckets` 是它的投影）。
+  细节与理由见上面「召回面的四条纪律」第 6 条——**别在两处各写一份**，
+  改一处要同步另一处。
+- **与 agent-harness 的接缝在宿主，不在本仓**（2026-10-20 核对）：
+  两个内核互不 import，接起来的是宿主里的**单入口适配包**（扁鹊侧是
+  `internal/memstore`）。本仓改不了宿主接不接捕获面——现状与待办见
+  [`docs/HOST_WIRING_20261020.md`](docs/HOST_WIRING_20261020.md) §4、§7。
 - **迁移包（operations/portable）的**读面**已改走 `oekit/pkg/pack`，写面不换**
   （2026-10-20 定案，v0.17.0 后修订）：
   - **读面走 pack**（2026-10-20 实装）：体检的摘要/条数/多余文件/非法文件名
@@ -269,7 +290,7 @@ make check
 ## 发版
 
 ```bash
-make release-check TAG=v0.4.1      # 已发布版本能被下游按版本号引入
+make release-check TAG=v0.5.1      # 已发布版本能被下游按版本号引入
 ```
 
 `make release-check` 与 CI 的 release 段**同一套动作**，本地能跑。

@@ -3,26 +3,33 @@
 > 性质：**决策依据文档**。回答三个问题——octop-memory 是什么、扁鹊记忆平面差在哪、
 > agent-harness 哪些该下沉到新模块。文中所有 octop 事实均由 `git clone --depth 1`
 > 核对 `TencentCloud/octop-memory` @ `ed11d54`（v1.0.2）得出，未采信二手描述。
-> 关联：`docs/RAG_ASSESSMENT_20261008.md`（知识检索面，与本方案**不是同一件事**，
-> 见 §5.3）、`agent-harness/docs/SPLIT_PLAN.md`（拆分方法论，本方案沿用其判定标准）。
+> 关联：`bianque/docs/RAG_ASSESSMENT_20261008.md`（知识检索面，与本方案**不是同一件事**，
+> 见 §五）、`agent-harness/docs/SPLIT_PLAN.md`（拆分方法论，本方案沿用其判定标准）。
 
 ## TL;DR
 
 1. **不是从零抽**。扁鹊已有分层记忆平面（批次 80/81/115，`bq_memory_atom` +
    `bq_memory_subject_page`），其 IDL 注释明写「对标 Octop octop-memory 的事实卡」
    ——它是 octop 的一个**子集**，缺的是**宿主外的抽象边界**与 octop 后半程能力。
-2. **从 agent-harness「下沉」的东西接近于零**。逐包核完 23 个包后裁定：
-   **1 个借道**（budget 的计量面）、**2 个接线**（pii 落库前打码、injectband 召回防注入）、
+2. **从 agent-harness「下沉」的东西接近于零**。逐包核完 24 个包后裁定：
+   **0 个借道**（budget 原判「借道计量面」，M2 实弹推翻）、**0 个接线**
+   （pii 原判「接线」，M3 实弹推翻；injectband 原判「接线」，M2 实弹推翻并撤掉集成）、
    **1 个只抄机制不合并**（pending ↔ thread_state）、**其余 16 个包全留 harness**。
    真正要搬的是**扁鹊自己的记忆平面**。
+   ⚠️ 三处裁定都被实弹推翻了，理由见 §三 表内与 §4.3——**别按本文最初的裁定动手**。
 3. **本仓有两处强于 octop，必须写进设计**：octop 的 privacy 面只有
    `store_raw_content=false` 这类**开关式丢弃**、没有内容级打码；recall 出来的内容
    直接拼 prompt、**不过身份防伪**。记忆跨会话持久化 + 可导出成包 = 新增泄漏面与
    注入面，这两处我们不能跟着抄。
 4. **顺手发现一个现存缺陷**：记忆面没有接 pii（`memory_svc.go` 的 import 面可证），
    会话终稿蒸馏出的 `assertion`/`quote` 逐字落库。建议**单列一批先修**，不等新模块。
+   ✅ **宿主侧已于 2026-10-19 清偿**（扁鹊仓提交 `ad3ada51`：在「构造事实卡」这个
+   动作上收口，先脱敏再算签名，用例 `TestMemoryRedactedBeforeStore` 钉住）。
+   仍未做的是**接入本仓的 `capture` 流水线**——见 §7.1 与
+   [`HOST_WIRING_20261020.md`](HOST_WIRING_20261020.md) §4。
 5. **下一步 M0 建仓**（go.mod + 域词门禁 + types + store 接口），依赖面已核实可离线取到
-   `modernc.org/sqlite v1.23.1`（纯 Go，满足 `CGO_ENABLED=0`）。
+   `modernc.org/sqlite`（纯 Go，满足 `CGO_ENABLED=0`；现钉 `v1.40.1`）。
+   ✅ M0–M6 已落地（当前 `v0.5.1`），M7 见 §6.1–§6.3。
 
 ---
 
@@ -139,7 +146,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 | 虚拟路径投影（atom/page/raw ↔ `.md`） | ❌ | `application` | 补 |
 | 宿主手改文件对账（`MEMORY.md`/`USER.md`） | ❌ | `application` | 补 |
 | provenance 排除运行期错误 | ❌ | `types` + `capture` | 补 |
-| vector index | ⚠️ 有 Milvus RAG 面（**另一件事**） | `ports` | **刻意不做**，见 §5.3 |
+| vector index | ⚠️ 有 Milvus RAG 面（**另一件事**） | `ports` | **刻意不做**，见 §五 |
 
 ---
 
@@ -148,16 +155,23 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 ```
 agent-memory/
 ├── types/          AtomCard/Candidate/RawEvent/Entity/Alias/EntityPage/
-│                   Episode/MemoryNode/ActiveEntity/JournalEntry
-├── ports/          LLM / Embedder / VectorIndex —— 全是接口，零实现
-├── store/          Store 接口 + 事务语义（对标 MemoryBackend Protocol）
-├── storage/        sqlite（FTS5 + 表前缀 ns）/ postgres（ns-first 键 + FTS）
-├── pipeline/       capture → extractor → promotion → recall → page → episode
+│                   Episode/ActiveEntity/JournalEntry/DigestRecord/Provenance
+│                   （**不声明 MemoryNode**——树刻意不做，留着它等于让人以为
+│                    那是个待启用的能力）
+├── ports/          LLM / Embedder / VectorIndex / Redactor / Bander /
+│                   TokenEstimator / Budget —— 接口 + 纯 stdlib 默认实现
+├── store/          8 个消费面小接口 + Store 聚合 + RawWriter + 事务语义
+│                   （对标 MemoryBackend Protocol）+ lexical.go 口径钉子
+├── storage/        sqlite（FTS5 + 单套表 + namespace 列）/ postgres（ns-first 键 + FTS）
+├── pipeline/       capture → extractor → promotion → recall → page → episode → entity
 ├── lifecycle/      gc / consolidate / vacuum / retention
 ├── operations/     portable 包 + import/export
-├── application/    Runtime 装配 + config + 路径投影 + 宿主文件对账
-├── adapters/       bridge（JSON-RPC over stdio）/ cli
-└── policy/         architecture-policy.yaml
+├── application/    Service 装配（服务面只做 capture/extract/promote/recall/search）
+├── adapters/       bridge（JSON-RPC over stdio）/ cli / llm（OpenAI 兼容端点）
+├── cmd/memory/     CLI 入口
+├── integration/    跨包端到端测试
+├── tools/archcheck/ 门禁工具（**独立模块**，好让 YAML 依赖不进核心）
+└── architecture-policy.yaml   规则源（声明面 + 可执行面）
 ```
 
 **依赖方向（单向、无环）**：
@@ -169,10 +183,14 @@ adapters → application → pipeline → store(接口) ← storage(实现)
 lifecycle / operations 与 pipeline 平级
 ```
 
+> 方向的**权威来源是 `architecture-policy.yaml` 的 `modules` 段**（22 个模块登记），
+> 不是这张图。改依赖方向先改 policy（policy 先行），门禁按 policy 判。
+
 **零核心依赖纪律**（octop 的核心零依赖在 Go 侧的等价物）：
 核心不引 LLM SDK、不引 embedding SDK、不引 HTTP 框架、不引编排包。
 只用 stdlib + `database/sql` + `modernc.org/sqlite`（**纯 Go，满足本仓
-`CGO_ENABLED=0` 硬要求**；该版本 `v1.23.1` 已在本地模块缓存，离线可建仓）。
+`CGO_ENABLED=0` 硬要求**；现钉 `v1.40.1`，含 FTS5，实测 SQLite 3.50.4）。
+第三方进核心须在 policy 的 `allow_third_party` 段逐条登记（见 §8.4）。
 
 **门禁**（对标 harness 的 `harness-no-domain-vocabulary`）：
 
@@ -202,7 +220,7 @@ lifecycle / operations 与 pipeline 平级
 | `pii` | 827 | ~~**接线**~~ → **实装改为：不借道，记忆自带 `ports.Redactor` 端口 + 结构性兵底**（2026-10-19 M3 实弹） | octop 的 privacy 只有 `store_raw_content`/`store_tool_payloads` 两个开关式丢弃，**没有内容级打码**。记忆跨会话持久化 + 可导出成包 = 新增泄漏面。裁定：capture 管线挂脱敏处置面，**落库前打码**（不是注入前打码——落库后打码等于已泄漏）。这是本仓强于 octop 的一处。
 
 **实弹（M3）**：与 budget 同理不借道——harness 的 pii 是「策略注册表 + 执行面」的完整平面，而记忆要的是一个「落库前必过一过」的窄接口，两者是不同形态，且借道撞破同样的两条门禁红线。改为 `ports.Redactor`（**必需依赖**，`capture.New` 传 nil 直接失败）+ `ports.PatternRedactor`（只认形态的兵底）。兵底的收录标准三条同时成立：① 不认识领域词；② 误报代价只是少几个字符；③ **漏报代价不可逆**（凭据一旦落库，要靠轮换补救，而轮换往往来不及） |
-| `reminder` | 30 | **接线（改引 guardx，不经本门面）** | recall 内容跨会话/跨用户/跨宿主 = **不可信内容**，直拼 prompt = 提示注入。核心 `injectband` 已在 guardx/tier 0，agent-memory **直接引 guardx**；`harness/reminder` 这个门面是为保扁鹊调用点稳定而存在的，不是给外仓用的出口 |
+| `reminder` | 30 | ~~**接线（改引 guardx，不经本门面）**~~ → **实装改为：不借，转义归本仓 `ports.MemoryBand`**（2026-10-19 M2 实弹推翻，见 §4.3） | recall 内容跨会话/跨用户/跨宿主 = **不可信内容**，直拼 prompt = 提示注入。原判据是「核心 `injectband` 已在 guardx/tier 0，直接引 guardx」——**实装时被用例打穿**：它的 `tagRe` 写死、只认 `<system-reminder>` 家族，拿它守 `<memory-context>` 时伪造的闭合标签原样穿过。集成与依赖一并撤掉，转义归本仓（转义全部 `<`，一次挡住两类伪造） |
 | `pending` | 62 | **不合并，只抄机制** | octop 的 `thread_active_entities` 回答「『那个』指谁」= 召回期代词消解栈；pending 是「上一轮问了什么」= 跨轮挂起态载体。表面都是跨轮状态，**生命周期相反**（前者随召回滑动淘汰，后者等用户答复才结算）。同 AGENTS.md「意图两个 LLM 选路面不合并」的判据。但 thread_state 的 **LRU + pin-time + 重启存活**三条机制值得整体抄 |
 | `checkpoint` | 545 | **不下沉** | octop 把它与长期记忆同库，是因为它的宿主是 LangGraph。本仓 checkpoint 是跨进程 CAS + SeqGate，服务「续跑不重放」，记忆服务「记住事实」；且 AGENTS.md 已记本仓链是**含并行分支的 DAG**，`BuildPlan` 的线性连续前缀模型不成立。可共用同一个 SQLite 文件/连接池，但**表前缀独立、包不合并** |
 | `spill` | 251 | **不下沉（语义相反）** | spill 管输出溢出的截断落盘，记忆管值得留的。预算面互补（预算不够先 recall 补料、再 spill 截断），实现不共享 |
@@ -210,21 +228,25 @@ lifecycle / operations 与 pipeline 平级
 | 其余 16 个包 | ~8.6k | **不属记忆，全留 harness** | `protocol`/`eventbus`/`statemachine`/`commitgate`/`contract`/`dispatch`/`ptc`/`watchdog`/`delta`/`drain`/`netguard`/`policy`/`toolfail`/`tooldisclose`/`guardset`——编排与安全面。`delta`/`pending` 已被 harness 抽过一次；再抽进 memory 等于把编排机制拆到两个内核仓，破坏 harness 的单一定位 |
 
 **一句话结论**：从 harness「下沉」的东西接近于零——**真正要搬的是扁鹊自己的记忆平面**
-（`repo_memory.go` + `memory_svc.go` 的机制面），harness 侧只有 1 个借道 + 2 个接线。
+（`repo_memory.go` + `memory_svc.go` 的机制面）。
+⚠️ harness 侧最终是 **0 个借道 + 0 个接线**（三处原裁定都被实弹推翻，见上表）。
+「共享的是纪律，不是代码」这条是本节最贵的结论。
 
 ---
 
-## 四、我们比 octop 强 / 必须补的三处
+## 四、我们比 octop 强 / 必须补的两处
 
-> 三处偏离全部有「不接会怎样」的用例钉住。其中两处（转义借 guardx、脱敏兵底的形态
-> 覆盖）在实现期间各被用例打穿过一次，过程与结论记在 §4.3 与 ports/redact.go。
+> 这两处偏离全部有「不接会怎样」的用例钉住。其中一处（转义借 guardx）实现期间
+> 被用例当场打穿，过程与结论记在 §4.3 与 ports/redact.go。
+> ⚠️ 标题曾写成「三处」——第三处（召回的存储依赖面收窄成 `recall.Reader`）
+> 是**本仓自己的工程纪律**，不是对 octop 的偏离，故不计入本表。
 
 | 处 | octop 现状 | 本仓要求 |
 |---|---|---|
-| **落库前脱敏** | privacy 只有开关式丢弃，无内容级打码 | capture 管线挂 pii；**打码在落库前**，否则导出即泄漏 |
-| **召回注入防伪** | recall 输出直接拼 prompt，无身份防伪 | recall 结果统一过 `guardx/injectband`；记忆内容标记为数据区，不得被当指令 |
+| **落库前脱敏** | privacy 只有开关式丢弃，无内容级打码 | capture 管线挂脱敏处置面；**打码在落库前**，否则导出即泄漏 |
+| **召回注入防伪** | recall 输出直接拼 prompt，无身份防伪 | recall 结果统一过 `ports.MemoryBand` 数据区；记忆内容标记为数据区，不得被当指令 |
 
-这三处不是「对齐 octop」，是**明确偏离 octop**。写进 `types`/`ports`/`recall` 的包注释，
+这两处不是「对齐 octop」，是**明确偏离 octop**。写进 `types`/`ports`/`recall` 的包注释，
 并各配一个把「不接会怎样」的用例钉住——否则后人会看着 octop 把它们改回去。
 
 ### 4.3 转义必须匹配**实际在用的那条 band**（M2 实弹，代价是一个被拆掉的集成）
@@ -258,9 +280,13 @@ band；拿它守 `<memory-context>` 时，一句 `</memory-context>` 原样穿�
 ### 4.4 召回的依赖面收窄成 `recall.Reader`（M2 兑现自己的纪律）
 
 `store/store.go` 的包注释写着「阶段只声明自己需要的子接口」，但 M1 的后端全量实现了
-`store.Store`。M2 兑现这条：召回只用得到 5 个存储方法，于是声明 `recall.Reader`。
-量化收益：召回的单元测试写 5 个方法而不是 40 个，且「召回依赖了存储的哪些面」
-在类型上直接可见。
+`store.Store`。M2 兑现这条：召回只用得到 5 个存储方法，于是声明 `recall.Reader`
+（`ListAtoms` / `SearchAtoms` / `GetEntityPage` / `UpsertActiveEntity` /
+`EvictActiveEntities`）。量化收益：召回的单元测试写 5 个方法而不是 40 个，
+且「召回依赖了存储的哪些面」在类型上直接可见。
+
+原始事件面**另立** `recall.RawReader`（可选，1 个方法），理由见 §7.2.1
+第二条「无捕获面形态」——那是**契约洗白**问题，不是接口数量问题。
 
 ### 4.5 夹具是为实现量身写的：实现错了夹具也会绿（深度评审的元教训，issue #7）
 
@@ -451,7 +477,7 @@ M7-b1/b3 落地后对适配层做了一轮逐行自查，查出四条**契约面
 
 ## 七、风险与未决
 
-### 7.1 现存缺陷（**宿主侧，仍未修**）
+### 7.1 现存缺陷（宿主侧：**已清偿，但捕获面仍未接**）
 
 > ✅ **宿主侧已于 2026-10-19 清偿**（宿主仓提交 `ad3ada51`）。
 >
@@ -566,6 +592,8 @@ octop 的 PG 实现 2,416 行 + 真实 `TEST_POSTGRES_DSN` 门禁。扁鹊记忆
 - 本仓 10317 行非测试代码里，真正属于「通用轮子」的是约 800~1000 行
   （TTL 缓存、手写排序、两份保序去重、手写日期边界、围栏剥离、掩码生成、
   CLI 分发样板、JSON-RPC 帧、zip 容器 + 清单 + 体检）。
+  （体量数字记于 2026-10-19；此后本仓继续长，**现约 13k 行非测试代码**——
+  判据是「通用轮子占比有限」，不是具体行数。）
 
 故本轮的实际产出是：**采纳 6 处严格等价的替换 + 1 处真实能力补齐**，
 **并把矩阵的缺口提为 8 条上游 issue**。业务语义一行未动——那部分本来就不该
@@ -588,6 +616,12 @@ octop 的 PG 实现 2,416 行 + 真实 `TEST_POSTGRES_DSN` 门禁。扁鹊记忆
 | `oagentkit/guardx` | v0.5.0 | `oekit/logx`、`mvdan.cc/sh/v3` | logredact/fence/egress/permgate 纯 stdlib | ⚠️ 单包可入 |
 | `oagentkit/{llm,rag,obs,toolgate,skillkit}` | — | eino、milvus、hertz、yaml… | — | ❌ |
 | `oagentkit/queue` | v0.6.0 | lib/pq | worker 后端无关、pglease 绑定 PG | ⚠️ |
+
+> **本表是 2026-10-19 那一刻的依赖地板快照**——判据（模块级 require 与 import 面
+> 的差别）仍然有效，**版本号已经过时**。本仓当前实际钉的是
+> `oekit/pkg v0.17.0` / `oagentkit/textx v0.6.1` / `oagentkit/guardx v0.8.2`
+> （见 `go.mod`），三个都在 policy 的 `allow_third_party` 段登记着。
+> 重新评估某个模块能否进核心时，**看当下的 `go.mod`，别照抄本表的版本号**。
 
 两条由此得出的纪律：
 
@@ -688,6 +722,6 @@ oagentkit/textx v0.6.0–v0.6.1、oagentkit/guardx v0.6.0–v0.8.2）。
 | octop 全部能力面/分层/数据流/门禁 | 本地 `git clone --depth 1` @ `ed11d54`，逐文件读 `README.md` / `AGENTS.md` / `types.py` / `pipeline/**` / `storage/backends/**` / `application/runtime.py` |
 | octop 33,479 行 / 280 文件 / 86 测试 | `find src -name '*.py' \| xargs wc -l`、`git ls-files \| wc -l`、`ls tests \| wc -l` |
 | 扁鹊记忆平面体量与常量 | `wc -l`、`memory_svc.go:29-45`、`idl/memory.thrift` |
-| 记忆面无 pii 接线 | `memory_svc.go` import 面（未引 pii） |
+| 记忆面无 pii 接线（**当时**） | `memory_svc.go` import 面（未引 pii）——⚠️ 已于 2026-10-19 由扁鹊仓 `ad3ada51` 清偿 |
 | harness 24 包行数 | `ls $d/*.go \| grep -v _test \| wc -l`（排除测试与 `.toolgate-work/`） |
-| `modernc.org/sqlite v1.23.1` 可离线取到 | `bianque/go.mod:242` + 本地模块缓存 |
+| `modernc.org/sqlite` 可离线取到 | `bianque/go.mod:242` + 本地模块缓存（当时 `v1.23.1`，现钉 `v1.40.1`） |

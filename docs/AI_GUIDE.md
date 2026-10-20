@@ -7,13 +7,15 @@
 3. 哪些改动会**当场被门禁打红**？
 
 纪律原文在 [`../AGENTS.md`](../AGENTS.md)（那是「代理容易踩、且踩了会留下长期债的硬纪律」），
-设计裁定在 [`AGENT_MEMORY_PLAN_20261019.md`](AGENT_MEMORY_PLAN_20261019.md)（50KB，人读版，不建议 AI 通读）。
+设计裁定在 [`AGENT_MEMORY_PLAN_20261019.md`](AGENT_MEMORY_PLAN_20261019.md)（50KB，人读版，不建议 AI 通读），
+接线现状在 [`HOST_WIRING_20261020.md`](HOST_WIRING_20261020.md)（本仓与 agent-harness 怎么配合用）。
 本文件是**改造地图**：先读它，再按指针去读具体文件。
 
-> **三条读法，按你的任务挑一条**，别通读：
+> **四条读法，按你的任务挑一条**，别通读：
 > - 要**加东西**（新端口、新后端、新流水线阶段）→ 读 §2 + §3
 > - 要**改行为**（召回策略、判定阈值、脱敏规则）→ 读 §2 + §4
 > - 要**修 bug / 排查** → 读 §5 的「症状 → 病因」索引
+> - 要**接宿主 / 搞清与 agent-harness 的关系** → 读 [`HOST_WIRING_20261020.md`](HOST_WIRING_20261020.md)
 
 ---
 
@@ -41,7 +43,7 @@ types   （零依赖，领域结构单源）
   ↑
 ports   （零依赖，外部能力接口 + 纯 stdlib 默认实现）
   ↑
-store   （持久化契约，按消费面拆成 8 个小接口）
+store   （持久化契约，按消费面拆成 8 个小接口 + Store 聚合 + RawWriter 写入面）
   ↑
 pipeline/*  ← lifecycle / operations
   ↑
@@ -64,6 +66,10 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 单类型方法数 ≤ 60、单文件 ≤ 800 行 | `threshold-god-object` | 非零退出 |
 | 免检依赖必须登记 `reason`+`until`+`removal` | `memory-allowlist-expired` | 到期即红 |
 
+> 红线里**只有前四条**是 policy 的 `rules:` 段写的；`threshold-god-object` 来自
+> `thresholds:` 段，`memory-allowlist-expired` 是门禁**工具侧**自己算的
+> （读 `allow_third_party` 条目的 `until`）。改门禁时别去 policy 里找它们。
+
 ⚠️ **领域词门禁会扫注释与测试数据**，且是纯文本匹配——
 **连「解释禁词的那行注释」都会拦**。写这类说明只能说「本仓没有的某类基础设施对象」，
 不能逐字复述词表。已从禁词表撤出的词：`namespace`（记忆隔离维度）、`node`、`host`。
@@ -80,7 +86,8 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 模型调用/向量化/向量索引/脱敏/防伪 | `ports/` | 注入它的 `application.Deps` | 新增第三方须登记 `allow_third_party` |
 | 分桶配额与丢弃计数 | `ports/budget.go` | `pipeline/recall/recall.go` | `BucketID` 是**字符串**，别改成枚举 |
 | 存储接口 | `store/store.go` | **两个后端 + `storage/parity/` 都要动** | 加接口方法 = parity 加断言，两个后端都真跑 |
-| 召回策略 | `pipeline/recall/{recall,gather,rank}.go` | `recall.Config` | 八段串行，改一段要重跑全链测试 |
+| 检索口径钉子 | `store/lexical.go` | 两个后端的索引/查询侧 | `LexicalTokens` / `FTS5Query` 是**单源**，别绕过 |
+| 召回策略 | `pipeline/recall/{recall,gather,rank,cache}.go` | `recall.Config` | 八段串行，改一段要重跑全链测试 |
 | 捕获与脱敏接线 | `pipeline/capture/capture.go` | `ports/redact.go` | 顺序不可换：**先判收不收 → 再打码 → 最后落库** |
 | 判定规则 | `pipeline/promotion/promotion.go` | `types/` 枚举 | 送人工是默认姿态，矛盾**不许**自动裁决 |
 | 提炼（要模型） | `pipeline/extractor/extractor.go` | `types.Candidate` | 抽取与判定**必须分层** |
@@ -88,7 +95,7 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 生命周期 | `lifecycle/lifecycle.go` | — | 事实卡只软退役，不硬删 |
 | 迁移包格式 | `operations/portable/portable.go` | `oekit/pkg/pack` | 写面不换 pack：改了等于**改包格式**，已发布包导不回来 |
 | CLI 命令 | `adapters/cli/{cli,admin}.go` | — | `Run(args,stdout,stderr) int`，不是 `main()` |
-| 对外 RPC | `adapters/bridge/bridge.go` | `application.Service` | 方法名是 `memory.xxx` 白名单 |
+| 对外 RPC | `adapters/bridge/bridge.go` | `application.Service` | 方法名是 `memory.xxx` 白名单（现 8 个） |
 | 宿主接入 | `application/service.go` | `adapters/*` | 服务面**只做五件事**：capture/extract/promote/recall/search |
 | 依赖方向/豁免 | `architecture-policy.yaml` | `tools/archcheck/` | **policy 先行**；豁免缺字段**加载期即失败** |
 
@@ -103,12 +110,18 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 
 ```
 1. architecture-policy.yaml 加模块（id / roots / requires），requires 里带上 storage-parity
-2. storage/<新后端>/  实现 store.Store 的 8 个小接口 + Transaction + Close
+2. storage/<新后端>/  实现 store.Store 的 8 个子接口 + Transaction + Close
+   （RawStore/CandidateStore/AtomStore/EntityStore/PageStore/EpisodeStore/JournalStore/MetaStore；
+    另实现 store.RawWriter——那是捕获阶段只需要的那一小片写入面）
 3. storage/<新后端>/schema.go  建表；方言 SQL 只许出现在这个目录
 4. storage/parity/parity.go  加断言（**在共享断言里加，不是新后端自己写**）
 5. storage/<新后端>/parity_test.go  挂 parity.Run(t, openXxx)
 6. make architecture-check  →  跑 gate_test.go 确认门禁本身没坏
 ```
+
+> **命名空间隔离：单套表 + namespace 列**，不是「每 namespace 一套表」。
+> 理由写在 `storage/sqlite/schema.go` 顶部：实例已绑定一个记忆库，表前缀那条路
+> 会让「跨 namespace 的体检与迁移」变成 N 遍 DDL。PG 侧同理是 namespace-first 键。
 
 > **parity 断言是产品契约，不是实现细节。** 断言里**不许**断言 bm25 名次——
 > 「哪条该进 prompt」是召回层重排的职责。把名次钉进跨后端断言，换个后端就假红。
@@ -200,9 +213,10 @@ make check                         # ③ 完整闸：fmt + vet + test + 架构�
 ### 4.3 门禁自证
 
 `tools/archcheck/gate_test.go` 测的不是「好代码上通过」，而是**坏代码上必须红**：
-域词（代码/注释/测试数据三处）、编排依赖、模块方向写反、pipeline 层出现 SQL，
-每条各一个用例。**它绿了才说明门禁本身没坏**——门禁最大的失败模式是假通过，
-它一声不吭退出 0。
+域词（代码/注释/测试数据三处）、编排依赖、模块方向写反、pipeline 层出现 SQL、
+核心引第三方包、白名单前缀混淆（`oekit/pkg` 不放行 `oekit/pkg-evil`）、
+白名单到期、god object、policy 缺字段——**每条各一个用例，共 18 例**。
+**它绿了才说明门禁本身没坏**——门禁最大的失败模式是假通过，它一声不吭退出 0。
 
 改了门禁规则或 policy 之后：
 
@@ -215,16 +229,24 @@ make architecture-check   # 跑规则 + 跑 gate_test.go
 ```bash
 make check
 git add -- <具体路径>       # 不 add . —— 并发会话会把自己的文件带进来
-git diff --cached --name-status   # 核暂存区集合
+git diff --cached --name-status | wc -l   # 核暂存区集合（**数行数**，别只看前几行）
 git commit
 git show --stat --name-status HEAD  # 提交后复核文件集合
 ```
 
-> **并发会话的两种越界**：「塞进来」（对方 add 了它的文件，你的提交会带上它）与
-> 「抽走」（对方 reset 了你的暂存）。根治办法是**路径限定提交**：
-> `git commit -- <路径>` 按工作树内容提交指定路径，不依赖索引。
-> 注意坑：只列新路径时**删除侧会丢**，要同时列旧路径
+> **并发会话的三种越界**：
+> ①「塞进来」——对方 `git add` 了它的文件，你的提交会带上它；
+> ②「抽走」——对方 `reset` 了你的暂存；
+> ③「抢先提交」——对方先 `git commit`，把**整个暂存区**连同你的内容一起卷走，
+> 你的提交变成「no changes added to commit」（内容没丢，但提交归属错乱）。
+>
+> 根治办法是**路径限定提交**：`git commit -- <路径>` 按工作树内容提交指定路径，
+> 不依赖索引。注意坑：只列新路径时**删除侧会丢**，要同时列旧路径
 > （`git commit -- old.go pkg/`）。
+>
+> ③ 的判法：提交返回「no changes added」**不等于失败**——先 `git show HEAD:<你的文件>`
+> 核内容是否已落，再决定要不要重做。剔除他人内容用 `git reset --soft HEAD~1`
+> + `git restore --staged <他人路径>`，**不动工作树**（他的在途内容原样保留）。
 
 ---
 
@@ -247,7 +269,11 @@ git show --stat --name-status HEAD  # 提交后复核文件集合
 | 召回结果偏少但看不出原因 | 丢弃没分路 | `Result.Drops` / `ports.Budget` |
 | 画像桶恒为 0 | 画像参与了多样性裁剪被挤掉 | `TestBucketsAreIndependent` |
 | 改了依赖方向门禁就红 | 没先改 policy（policy 先行） | `architecture-policy.yaml` |
-| 升级后配置写错直接起不来 | 破坏性变更**有意为之**（CHANGELOG 已写明） | 配置严格模式 |
+| 中文子串检索 0 命中却「没报错」 | 切词口径漂了：FTS5 把连续汉字当**一个**词元 | `store/lexical.go` `LexicalTokens` |
+| 预算看着够、实际超了 | 取整方向错：合总档把每段零头吞掉（**低估是静默的那一侧**） | `TestStaticEstimatorRoundingIsPerSegment` |
+| 依赖升级后短凭据完整暴露 | 上游掩码的 Keep 档回退（本仓兜底已按纪律撤除） | `TestUpstreamMaskerShortHitIsFullyMasked` |
+| 改依赖方向/白名单门禁就红 | policy 豁免缺 `reason`/`until`/`removal` 之一 | `tools/archcheck/policy.go` 加载期校验 |
+| 提交里混进了别人的文件 / 提交内容被抽走 | 并发会话共用仓库：暂存区被别人动过 | AGENTS.md「发版」段与本文件 §4.4 |
 
 ---
 
@@ -286,6 +312,8 @@ cat architecture-policy.yaml
 | `pending` 不与活跃实体栈合并 | 表面都是跨轮状态，生命周期相反 |
 | 迁移包写面不换 `pack` | 本仓清单多了两个溯源字段，换过去等于改包格式 |
 | PG parity 需要真服务器 | 没配 DSN 时它**显式 skip**，跳过不证明兼容 |
+| 门禁的 `severity` 字段未生效 | policy 里声明了 `severity`，但门禁**只按 error 处理**，warn 与 error 行为相同 |
+| 门禁 `exceptions` 的 `until` 只解析不比较 | 例外到期**不自动失效**；真要限时，得走 `allow_third_party` 那条路（那条会到期即红） |
 
 ---
 
