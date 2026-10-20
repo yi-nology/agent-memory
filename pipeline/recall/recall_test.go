@@ -2,6 +2,7 @@ package recall_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -281,6 +282,61 @@ func TestRetiredFactsNeverRecalled(t *testing.T) {
 
 // ── 预算 ──
 
+// 通用面：丢弃要**按原因可归因**，桶要有计数。
+//
+// 这是 issue #9 的验收点：宿主自造召回时也要这套契约，而本仓的召回
+// 必须先自己用起来——否则那是一件「已实现但没接线」的抽象。
+//
+// 判据挑的是**能区分两种情形**的输入：本用例里事实桶被打满，
+// 而总量还远没到。于是丢弃的原因是「桶不足」（DropQuota），
+// 不是「总量不足」（DropBudget）——两者处置完全不同
+// （该调分桶占比 vs 该调总预算），合成一个数就看不出是哪一种。
+func TestDropsAreAttributableByReason(t *testing.T) {
+	f := &fakeReader{}
+	for i := 0; i < 40; i++ {
+		// **每个事实挂不同实体**：同实体的话会被多样性闸（PerEntityMax）
+		// 先砍掉大半，根本走不到配额判定——那样测到的就不是「桶不足」。
+		f.atoms = append(f.atoms, atom(
+			"a"+string(rune('a'+i%26))+string(rune('a'+i/26)), "e"+strconv.Itoa(i),
+			"第 "+string(rune('A'+i/26))+"-"+string(rune('a'+i%26))+" 条很长的事实正文用来把预算吃满", types.ImportanceHigh))
+	}
+	f.pages = map[string]*types.EntityPage{
+		"e0": {EntityID: "e0", Headline: "这个实体的画像", UpdatedAt: base()},
+	}
+
+	cfg := recall.DefaultConfig()
+	cfg.TotalBudget = 600
+	cfg.Sources = []recall.Source{recall.SourceAtom, recall.SourcePageHeadline}
+	p := newPipe(t, f, cfg)
+	res, err := p.Recall(context.Background(), recall.Request{
+		Namespace: ns, Query: "事实", Entities: []string{"e0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res.Drops[ports.DropQuota] == 0 {
+		t.Fatalf("事实桶被打满，丢弃原因应是桶不足，实得 %v", res.Drops)
+	}
+	if res.Drops[ports.DropBudget] != 0 {
+		t.Fatalf("总量没到，丢弃原因不该是总量不足，实得 %v", res.Drops)
+	}
+	// 旧字段与新表必须一致（宿主读旧字段不破）。
+	if res.DroppedByBudget != res.Drops[ports.DropBudget]+res.Drops[ports.DropQuota] {
+		t.Fatalf("旧字段与通用表对不上: %d vs %v", res.DroppedByBudget, res.Drops)
+	}
+	if res.Dropped != res.DroppedByBudget+res.DroppedByDiversity+res.DroppedByDuplicate {
+		t.Fatalf("丢弃总数与分路之和对不上: %d", res.Dropped)
+	}
+	// 桶计数：画像桶必须在场（它被挤空是个值得发现的症状）。
+	if res.Buckets["headline"] == 0 {
+		t.Fatalf("画像桶应在场，实得 %v", res.Buckets)
+	}
+	if res.Buckets["atom"] == 0 {
+		t.Fatalf("事实桶应有内容，实得 %v", res.Buckets)
+	}
+}
+
 // 分桶配额：事实桶满了不许吃画像桶的额度。
 func TestBucketsAreIndependent(t *testing.T) {
 	// 40 条**内容各不相同**的事实：内容相同的会被去重闸直接塌成 1 条，
@@ -485,6 +541,53 @@ func TestCacheReturnsCopy(t *testing.T) {
 	second, _ := p.Recall(context.Background(), req)
 	if second.Snippets[0].Body == "被调用方改坏了" {
 		t.Fatal("缓存交出的是同一份对象：调用方一改，缓存即被污染")
+	}
+}
+
+// 缓存命中必须**带着那两张通用表**回来，且是**副本**。
+//
+// 这条是被一个真实的漏抄抓出来的：Result 新增 Drops / Buckets 后，
+// cloneResult 忘了抄它们——于是「第一次有、第二次没了」。
+// 而缓存命中只在「第二次问同一个问题」时才显现，正是最难复现的那种形态。
+func TestCacheHitCarriesDropTables(t *testing.T) {
+	f := &fakeReader{}
+	for i := 0; i < 40; i++ {
+		f.atoms = append(f.atoms, atom(
+			"a"+string(rune('a'+i%26))+string(rune('a'+i/26)), "e"+strconv.Itoa(i),
+			"第 "+string(rune('A'+i/26))+"-"+string(rune('a'+i%26))+" 条很长的事实正文用来把预算吃满", types.ImportanceHigh))
+	}
+	cfg := recall.DefaultConfig()
+	cfg.TotalBudget = 600
+	cfg.CacheTTL = time.Minute
+	cfg.Sources = []recall.Source{recall.SourceAtom}
+	p := newPipe(t, f, cfg)
+	req := recall.Request{Namespace: ns, Query: "事实"}
+
+	first, err := p.Recall(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Drops[ports.DropQuota] == 0 {
+		t.Fatalf("前置条件：本用例要有桶不足的丢弃，实得 %v", first.Drops)
+	}
+	second, err := p.Recall(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.FromCache {
+		t.Fatal("前置条件：第二次应命中缓存")
+	}
+	if second.Drops[ports.DropQuota] == 0 {
+		t.Fatalf("缓存命中必须带着通用表回来，实得 %v", second.Drops)
+	}
+	if len(second.Buckets) == 0 {
+		t.Fatalf("缓存命中必须带着桶计数回来，实得 %v", second.Buckets)
+	}
+	// 副本：调用方改了不该污染缓存。
+	second.Drops[ports.DropQuota] = 999
+	third, _ := p.Recall(context.Background(), req)
+	if third.Drops[ports.DropQuota] == 999 {
+		t.Fatal("通用表必须是副本：调用方改了不该污染缓存")
 	}
 }
 

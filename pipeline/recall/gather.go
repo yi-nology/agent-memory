@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
 )
@@ -307,32 +308,32 @@ func (p *Pipeline) pushEntities(ctx context.Context, req Request, cands []*candi
 // 配额按桶各算：事实桶满了**不占用**画像桶的额度。这样画像这一档是**保留**的，
 // 而不是「事实够多就永远挤掉画像」——后者会让页面重生成这个功能形同虚设。
 //
+// # 配额与丢弃计数走 ports.Budget 那件
+//
+// 这不是「为了抽象而抽象」：桶配额与丢弃原因计数这套契约与「怎么取数、
+// 怎么排序」无关，宿主自造召回时也要它（见 ports/budget.go）。
+// 本仓复用同一件，于是两边的行为口径不会分叉。
+//
 // # 已知边界：桶容量小于该桶最小单元时，该桶恒为空
 //
 // 分桶是**上限**，不是保底。默认口径下画像一句话通常远小于 10% × 1500 = 150
 // token，故不成问题；但若宿主把 TotalBudget 压到很小、或画像写得极长，
 // 画像会**静默地一次都不出现**。症状是「页面重生成白做了」而不是报错。
 // 宿主调小预算时要用 Result.Dropped 盯一眼，别只看它非零。
-func (p *Pipeline) allocate(cands []*candidate) ([]Snippet, int) {
-	caps := map[bucket]int{
-		bucketAtom:     int(float64(p.cfg.TotalBudget) * p.cfg.BucketAtom),
-		bucketQuote:    int(float64(p.cfg.TotalBudget) * p.cfg.BucketQuote),
-		bucketHeadline: int(float64(p.cfg.TotalBudget) * p.cfg.BucketHeadline),
-	}
-	used := map[bucket]int{}
-	var (
-		kept  []Snippet
-		total int
-	)
+func (p *Pipeline) allocate(cands []*candidate) ([]Snippet, *ports.Budget) {
+	b := ports.NewBudget(p.cfg.TotalBudget, map[ports.BucketID]float64{
+		bucketAtom:     p.cfg.BucketAtom,
+		bucketQuote:    p.cfg.BucketQuote,
+		bucketHeadline: p.cfg.BucketHeadline,
+	})
+	var kept []Snippet
 	for _, c := range cands {
-		if c.Tokens > caps[c.bucket]-used[c.bucket] || total+c.Tokens > p.cfg.TotalBudget {
+		if !b.Admit(c.bucket, c.Tokens) {
 			continue // 不 break：后面可能有小片段塞得进去
 		}
-		used[c.bucket] += c.Tokens
-		total += c.Tokens
 		kept = append(kept, c.Snippet)
 	}
-	return kept, len(cands) - len(kept)
+	return kept, b
 }
 
 func minInt(a, b int) int {

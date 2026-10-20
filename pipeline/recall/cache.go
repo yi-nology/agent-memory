@@ -3,6 +3,8 @@ package recall
 import (
 	"sync"
 	"time"
+
+	"github.com/yi-nology/agent-memory/ports"
 )
 
 // cache 召回结果 TTL 缓存。
@@ -101,6 +103,11 @@ func (p *Pipeline) Purge() int { return p.cache.purge() }
 //
 // 必须复制：缓存里那份若被调用方改了（比如追加了来源标记），下次命中就是脏数据，
 // 而这种 bug 只在「第二次问同一个问题」时才显现——极难复现。
+//
+// ⚠️ **新增字段必须一并复制**：漏掉一个 map，缓存命中就会返回 nil
+// （「第一次有、第二次没了」——正好是这条注释说的那种难复现的形态）。
+// 故这里用「逐字段手抄」是刻意的：加字段时编译器会指出来，
+// 而「遍历反射复制」不会——它把漏抄变成静默。
 func cloneResult(r *Result) *Result {
 	if r == nil {
 		return nil
@@ -111,8 +118,32 @@ func cloneResult(r *Result) *Result {
 		DroppedByBudget:    r.DroppedByBudget,
 		DroppedByDiversity: r.DroppedByDiversity,
 		DroppedByDuplicate: r.DroppedByDuplicate,
+		Drops:              copyDropReasons(r.Drops),
+		Buckets:            copyBuckets(r.Buckets),
 		FromCache:          r.FromCache,
 		Entities:           append([]string(nil), r.Entities...),
 	}
 	return cp
+}
+
+func copyDropReasons(m map[ports.DropReason]int) map[ports.DropReason]int {
+	if m == nil {
+		return nil
+	}
+	out := make(map[ports.DropReason]int, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func copyBuckets(m map[ports.BucketID]int) map[ports.BucketID]int {
+	if m == nil {
+		return nil
+	}
+	out := make(map[ports.BucketID]int, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }

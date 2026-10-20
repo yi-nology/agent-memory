@@ -88,6 +88,20 @@ type Result struct {
 	// 三路分开给是因为处置不同：重复说明提炼层在制造同一件事（改 extractor），
 	// 多样性说明实体偏斜（改 PerEntityMax 或改分桶），预算说明装不下（改总量）。
 	DroppedByDuplicate int
+	// Drops 按原因分路的丢弃计数（**通用面**）。
+	//
+	// 上面的三条具名字段是这张表在本仓召回里的**投影**（宿主读旧字段不破），
+	// 这张表才是可复用的那一面：宿主自造召回时用 ports.Budget 拿到同样形状的
+	// 计数，于是「为什么少了」在两边都能归因——
+	// 而分桶不足（DropQuota）与总量不足（DropBudget）必须分开：
+	// 前者该调分桶占比，后者该调总量，合成一个数就看不出是哪一种。
+	Drops map[ports.DropReason]int
+	// Buckets 各配额桶收到的条数（**通用面**）。
+	//
+	// 宿主能据此看到「这一轮事实桶收了几条、画像桶收了几条」，
+	// 而不必自己按 Role/Source 猜——画像桶恒为 0 是个值得发现的症状
+	//（画像被挤空会让页面重生成这个功能形同虚设）。
+	Buckets map[ports.BucketID]int
 	// FromCache 是否命中缓存。
 	FromCache bool
 	// Entities 本次推入活跃实体栈的实体（按栈顶在前）。
@@ -356,7 +370,7 @@ type candidate struct {
 	Snippet
 	score float64
 	// bucket 该片段占哪个配额桶。
-	bucket bucket
+	bucket ports.BucketID
 	// dedupKey 去重键。
 	dedupKey string
 	// plain 去包裹的原文。词面匹配用它——用带标签的 Body 会让「记忆/画像」
@@ -367,13 +381,16 @@ type candidate struct {
 	rawRuntimeError bool
 }
 
-// bucket 配额桶。
-type bucket int
-
+// 配额桶。
+//
+// 身份用 ports.BucketID（字符串）而不是本仓私有的枚举：
+// 桶的**契约**（标识 + 配额 + 计数）在 ports.Budget 那件里，
+// 宿主自造召回时用同一套；本仓的三个桶只是「本仓的三种来源分类」，
+// 不该是内核替所有宿主定下的枚举。
 const (
-	bucketAtom bucket = iota
-	bucketQuote
-	bucketHeadline
+	bucketAtom     = ports.BucketID("atom")
+	bucketQuote    = ports.BucketID("quote")
+	bucketHeadline = ports.BucketID("headline")
 )
 
 // Recalle 单次召回。
@@ -405,14 +422,23 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 
 	ents := p.pushEntities(ctx, req, cands)
 
-	kept, droppedByBudget := p.allocate(cands)
+	kept, budget := p.allocate(cands)
+	// 重复与多样性两条丢弃是召回器自己的判定（不是配额判定的结果），
+	// 按原因上报进同一张表——「为什么少了」要在**一处**看全。
+	budget.Drop(ports.DropDiversity, droppedByDiversity)
+	budget.Drop(ports.DropDuplicate, droppedByDuplicate)
+	drops := budget.Dropped()
 	res := &Result{
-		Snippets:           kept,
-		Entities:           ents,
-		DroppedByBudget:    droppedByBudget,
+		Snippets: kept,
+		Entities: ents,
+		// 旧的三条具名字段是通用表的投影：DroppedByBudget 仍是「预算装不下」
+		// 的总数（桶不足 + 总量不足），处置不变。
+		DroppedByBudget:    drops[ports.DropBudget] + drops[ports.DropQuota],
 		DroppedByDiversity: droppedByDiversity,
 		DroppedByDuplicate: droppedByDuplicate,
-		Dropped:            droppedByBudget + droppedByDiversity + droppedByDuplicate,
+		Dropped:            budget.DroppedTotal(),
+		Drops:              drops,
+		Buckets:            budget.Kept(),
 	}
 	if p.cache != nil {
 		p.cache.put(p.cacheKey(req), res)
