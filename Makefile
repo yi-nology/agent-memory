@@ -10,7 +10,7 @@
 GO ?= go
 export CGO_ENABLED = 0
 
-.PHONY: all check build test test-race vet fmt fmt-check tidy-check architecture-check
+.PHONY: all check build test test-race vet fmt fmt-check tidy-check architecture-check release-check
 
 all: check
 
@@ -50,3 +50,34 @@ tidy-check:
 	@echo "tidy-check: 主模块 require 段（第三方只应服务于 storage/）"; \
 	grep -nE '^\s+[a-z0-9][^ ]*\s+v[0-9]' go.mod || echo "  （无 require）"; \
 	echo "tidy-check: import 面判据由门禁 memory-core-stdlib-only 执行 ✓"
+
+# 发布物自检（本地版）：按下游的真实路径把已发布的版本引进来并编译。
+#
+# 与 .github/workflows/ci.yml 的 release 段**同一套动作**。
+#
+# 用法：make release-check TAG=v0.4.0
+#
+# # 为什么要有本地版
+#
+# v0.4.0 的发布物自检在 CI 上红了，而那道闸从 v0.1.0 起就一直是红的
+# （版本号形态错）却「没人看它红」——一次错两处。闸红着没人察觉的根因是：
+# **红只发生在 CI 上**，本地没有任何一处会复现它。于是发版变成了「推上去看红不红」。
+#
+# 把它做成一个本地可跑的目标之后，「红」这件事在推 tag 之前就能看到。
+# 这条比闸本身更值钱：闸的形状会变，能本地复现它的动作不会变。
+release-check:
+	@test -n "$(TAG)" || { echo "用法: make release-check TAG=v0.4.0"; exit 2; }
+	@set -euo pipefail; \
+	tmp=$$(mktemp -d); cd "$$tmp"; \
+	go mod init probe >/dev/null; \
+	go get "github.com/yi-nology/agent-memory@$(TAG)"; \
+	go list -m github.com/yi-nology/agent-memory; \
+	CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/types; \
+	echo "release-check: 模块级可解析 ✓"
+	@set -euo pipefail; \
+	tmp=$$(mktemp -d); cd "$$tmp"; \
+	go mod init probe >/dev/null; \
+	pkgs="types store ports pipeline/recall storage/postgres"; \
+	for pkg in $$pkgs; do go get "github.com/yi-nology/agent-memory/$$pkg@$(TAG)"; done; \
+	for pkg in $$pkgs; do CGO_ENABLED=0 go build "github.com/yi-nology/agent-memory/$$pkg"; done; \
+	echo "release-check: 带依赖的包下游也能引进来并编译 ✓"
