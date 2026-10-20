@@ -12,26 +12,28 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
     └──episode extraction──→ Episode
 ```
 
-## 现在有什么（v0.2.0）
+## 现在有什么（v0.4.0）
 
 | 面 | 状态 | 位置 |
 |---|---|---|
 | 领域结构单源 | ✅ | `types/` —— 捕获事件/候选/事实卡/实体/别名/页面/情节/审计条目 |
 | 外部能力端口 | ✅ | `ports/` —— 模型调用/向量化/向量索引/脱敏/注入防伪，全部是接口 |
-| 持久化契约 | ✅ | `store/` —— 按消费面拆成小接口，21 个模块的方向已登记 |
+| 持久化契约 | ✅ | `store/` —— 按消费面拆成小接口，22 个模块的方向已登记 |
 | 架构门禁 | ✅ | `architecture-policy.yaml` + `tools/archcheck/`（**独立模块**，5 条规则 / 18 个自证用例） |
 | SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑** |
 | PostgreSQL 后端 | ✅ | `storage/postgres/` —— tsvector + GIN + 事务，与 SQLite **同一组行为断言** |
 | 跨后端行为断言 | ✅ | `storage/parity/` —— **31 条断言，两个后端都真跑**（PG 对着真实服务器） |
-| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测、**取数两路**（查询命中 ∪ 高价值兜底） |
+| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测、**取数两路**（查询命中 ∪ 高价值兜底）、可按宿主实体限定、可无捕获面运行 |
 | 注入防伪 | ✅ | `ports.MemoryBand` —— 转义全部 `<`，9 条攻击载荷用例钉住 |
+| 脱敏 | ✅ | `ports.PatternRedactor` —— 形态兵底 + `guardx/logredact` 规则表，**掩码长度不泄露原值长度** |
 | 捕获面 | ✅ | `pipeline/capture/` —— **落库前打码**（Redactor 必需）、运行期错误与空白正文拒收 |
 | 提炼面 | ✅ | `pipeline/extractor/` —— 防稀释校验、非法枚举硬拒、无模型显式失败 |
 | 晋升面 | ✅ | `pipeline/promotion/` —— 五检查（价值/证据/实体/重复/矛盾）+ **落库四步在一个事务里**，送人工是默认姿态 |
 | 归一面 | ✅ | `pipeline/entity/` —— 按名查/登记别名/合并实体（合并**改归属**不是复制） |
 | 页面/情节 | ✅ | `pipeline/page/` `pipeline/episode/` —— 页面重生成、情节与日/周/月周期摘要 |
 | 生命周期 | ✅ | `lifecycle/` —— 回收/合并/保留期/物理整理 |
-| 迁移包 / bridge / CLI | ✅ | `operations/portable/`（.hmpkg）`adapters/bridge`（JSON-RPC）`adapters/cli` |
+| 模型适配器 | ✅ | `adapters/llm/` —— OpenAI 兼容端点，**纯标准库**（不引 SDK、不引 eino），空正文必须报错 |
+| 迁移包 / bridge / CLI | ✅ | `operations/portable/`（.hmpkg，体检与导入走 `oekit/pkg/pack`）`adapters/bridge`（JSON-RPC）`adapters/cli` |
 | 跨包端到端测试 | ✅ | `integration/` —— 主链走一遍（真实后端，不 mock 任何一层） |
 
 > **PG 那一行不再是「未验证」**：v0.2.0 起 PG 后端是**完整实现**，
@@ -85,6 +87,18 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
    跨用户的不可信内容）；`Provenance` 做成**类型**而不是 payload 里的字符串键。
    这两条各配一个「不接会怎样」的用例钉住——否则后人会照着上游改回去。
 
+7. **上游修好了，自己那份兜底就得撤。** 脱敏的长度地板先后有两层本地兜底
+   （声明式 `minLen` + 运行期预扫），而上游 `oekit/pkg` v0.17.0 已原生
+   「短值整段全量打码」。本仓把两层**全部撤除**——留着它们不只是双源漂移，
+   更危险的是让人误以为「这条是本仓保证的」，上游真回退时没人去查。
+   撤除后该保证改由**依赖契约测试**钉住：把依赖降到修复前的版本，用例立刻变红。
+
+8. **口径要单源，且钉在一处。** 检索切词与 token 折算都走上游，但本仓在
+   `store` 层各留一个钉子（`LexicalTokens` / `FTS5Query`）——上游改了切法，
+   本仓在这一处吸收并复核，而不是各处各自跟着变。
+   钉子的必要性在 v0.4.0 被验证过一次：查询侧一度直接调上游而绕过钉子，
+   两者当时行为一致（不是当下的错），但上游一改就是**静默漏命中**。
+
 ## 开发
 
 ```bash
@@ -93,12 +107,14 @@ make test         # 只跑主模块测试
 make tidy-check   # 核对主模块仍然零依赖
 ```
 
-需要 Go 1.25+。全程 `CGO_ENABLED=0`（SQLite 走纯 Go 驱动，不依赖 cgo）。
+需要 Go 1.27+。全程 `CGO_ENABLED=0`（SQLite 走纯 Go 驱动，不依赖 cgo）。
 
 ### 命令行面
 
 ```bash
 memory capture --content "…"      # 捕获一条事件（落库前已打码）
+memory extract [--session S]       # 从原始事件提炼候选（**要模型**）
+memory promote [--entity ID]      # 判定候选并落成事实（**要模型**）
 memory recall  <查询词>            # 召回并渲染
 memory search  <查询词>            # 检索事实卡
 memory stats                       # 计数
@@ -116,7 +132,11 @@ memory entity alias --entity ID --alias A # 登记别名
 memory episode list                # 列出情节
 ```
 
-CLI 是**管理口**（看与搬），不注入模型：提炼、页面重生成、周期摘要由宿主触发。
+CLI 多数命令是**管理口**（看与搬），不注入模型；`extract` 与 `promote` 例外——
+它们要模型，端点从环境变量读（`MEMORY_LLM_BASE_URL` / `MEMORY_LLM_API_KEY` /
+`MEMORY_LLM_MODEL` / `MEMORY_LLM_TIMEOUT`），**密钥不进命令行**。
+未配置模型时这两个命令显式报错，其余命令零影响。
+页面重生成与周期摘要仍由宿主触发。
 
 ### 跑 PG 的行为断言
 
