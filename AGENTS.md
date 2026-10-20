@@ -348,7 +348,7 @@ make check
 ## 发版
 
 ```bash
-make release-check TAG=v0.5.1      # 已发布版本能被下游按版本号引入
+make release-check TAG=v0.6.0      # 已发布版本能被下游按版本号引入
 ```
 
 `make release-check` 与 CI 的 release 段**同一套动作**，本地能跑。

@@ -15,7 +15,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
     └──episode extraction──→ Episode
 ```
 
-## 现在有什么（v0.5.1 + 未发布改动）
+## 现在有什么（v0.6.0）
 
 | 面 | 状态 | 位置 |
 |---|---|---|
@@ -39,10 +39,10 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 | 迁移包 / bridge / CLI | ✅ | `operations/portable/`（.hmpkg，体检与导入走 `oekit/pkg/pack`）`adapters/bridge`（JSON-RPC）`adapters/cli` |
 | 跨包端到端测试 | ✅ | `integration/` —— 主链走一遍（真实后端，不 mock 任何一层） |
 
-> **下一次发版是 v0.6.0，且含破坏性变更**：`store` 的三个方法签名变了
+> **v0.6.0 含破坏性变更**：`store` 的三个方法签名变了
 > （`SearchAtoms` / `ListRaw` / `SearchRaw` 都要带过滤条件或归属），
 > `application.Service.Search` 改成吃 `store.AtomFilter`。
-> 下游跟着改的清单见 issue #10 / #11 的回写。
+> 下游跟着改的清单见 issue #10 / #11 的回写与 tag 的发布说明。
 
 > **PG 那一行不再是「未验证」**：v0.2.0 起 PG 后端是**完整实现**，
 > 36 条 parity 断言对着**真实 PostgreSQL** 跑通，且 CI 里加了 `postgres` service
