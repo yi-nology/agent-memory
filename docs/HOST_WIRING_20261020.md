@@ -67,7 +67,7 @@
 
 ```
 bianque/go.mod:50  github.com/yi-nology/agent-harness v0.6.2
-bianque/go.mod:51  github.com/yi-nology/agent-memory  v0.4.2
+bianque/go.mod:51  github.com/yi-nology/agent-memory  v0.6.0   ← 2026-10-21 升（原 v0.4.2）
 ```
 
 | 内核 | 宿主里用到的文件数 | 落在哪 |
@@ -202,16 +202,28 @@ memory.episode.digest    生成日/周/月周期摘要
 
 | 项 | 现状 |
 |---|---|
-| 本仓最新 tag | `v0.5.1` |
-| 扁鹊钉的版本 | `agent-memory v0.4.2` / `agent-harness v0.6.2` |
-| 落差 | 跨了 `ports.Budget` 契约件那次解耦（issue #9，commit `d4ae369`）——**宿主要用新的分桶配额与分路丢弃计数，得先升版本** |
+| 本仓最新 tag | `v0.6.0` |
+| 扁鹊钉的版本 | `agent-memory v0.6.0` / `agent-harness v0.6.2` |
+| 落差 | 无（2026-10-21 已对齐：v0.4.2 → v0.6.0） |
+
+**2026-10-21 补记（宿主侧已适配 v0.6.0）**：
+
+- v0.6.0 是**破坏性版本**（`store` 的 `SearchAtoms` / `ListRaw` / `SearchRaw`
+  签名变了），宿主侧同笔适配：适配层 `internal/memstore` 认 `store.AtomFilter.Scope`，
+  归属（内核 `types.Scope`）与宿主的 `team_id` 一一对应。
+- 宿主侧顺带把**归属进签名**与**三条读路径按团队分层**落下了
+  （原先只有注入面过滤、工具面不过滤，且过滤是后置的）：
+  签名含团队、过滤进 SQL、工具面按 ctx 里的会话团队分层。
+- 仍未做：扁鹊**接捕获面**（蒸馏产物走 `capture` 而不是自己的老路）——
+  §4 第 2 条那条不变量要等这一步才成立。
 
 **待办（宿主侧，本仓改不了）**：
 
 1. 扁鹊接捕获面 → 让蒸馏产物走 `capture` 而不是继续走老路（§4 第 2 条那条不变量才成立）。
    ⚠️ 这**不是**「补脱敏」——脱敏已在 `ad3ada51` 清偿（§4 第 1 条），
    这里是「让内核知道出处」。
-2. 扁鹊升 agent-memory 到 v0.5.x，评估 `ports.Budget` 投影面。
+2. 扁鹊的**画像**（`bq_memory_subject_page`）仍不带团队维度 → 各队事实在画像里互相可见。
+   画像团队化要改表结构（按 (锚点, 团队) 拆行）+ 同步 digest 取用面，是另一笔改动。
 3. 本仓侧无阻塞项。
 
 ---
