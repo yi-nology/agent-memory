@@ -1,0 +1,12 @@
+{
+  "mcp": {
+    "servers": {
+      "agentmemory": {
+        "command": "/opt/agent-memory/bin/memory",
+        "args": ["mcp", "--db", "/opt/agent-memory/data/memory.sqlite", "--namespace", "openclaw"],
+        "transport": "stdio",
+        "enabled": true
+      }
+    }
+  }
+}

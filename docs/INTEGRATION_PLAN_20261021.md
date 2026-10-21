@@ -6,6 +6,14 @@
 **规划前先把事实核了一遍**（下面每条「现状」都是实测/读源码得到的，不是推测）——
 因为三件事里有两件的前提与直觉相反，先核再规划能省掉整轮返工。
 
+### 进度（2026-10-21）
+
+| 轨道 | 已落地 | 剩下 |
+|---|---|---|
+| A：`.hmpkg` 互通 | A-0（字段映射表）、A-1（octop 布局写出）、A-2（布局嗅探读入 ✓ 自环用例 ✓） | **A-3**：黄金样本的跨仓对账（需要 octop 侧配合 ✓） |
+| B：宿主升级 | — | B-0…B-3（在扁鹊仓做 ✓），B-4 可选 ✓ |
+| C：OpenClaw | C-0（`memory mcp`）、C-1（配置片段 ✓）、C-2（捕获接线 ✓）、C-3（验证脚本 ✓） | 无（本机 OpenClaw 2026.9.8 已端到端跑通 ✓） |
+
 ---
 
 ## 轨道 A：`.hmpkg` Go↔Python 互通
@@ -129,7 +137,9 @@ importance` —— 同一设计的两个实现 ✓。本仓是**超集**（多 `
 
 ### 现状（已核实）
 
-- **OpenClaw 认 MCP ✓**（多个第三方记忆产品用「MCP + hooks」接它 ✓；它的 gateway 监听 3111 ✓）。
+- **OpenClaw 认 MCP ✓**（多个第三方记忆产品用「MCP + hooks」接它 ✓）。
+  ⚠️ **gateway 端口是 18789** ✓（控制面板与 websocket 都在上面 ✓），
+  不是先前记的 3111 ✓ —— 写进文档前**核过官方文档与 schema** ✓。
 - octop 的 OpenClaw 插件是 **Node/TS 包** ✓（`openclaw.plugin.json` + `package.json` ✓），
   做法是**拉起一个 bridge 子进程**暴露 tools ✓。
 - OpenClaw 有 **hooks** ✓（`agent_end` 用来捕获 ✓）。
@@ -143,12 +153,32 @@ octop 需要 Node 插件是因为它的运行时是 Python ✓；
 | 阶段 | 交付 | 验收 | 状态 |
 |---|---|---|---|
 | C-0 | **`memory mcp`**：stdio MCP 服务器入口（本仓已有 `adapters/mcp` 的协议层 ✓，缺的只是入口 ✓） | CLI 里跑一次真实协议往返（`initialize` → 有 `protocolVersion` ✓） | ✅ 已做 |
-| C-1 | **OpenClaw 配置片段**（mcpServers + hooks ✓） | 配置能被 OpenClaw 读入 ✓（文档 + 片段 ✓） | ⏳ 待做 |
-| C-2 | **捕获面接线**（hook → `memory capture` ✓ CLI 已有 ✓） | 一次 hook 触发后，库里多一条原始事件 ✓ | ⏳ 待做 |
-| C-3 | **端到端验证脚本**（OpenClaw 里问一句 → 召回命中 ✓） | 脚本在有 OpenClaw 的机器上跑通 ✓ | ⏳ 待做 |
+| C-1 | **OpenClaw 配置片段**（`mcp.servers` + 插件项 ✓） | 配置能被 OpenClaw 读入 ✓（文档 + 片段 ✓） | ✅ 已做 |
+| C-2 | **捕获面接线**（MCP 工具 → 内核捕获面 ✓） | 一次捕获后，库里多一条原始事件 ✓ **且落在配置指定的那个库里** ✓ | ✅ 已做 |
+| C-3 | **端到端验证脚本**（`scripts/verify-openclaw-memory.sh` ✓） | 脚本在有 OpenClaw 的机器上跑通 ✓ | ✅ 已做 |
 
 ⚠️ **明确写下来：不需要写 Node 插件** ✓ —— 免得后人照着 octop 的做法去写一个 ✗
 （那是它运行时形状决定的 ✓，不是协议要求 ✓）。
+
+### C 段做完后才知道的四件事（都是「照博客写就会错」的那种 ✓）
+
+1. **配置键是 `mcp.servers`，不是 `mcpServers`** ✓。
+   `mcpServers` 是 Claude Desktop 那一族的形状 ✓；
+   OpenClaw 用 `mcp.servers` ✓（顶层 `mcp` 下）✓。
+   而 OpenClaw 的根级 schema 是 `strictObject` ✓ ⇒ **未知根键让 Gateway 拒绝启动** ✓
+   ⇒ 写错键名不是「这一项不生效」，是「起不来」✓。
+2. **工具名会被改写** ✓：`<服务器名>__<工具名>` ✓，点换成横线 ✓
+   （`memory.capture` → `agentmemory__memory-capture` ✓）。
+   ⇒ **提示词约定必须写改写后的名字** ✓ —— 写原名的话，agent 找不到那个工具 ✓
+   （不报错、就是不记 ✓）。
+3. **模式 B 有两个静默坑** ✓：`hooks.allowConversationAccess` 不开 → 永远不捕获 ✓；
+   `hooks.allowPromptInjection` 不开 → 召回那一半静默失效 ✓。
+4. **官方文档与实测有出入** ✓：文档说 `openclaw mcp` 的写操作与探测要求 Gateway 停着 ✓，
+   而本机 **2026.9.8** 实测在 Gateway 运行时照常可用 ✓ —— 以实测为准 ✓。
+
+⇒ **纪律**：接第三方宿主时，配置形状要照**它的 schema 源码**核 ✓，
+而不是照博客圈的通用形状抄 ✓ —— 后者抄来的往往是**别的宿主的形状** ✓，
+而本仓的文档会被后来人当成依据 ✓。
 
 ---
 
