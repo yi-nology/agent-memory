@@ -99,7 +99,7 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 实体归一 | `pipeline/entity/entity.go` | `types/entity.go` | 合并是**改归属**，不是复制 |
 | 查询理解（时间窗/代词/实体） | `pipeline/query/` | `pipeline/recall`（取数前置）+ `types/query.go` | 解析出的实体**只补画像**，不划事实范围 |
 | 混合检索（语义 + RRF） | `ports/semantic.go` + `ports/rerank.go` | `pipeline/recall/hybrid.go` | 融合决定**池子**，排序归打分器；缺省权重 0 ⇒ 零漂移 |
-| 向量轨（向量化 + 索引） | `ports/vector.go` + `ports/index.go` | `application/vector.go`（写/删向量）+ `application/service.go`（装配语义路）+ 两个存储后端（持久化索引） | 语义强度归宿主、**管线**归内核；**归属必须进索引**（后置过滤会吃掉配额） |
+| 向量轨（向量化 + 索引） | `ports/vector.go` + `ports/index.go` | `application/vector.go`（写/删向量）+ `application/service.go`（装配语义路）+ 两个存储后端（`atom_vectors` 表，持久化索引） | 语义强度归宿主、**管线**归内核；**归属必须进索引**（后置过滤会吃掉配额）；本仓的持久化索引是**暴力扫描**（小库够用），大规模注入宿主自己的向量库 |
 | 事实更新（取代 vs 矛盾） | `pipeline/promotion/update.go` | `types/atom.go`（时序字段）+ `store.AtomFilter.At` | 模型只做**路由**；作废与矛盾落人工 |
 | 时序事实（生效区间） | `types/atom.go` | 两个后端（加列 + 迁移）+ `store.AtomFilter.At` | `ValidFrom` 零值取 `OccurredAt`（老数据不变） |
 | 关系边与多跳 | `types/graph.go` + `pipeline/graph/` | `store.EdgeStore` + 两个后端（建表 + 迁移） | 边是**派生物**；溯源（SourceAtomID）必需 |
@@ -109,6 +109,7 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 迁移包格式 | `operations/portable/portable.go` | `oekit/pkg/pack` | 写面不换 pack：改了等于**改包格式**，已发布包导不回来 |
 | CLI 命令 | `adapters/cli/{cli,admin}.go` | — | `Run(args,stdout,stderr) int`，不是 `main()` |
 | 向量索引补算 | `adapters/cli/cli.go`（`memory reindex`） | `ports.HashEmbedder` + 存储的向量面 | 存量事实没有向量 → 语义轨等于失灵；补算是幂等的 |
+| 向量索引的**归属**维度 | `storage/{sqlite,postgres}/schema.go`（`atom_vectors.scope`） | 两个后端 + `ports.VectorIndex.Search` 的 scope 参数 | 归属过滤必须在**取数层**（进 SQL）；后置过滤会让别家占掉 topK 槽位 |
 | 对外 RPC | `adapters/bridge/bridge.go` | `application.Service` | 方法名是 `memory.xxx` 白名单（现 8 个） |
 | 宿主接入 | `application/service.go` | `adapters/*` | 服务面**只做五件事**：capture/extract/promote/recall/search |
 | 依赖方向/豁免 | `architecture-policy.yaml` | `tools/archcheck/` | **policy 先行**；豁免缺字段**加载期即失败** |

@@ -17,7 +17,7 @@ import (
 // 本仓的定案是「向量轨不接」：两个后端都不存向量。
 // 卡上带着向量来存时**必须报错**——静默丢掉的话，症状是
 // 「相似度检索永远空」，而它与「存错了地方」毫无相似之处。
-var errAtomVectorNotStored = errors.New("事实卡带了向量，但本后端不落向量（向量轨未接）：" +
+var errAtomVectorNotStored = errors.New("事实卡带了向量，但本后端不落向量（向量是派生物，另有向量索引面）：" +
 	"请把它留在自己的存储里，或换一个会落向量的后端")
 
 const atomCols = `id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,

@@ -21,7 +21,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 |---|---|---|
 | 领域结构单源 | ✅ | `types/` —— 捕获事件/候选/事实卡/实体/别名/页面/情节/审计条目 |
 | 外部能力端口 | ✅ | `ports/` —— 模型调用/脱敏/注入防伪/词元计量，接口 + 纯标准库默认实现；**分桶配额与丢弃计数**（`ports.Budget`）与召回实现解耦，宿主自造召回可复用同一套；**排序打分器**（`ports.Ranker`）可注入换口径，缺省权重下**逐条等价于**原实现 |
-| 向量轨 | ✅ | `ports/vector.go` + `ports/index.go` —— **已接通**：`Embedder` + `VectorIndex` 两个预留口有真的消费点（晋升后写向量、召回时语义路 + RRF 融合、退役时删向量）；给一个**诚实的可跑实现**（`HashEmbedder` 词面哈希嵌入 + `MemIndex` 内存索引），语义强度由宿主换实现；不装配 = 逐条回到纯词面 |
+| 向量轨 | ✅ | `ports/vector.go` + `ports/index.go` —— **已接通**：`Embedder` + `VectorIndex` 两个预留口有真的消费点（晋升后写向量、召回时语义路 + RRF 融合、退役时删向量）；**归属进索引**（过滤在取数层，后置过滤会吃掉配额）；两个后端有**持久化索引**（`atom_vectors` 表，暴力扫描，小库够用），宿主可注入 Chroma/Qdrant 等；本仓的 `HashEmbedder` 是**词面哈希嵌入**（不是语义嵌入，语义强度由宿主换实现）；不装配 = 逐条回到纯词面 |
 | 持久化契约 | ✅ | `store/` —— 按消费面拆成 8 个小接口（`RawStore`/`CandidateStore`/`AtomStore`/`EntityStore`/`PageStore`/`EpisodeStore`/`JournalStore`/`MetaStore`），22 个模块的方向已登记；**归属维度**（记录级隔离）进过滤面，两条取数路都在**取数层**生效 |
 | 架构门禁 | ✅ | `architecture-policy.yaml` + `tools/archcheck/`（**独立模块**，5 条规则 + 2 条阈值 / 18 个自证用例） |
 | SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑**（单套表 + namespace 列隔离，非表前缀）；带**版本化迁移**（老库打开即升级，迁移幂等） |

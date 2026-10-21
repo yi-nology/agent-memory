@@ -47,6 +47,7 @@ var migrations = []migration{
 	{version: 3, apply: migrateV3EntityPageScope},
 	{version: 4, apply: migrateV4AtomTemporal},
 	{version: 5, apply: migrateV5EntityEdges},
+	{version: 6, apply: migrateV6AtomVectors},
 }
 
 // migrateV2AtomScope 给 atoms、raw_events、candidates 加归属列 scope 与索引。
@@ -162,6 +163,55 @@ func migrateV5EntityEdges(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("建关系边表失败: %w", err)
 	}
 	return nil
+}
+
+// migrateV6AtomVectors 建向量索引表与它的归属索引。
+//
+// # 为什么要有这一段
+//
+// 向量索引表是**新表**：新库由建表脚本建，老库（v5 形状）没有这张表。
+// 迁移补上它，两个来源的库必须落在**同一个形状**上——
+// 否则「有的库能语义召回、有的库不能」，症状是「换了库语义路就空了」。
+//
+// # 幂等
+//
+// 版本号那一行可能被手工改过、被老版本覆盖过，或者库是从别处拷来的，
+// 于是同一段迁移可能被跑第二次——而迁移跑第二遍而失败的话
+// **库就打不开了**，而那正是「升级一下记忆库」这种日常操作最不该出的事。
+//
+// 故表在不在先查（sqlite_master）：不在才建，在就跳过。
+// 索引单独建（IF NOT EXISTS）：「表在而索引不在」是可能发生的形状
+// （迁移被手工改过版本号），而缺索引的后果是「归属过滤退化成全表扫描」——
+// 症状只是慢，没人会去查。
+func migrateV6AtomVectors(ctx context.Context, db *sql.DB) error {
+	exists, err := tableExists(ctx, db, "atom_vectors")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := db.ExecContext(ctx, atomVectorsDDL); err != nil {
+			return fmt.Errorf("建向量索引表失败: %w", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, atomVectorsIndexDDL); err != nil {
+		return fmt.Errorf("建向量归属索引失败: %w", err)
+	}
+	return nil
+}
+
+// tableExists 表在不在。
+//
+// 查 sqlite_master（系统表）而不是试一句 SELECT：
+// 「表不存在」的报错信息由驱动决定，而迁移要判的是「要不要建」，
+// 不是「建表语句会不会失败」。
+func tableExists(ctx context.Context, q rowQuerier, table string) (bool, error) {
+	var n int
+	err := q.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("查表 %s 是否存在失败: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // rowQuerier 能查库的东西。*sql.DB 与 *sql.Tx 都满足它。

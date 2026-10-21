@@ -44,6 +44,7 @@ var migrations = []migration{
 	{version: 3, apply: migrateV3EntityPageScope},
 	{version: 4, apply: migrateV4AtomTemporal},
 	{version: 5, apply: migrateV5EntityEdges},
+	{version: 6, apply: migrateV6AtomVectors},
 }
 
 // migrateV4AtomTemporal 给 atoms 加生效区间与版本号三列。
@@ -103,6 +104,30 @@ func migrateV4AtomTemporal(ctx context.Context, db *sql.DB) error {
 func migrateV5EntityEdges(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, entityEdgesDDL); err != nil {
 		return fmt.Errorf("建关系边表失败: %w", err)
+	}
+	return nil
+}
+
+// migrateV6AtomVectors 建向量索引表与它的归属索引。
+//
+// # 为什么要有这一段
+//
+// 向量索引表是**新表**：新库由建表脚本建，老库（v5 形状）没有这张表。
+// 迁移补上它，两个来源的库必须落在**同一个形状**上——
+// 否则「有的库能语义召回、有的库不能」，症状是「换了库语义路就空了」。
+//
+// # 幂等
+//
+// DDL 与索引都用 IF NOT EXISTS（DDL 与建表脚本共用同一份，见 schema.go）：
+// 版本号那一行可能被手工改过、被老版本覆盖过，或者库是从别处拷来的，
+// 于是同一段迁移可能被跑第二遍——而迁移跑第二遍而失败的话
+// **库就打不开了**，而那正是「升级一下记忆库」这种日常操作最不该出的事。
+func migrateV6AtomVectors(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, atomVectorsDDL); err != nil {
+		return fmt.Errorf("建向量索引表失败: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, atomVectorsIndexDDL); err != nil {
+		return fmt.Errorf("建向量归属索引失败: %w", err)
 	}
 	return nil
 }

@@ -32,6 +32,12 @@
 // do not prove compatibility」——被跳过的断言等于不存在，它给的是假安全感。
 // 因此调用方必须让跳过**可见**（t.Skip 会打印），且不得把「全绿」当成
 // 「两种后端都验证过」。真实 PG 用例必须对着真服务器跑（Dsn 环境变量）。
+//
+// # 向量索引那一组是**另一个入口**（RunVector，见 parity_vector.go）
+//
+// 向量索引不是 store.Store 的一翼，而是另一个端口（ports.VectorIndex），
+// 且本包的依赖方向不许引用 ports。故那一组断言由各后端在自己的测试文件里
+// 调用 RunVector 跑——断言本体仍然只有**这一份**，两个后端跑的是同一组行为。
 package parity
 
 import (

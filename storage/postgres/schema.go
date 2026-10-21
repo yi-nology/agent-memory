@@ -10,8 +10,53 @@ import (
 //
 // 记在 meta 表的 schema_version 键里，迁移按版本号线性追加（见 migrate.go）。
 //
-// 5 = 事实卡的生效区间与版本号（v4）+ 关系边表（v5）。
-const schemaVersion = 5
+// 6 = 事实卡的生效区间与版本号（v4）+ 关系边表（v5）+ 向量索引表（v6）。
+const schemaVersion = 6
+
+// atomVectorsDDL 向量索引表的建表语句。
+//
+// 建表脚本与迁移共用**同一份** DDL（见 migrate.go 的 v6）：
+// 两份各写一遍的话，改了一处就会漂，而漂了的失效形态是
+// 「有的库有这张表、有的库没有」——症状是「语义召回像是没生效」，
+// 而那在数据上完全看不出来。
+//
+// 向量是**派生物**：真源是事实卡（向量是事实的函数），
+// 索引丢了可以从事实卡重算，事实卡丢了索引救不回来。
+// 故这一面只有「落向量与读向量」，没有任何改写事实的入口。
+//
+// scope 是**这条向量的归属**（与事实卡同口径）：空 = 全局可见，
+// 非空 = 仅同归属可见。检索时归属过滤**进 SQL**（见 misc.go 的 Search）。
+//
+// vec 是 float32 的**小端字节序列**（不是 JSON 串、不是文本）：
+// 文本往返会丢精度（十进制 → float64 → float32 两次舍入），
+// 而向量要逐位可复现——同一批记忆在不同进程里算出的向量必须逐位相同。
+//
+// ⚠️ 本后端的向量列用 BYTEA（PG 的二进制类型，对应 SQLite 的 BLOB），
+// 时刻列用 TIMESTAMPTZ（与本后端其它时刻列同款）。
+const atomVectorsDDL = `
+CREATE TABLE IF NOT EXISTS atom_vectors (
+  namespace  TEXT NOT NULL,
+  id         TEXT NOT NULL,
+  scope      TEXT NOT NULL DEFAULT '',
+  dim        INTEGER NOT NULL,
+  vec        BYTEA NOT NULL,
+  updated_at TIMESTAMPTZ,
+  PRIMARY KEY (namespace, id)
+);
+`
+
+// atomVectorsIndexDDL 向量索引表的归属索引。
+//
+// **归属过滤进 SQL**（见 misc.go 的 Search），故这条索引是取数路径的一部分：
+// 没有它，检索就是「整个命名空间全扫 + 逐条判归属」——
+// 而归属过滤的价值恰恰在于「别家的数据不进候选池」。
+//
+// 索引**归迁移管**（见 migrate.go 的 v6）：建表脚本每次打开都跑，
+// 而这张表是**新表**——脚本对老库是空操作（表还不存在时由脚本建出来，
+// 建出来之后索引自然跟着建；表已存在时两条语句都是空操作）。
+const atomVectorsIndexDDL = `
+CREATE INDEX IF NOT EXISTS atom_vectors_scope ON atom_vectors (namespace, scope);
+`
 
 // entityEdgesDDL 关系边表的建表语句。
 //
@@ -214,6 +259,7 @@ CREATE TABLE IF NOT EXISTS entity_pages (
 );
 CREATE INDEX IF NOT EXISTS pages_dirty ON entity_pages (namespace, dirty);
 ` + entityEdgesDDL + `
+` + atomVectorsDDL + atomVectorsIndexDDL + `
 
 CREATE TABLE IF NOT EXISTS episodes (
   namespace      TEXT NOT NULL,

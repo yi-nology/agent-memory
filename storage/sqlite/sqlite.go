@@ -3,12 +3,15 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
+	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 
 	// 纯 Go SQLite 驱动（CGO_ENABLED=0 可用；FTS5 已编入，SQLite 3.50.4）。
@@ -39,6 +42,7 @@ type Store struct {
 	episodeStore
 	journalStore
 	metaStore
+	vectorStore
 
 	db *sql.DB
 	tx *sql.Tx
@@ -59,6 +63,12 @@ type (
 
 var _ store.Store = (*Store)(nil)
 
+// var _ ports.VectorIndex 编译期钉住「本后端直接实现向量索引端口」。
+//
+// 刻意**不写适配层**：存储层直接实现那个端口，装配面按类型断言取用，
+// 省掉一层胶水（见 architecture-policy.yaml 里 storage-sqlite 的说明）。
+var _ ports.VectorIndex = (*Store)(nil)
+
 // newStore 造一个全部子结构都回指自身的 Store。
 //
 // 漏回指一个的后果是该表的方法在调用时 panic（nil 指针）——所以这里用一个
@@ -74,6 +84,7 @@ func newStore(db *sql.DB) *Store {
 	s.episodeStore.Store = s
 	s.journalStore.Store = s
 	s.metaStore.Store = s
+	s.vectorStore.Store = s
 	return s
 }
 
@@ -356,6 +367,64 @@ func ftsBody(parts ...string) string {
 		}
 	}
 	return strings.Join(store.LexicalTokens(strings.Join(out, " ")), " ")
+}
+
+// ── 辅助：向量的字节形态 ──
+
+// encodeVec 把向量编码成小端 float32 字节序列。
+//
+// 为什么是二进制而不是 JSON 串：文本往返会丢精度
+// （十进制 → float64 → float32，两次舍入），
+// 而向量要**逐位可复现**——同一批记忆在不同进程里算出的向量必须逐位相同，
+// 否则「召回结果可复现」这条承诺（评测面靠它成立）就破了。
+//
+// 小端：两个后端统一用它，故跨后端搬库时字节序也一致。
+func encodeVec(vec []float32) []byte {
+	buf := make([]byte, 4*len(vec))
+	for i, v := range vec {
+		binary.LittleEndian.PutUint32(buf[4*i:], math.Float32bits(v))
+	}
+	return buf
+}
+
+// decodeVec 解回向量（decodeVec(encodeVec(v)) 与 v 逐位相同）。
+func decodeVec(b []byte) []float32 {
+	out := make([]float32, len(b)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[4*i:]))
+	}
+	return out
+}
+
+// vecNorm 向量的模长。
+func vecNorm(v []float32) float64 {
+	var sum float64
+	for _, x := range v {
+		sum += float64(x) * float64(x)
+	}
+	return math.Sqrt(sum)
+}
+
+// cosineScore 两个向量的余弦相似度。
+//
+// 第二个返回值是「能不能比」：零向量没有方向（0/0），
+// 比出来的数没有意义，故不能比时返回 false，调用方跳过这一条。
+//
+// 累加用 float64：float32 累加在长向量上会明显丢精度，
+// 而分数是要拿来排序的——排序被噪声带偏，召回次序就跟着漂。
+func cosineScore(a, b []float32) (float64, bool) {
+	an, bn := vecNorm(a), vecNorm(b)
+	if an == 0 || bn == 0 {
+		return 0, false
+	}
+	var dot float64
+	for i := range a {
+		if i >= len(b) {
+			break
+		}
+		dot += float64(a[i]) * float64(b[i])
+	}
+	return dot / (an * bn), true
 }
 
 // ftsQuery 把查询串拼成 FTS5 的 MATCH 串。
