@@ -116,68 +116,21 @@ jobs:
           go list ./... >/dev/null
           echo "release: $mod@$ver 可解析"
 
-      - name: 以模块身份自证（下游视角：拉下来能不能编译）
-        # 刻意不写 probe.go：YAML 块标量里嵌 heredoc 的话，heredoc 体必须顶格，
-        # 顶格会截断块标量本身（YAML 解析期就红）。改成直接构建依赖包——
-        # 「下游 import 它」这件事由 go build 那个包来证明，不必再写一个 main。
+      - name: 发布物自证（下游视角：拉下来能不能编译）
+        # 这一段直接调 `make release-check`：**闸里的包清单只有一份**。
         #
-        # ⚠️ 这一段验的是**模块级**的可解析性，故只构建零依赖的 types。
+        # ⚠️ 为什么要合到一处：清单曾在本文件与 Makefile 各存一份，
+        # 两份漂了就是这道闸漏检的直接原因（v0.4.0 实跑过：
+        # build 了 storage/postgres 却没有 get 它，报 missing go.sum entry）。
+        # 「取哪些」与「编哪些」现在由 Makefile 里的同一个变量驱动，
+        # 加一个包不会再漏一处；而本文件不再另存一份清单。
         #
-        # 为什么不能在这里 build store：store 自 v0.4.0 起 import 了
-        # oagentkit/textx（检索词元的契约钉子），而**模块路径**的
-        # `go get <模块>@版本` 不会把传递依赖的**包级**校验和写进下游 go.sum
-        # （Go 的既定行为：模块路径只登记模块图的校验和）。
-        # 于是 build store 会报 "missing go.sum entry for .../textx/textutil"——
-        # 而那不是发布物坏了，是**探针的取法不对**。
-        # 带依赖的包归下一段，那一段按下游的真实路径（包路径）走。
+        # ⚠️ 版本号形态：必须用**带 v 的** tag 名，不能用剥掉 v 的版本号。
+        # Go 的模块版本号**必须**以 v 开头（v0.2.0，不是 0.2.0），
+        # 而 `go get module@0.2.0` 会报 "invalid version: unknown revision 0.2.0"。
+        # 这道闸从 v0.1.0 起就一直是红的：脚本剥掉 v 之后拿它当模块版本用，
+        # 于是每次发版的「下游能按版本号引入」自检都失败——
+        # 而它恰好是唯一能提前发现「发布物下游引不进」的那道闸。
         run: |
           set -euo pipefail
-          # ⚠️ 这里必须用**带 v 的** tag 名，不能用剥掉 v 的版本号。
-          #
-          # Go 的模块版本号**必须**以 v 开头（v0.2.0，不是 0.2.0），
-          # 而 `go get module@0.2.0` 会报 "invalid version: unknown revision 0.2.0"。
-          #
-          # 这道闸从 v0.1.0 起就一直是红的：脚本剥掉 v 之后拿它当模块版本用，
-          # 于是每次发版的「下游能按版本号引入」自检都失败——
-          # 而它恰好是唯一能提前发现「发布物下游引不进」的那道闸。
-          # 一次错两处：版本号形态错，以及**没人看它红**。
-          tag="${GITHUB_REF_NAME}"
-          tmp="$(mktemp -d)"
-          cd "$tmp"
-          go mod init probe >/dev/null
-          # 走 proxy 引入自己发布的版本：这是下游的真实路径
-          go get "github.com/yi-nology/agent-memory@${tag}"
-          go list -m github.com/yi-nology/agent-memory
-          CGO_ENABLED=0 go build github.com/yi-nology/agent-memory/types
-          echo "release: 下游视角编译通过"
-
-      - name: 以模块身份自证（带依赖的包）
-        # 上一段只编译了 types——它**没有第三方依赖**，
-        # 所以那段验的是「模块能不能按版本号引进来」，
-        # 验不到「发布物的 go.mod/go.sum 对带依赖的包是否自洽」。
-        # 而这类失效的症状极隐蔽：下游 import 到那个包时才发现
-        # 「missing go.sum entry」，报错完全指不到本仓。
-        #
-        # 下游的正确路径是 `go get <模块>/<包>@版本`（或 import 之后 go mod tidy）：
-        # 只 `go get <模块>@版本` 不会把传递依赖的校验和写进下游的 go.sum，
-        # 那是 Go 的既定行为，不是本仓的缺陷——但**发布闸必须按下游的真实路径走**。
-        #
-        # ⚠️ **「go get 的包清单」与「build 的包清单」必须是同一份**。
-        # 两者漂了就是这道闸漏检的直接原因：v0.4.0 首次实跑时，
-        # 本段 build 了 storage/postgres（它 import lib/pq）却没有 get 它，
-        # 于是报 missing go.sum entry；而 store（import textx）同样。
-        # 故这里用**同一份清单**驱动两个动作，加一个包不会再漏一处。
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          tmp="$(mktemp -d)"
-          cd "$tmp"
-          go mod init probe >/dev/null
-          pkgs="types store ports pipeline/recall storage/postgres"
-          for pkg in $pkgs; do
-            go get "github.com/yi-nology/agent-memory/${pkg}@${tag}"
-          done
-          for pkg in $pkgs; do
-            CGO_ENABLED=0 go build "github.com/yi-nology/agent-memory/${pkg}"
-          done
-          echo "release: 带依赖的包下游也能引进来并编译"
+          make release-check TAG="${GITHUB_REF_NAME}"

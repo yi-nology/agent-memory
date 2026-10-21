@@ -77,7 +77,7 @@ release-check:
 	@set -euo pipefail; \
 	tmp=$$(mktemp -d); cd "$$tmp"; \
 	go mod init probe >/dev/null; \
-	pkgs="types store ports pipeline/recall storage/postgres"; \
+	pkgs="types store ports pipeline/recall pipeline/query pipeline/graph evaluation adapters/mcp storage/postgres"; \
 	for pkg in $$pkgs; do go get "github.com/yi-nology/agent-memory/$$pkg@$(TAG)"; done; \
 	for pkg in $$pkgs; do CGO_ENABLED=0 go build "github.com/yi-nology/agent-memory/$$pkg"; done; \
 	echo "release-check: 带依赖的包下游也能引进来并编译 ✓"

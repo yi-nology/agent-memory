@@ -15,8 +15,6 @@ import (
 
 var ns = store.Namespace("pg")
 
-func now() time.Time { return time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC) }
-
 // pgKey 页面夹具的键：(归属, 实体)。
 //
 // 页面按归属视角分页，故夹具也必须按 (归属, 实体) 分键——

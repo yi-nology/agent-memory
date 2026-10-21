@@ -15,7 +15,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
     └──episode extraction──→ Episode
 ```
 
-## 现在有什么（v0.6.0）
+## 现在有什么（v0.7.0）
 
 | 面 | 状态 | 位置 |
 |---|---|---|
@@ -51,16 +51,30 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 > `application.Service.Search` 改成吃 `store.AtomFilter`。
 > 下游跟着改的清单见 issue #10 / #11 的回写与 tag 的发布说明。
 
-> **未发布（含破坏性变更，发布时并入下一版说明）**：
-> `store.AtomFilter` 新增 `IDs` / `At`；`store` 新增 `EdgeStore` + `EdgeFilter`；
-> `promotion.Verdict` 新增 `Actor` / `Superseded`，`promotion.Decision` 新增 `update`；
-> `promotion.Config` 新增 `LLM` / `UpdateSimilarity` / `UpdateHintSimilarity`；
-> `recall.Config` 新增 `Semantic` / `Analyzer` / `Metrics`；
-> `application.Deps` 新增 `Embedder` / `VectorIndex`（向量轨，给了才启用）；
-> `recall.Request` 新增 `OccurredFrom` / `OccurredTo` / `At`；
-> `ports.RankCandidate` 新增 `FusionScore`，`ports.RankWeights` 新增 `Fusion`；
-> `application.Deps` 新增 `Promotion`；
-> `types.AtomCard` 新增 `ValidFrom` / `ValidTo` / `Version`。
+> **v0.7.0 含破坏性变更**（下游要改的清单，逐条列全）：
+>
+>   - `store.AtomFilter` 新增 `IDs`（按标识集合取，多路融合后一次取回）与
+>     `At`（按生效区间取，零值=不过滤）；
+>   - `store` 新增 `EdgeStore` 与 `EdgeFilter`（关系边，**派生物**）；
+>   - `store.PageStore` 的六个方法都多了 `scope` 参数
+>     （`GetEntityPage` / `ListDirtyEntityPages` / `MarkEntityPageDirty` /
+>     `ApplyEntityPageRegen` / `RecordEntityPageRegenFailure`）；
+>     `page.Regenerator` 的 `RegenerateDirty` / `RegenerateOne` 也多一个视角参数；
+>   - `types.EntityPage` 新增 `Scope`；`types.AtomCard` 新增
+>     `ValidFrom` / `ValidTo` / `Version`；`types.JournalKind` 新增
+>     `page-dirty` / `vector-sync`；
+>   - `promotion.Verdict` 新增 `Actor` / `Superseded`；
+>     `promotion.Decision` 新增 `update`（取代）；
+>     `promotion.Config` 新增 `LLM` / `UpdateSimilarity` / `UpdateHintSimilarity`；
+>   - `recall.Config` 新增 `Semantic` / `Analyzer` / `Metrics`；
+>     `recall.Request` 新增 `OccurredFrom` / `OccurredTo` / `At`；
+>   - `ports.RankCandidate` 新增 `FusionScore`，`ports.RankWeights` 新增 `Fusion`；
+>     `ports.VectorIndex` 的 `Search` / `Upsert` 多了 `scope`；
+>   - `application.Deps` 新增 `Promotion` / `Embedder` / `VectorIndex`。
+>
+> **老库无需手工处理**：两个后端都有**幂等迁移**
+> （SQLite 重建表改主键，PG 改主键约束；v6 加持久化向量索引表），
+> 打开即升级。
 >
 > 实体页面改成**按归属分视角**（逻辑主键 `namespace + entity_id + scope`），
 > 故 `store.PageStore` 的六个方法都多了 `scope` 参数

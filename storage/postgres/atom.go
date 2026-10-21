@@ -241,7 +241,7 @@ func atomConditions(f store.AtomFilter, start int) (string, []any) {
 		start++
 		where = append(where, "(valid_to IS NULL OR $"+fmt.Sprint(start)+" < valid_to)")
 		args = append(args, ts(f.At))
-		start++
+		// 不再 start++：后面没有占位符了（这次自增没有用处在）。
 	}
 	return strings.Join(where, " AND "), args
 }

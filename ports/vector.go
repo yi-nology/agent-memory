@@ -301,12 +301,11 @@ func (r VectorSemanticReader) Search(ctx context.Context, namespace, query, scop
 	}
 	// 过取只为了补上**失效事实**占掉的槽位（索引里没有时间维度，
 	// 退役事实的向量可能还在）——归属已经在索引里过滤掉了，不该过取。
-	fetch := limit
 	over := r.OverFetch
 	if over <= 0 {
 		over = DefaultSemanticOverFetch
 	}
-	fetch = limit * over
+	fetch := limit * over
 	hits, err := r.Index.Search(ctx, namespace, scope, vec, fetch)
 	if err != nil {
 		return nil, err

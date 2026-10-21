@@ -85,7 +85,7 @@ const ServerName = "agent-memory"
 // ServerVersion 本端版本（initialize 的 serverInfo.version）。
 //
 // 本仓没有版本常量单源，故这里手写一处，跟随发布走。
-const ServerVersion = "0.6.0"
+const ServerVersion = "0.7.0"
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
