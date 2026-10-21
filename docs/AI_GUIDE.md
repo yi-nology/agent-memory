@@ -88,7 +88,7 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | schema 加列 | `storage/{sqlite,postgres}/schema.go` | `storage/{sqlite,postgres}/migrate.go` | 建表脚本**没有 ALTER**；迁移**必须幂等**；索引归迁移管 |
 | 排序口径（打分器） | `ports/rank.go` | `pipeline/recall/rank.go` + `recall.Config.Ranker` | 缺省**零漂移**（旧公式在测试里重写一遍当期望值） |
 | 模型调用/脱敏/防伪 | `ports/` | 注入它的 `application.Deps` | 新增第三方须登记 `allow_third_party` |
-| 向量化/向量索引 | `ports/index.go` | — | **reserved：当前无消费点**（别让后人照着它接线） |
+| 向量化/向量索引 | `ports/index.go` + `ports/vector.go` | `application/vector.go` + 两个存储后端（持久化索引） | **已接通**（有真的消费点）；语义强度归宿主、管线归内核 |
 | 分桶配额与丢弃计数 | `ports/budget.go` | `pipeline/recall/recall.go` | `BucketID` 是**字符串**，别改成枚举 |
 | 存储接口 | `store/store.go` | **两个后端 + `storage/parity/` 都要动** | 加接口方法 = parity 加断言，两个后端都真跑 |
 | 检索口径钉子 | `store/lexical.go` | 两个后端的索引/查询侧 | `LexicalTokens` / `FTS5Query` 是**单源**，别绕过 |
@@ -108,6 +108,7 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 生命周期 | `lifecycle/lifecycle.go` | — | 事实卡只软退役，不硬删 |
 | 迁移包格式 | `operations/portable/portable.go` | `oekit/pkg/pack` | 写面不换 pack：改了等于**改包格式**，已发布包导不回来 |
 | CLI 命令 | `adapters/cli/{cli,admin}.go` | — | `Run(args,stdout,stderr) int`，不是 `main()` |
+| 向量索引补算 | `adapters/cli/cli.go`（`memory reindex`） | `ports.HashEmbedder` + 存储的向量面 | 存量事实没有向量 → 语义轨等于失灵；补算是幂等的 |
 | 对外 RPC | `adapters/bridge/bridge.go` | `application.Service` | 方法名是 `memory.xxx` 白名单（现 8 个） |
 | 宿主接入 | `application/service.go` | `adapters/*` | 服务面**只做五件事**：capture/extract/promote/recall/search |
 | 依赖方向/豁免 | `architecture-policy.yaml` | `tools/archcheck/` | **policy 先行**；豁免缺字段**加载期即失败** |
@@ -340,7 +341,7 @@ cat architecture-policy.yaml
 | 限制 | 说明 |
 |---|---|
 | 领域词门禁是纯文本匹配 | 连解释禁词的那行注释都会拦；禁词不能出现在任何文本里 |
-| 向量索引默认关 | 上游自己标为「默认关闭、测试全 mock、真实集成未验证」 |
+| 向量轨默认不启用 | 不给 Embedder/VectorIndex 就不启用（召回逐条回到纯词面）；本仓自带的哈希嵌入**只捕捉词面软匹配**，不是语义相似度 |
 | 树（root/branch/leaf）暂不做 | 对运维域价值有限，等真出现「同一事实挂多锚点」再启 |
 | `checkpoint` 不下沉到记忆 | 它服务「续跑而非重放」，记忆服务「记住事实」 |
 | `pending` 不与活跃实体栈合并 | 表面都是跨轮状态，生命周期相反 |

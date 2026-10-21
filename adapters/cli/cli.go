@@ -217,6 +217,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return cmdQuery(ctx, stdout, stderr, q)
 	case "stats":
 		return cmdStats(ctx, opt, stdout, stderr)
+	case "reindex":
+		// 向量索引补算：存量事实没有向量时，语义轨等于失灵
+		//（索引里没有它们 → 语义路一条都捞不到）。
+		return cmdReindex(ctx, opt, stdout, stderr, *limit)
 	case "export":
 		return cmdExport(ctx, opt, stdout, stderr, *out)
 	case "import":
@@ -272,6 +276,7 @@ func usage(w io.Writer) {
   memory recall   <查询词> [--session S] [--thread T] [--limit N]
   memory search   <查询词> [--limit N]
   memory query    <问句>                        把一句问句翻成检索条件（诊断用，不入库）
+  memory reindex  [--limit N]                   给存量事实补算向量（语义轨缺它就失灵）
   memory stats
   memory export   --out <包路径>
   memory import   --pkg <包路径>
@@ -461,10 +466,17 @@ func open(ctx context.Context, opt Options) (*application.Service, *sqlite.Store
 		Host:      opt.Host,
 		Recall:    recall.DefaultConfig(),
 	}, application.Deps{
-		Store:    st,
+		Store: st,
+		// 脱敏与防伪是**必需**依赖（缺了就是事故），故这里给的是真实现。
 		Redactor: ports.PatternRedactor{},
 		Bander:   ports.MemoryBand{},
 		LLM:      model,
+		// 向量轨：CLI 用**零依赖**的哈希嵌入（不用模型），
+		// 索引由存储自己提供（跟着记忆库一起活）。
+		//
+		// 它捕捉的是词面软匹配，**不是语义相似度**——
+		// 命令行这一档要的是「能跑、零外部依赖」，不是「效果最好」。
+		Embedder: ports.HashEmbedder{},
 	})
 	if err != nil {
 		_ = st.Close()
@@ -578,6 +590,55 @@ func cmdStats(ctx context.Context, opt Options, stdout, stderr io.Writer) int {
 	}
 	b, _ := json.MarshalIndent(s, "", "  ")
 	fmt.Fprintln(stdout, string(b))
+	return 0
+}
+
+// cmdReindex 给存量事实补算向量。
+//
+// # 为什么需要它
+//
+// 向量是**写路径**产生的：晋升成事实时顺手写一条。
+// 于是**存量**事实（写路径接上之前入库的）没有向量——
+// 而语义召回靠的是索引，索引里没有它们，就一条都捞不到。
+// 症状是「语义轨像是没生效」，而查不出原因（因为它确实在跑，只是索引是空的）。
+//
+// # 它是幂等的
+//
+// 按事实卡 ID 覆盖写：跑第二遍结果一样。
+func cmdReindex(ctx context.Context, opt Options, stdout, stderr io.Writer, limit int) int {
+	_, st, err := open(ctx, opt)
+	if err != nil {
+		fmt.Fprintln(stderr, "打开失败:", err)
+		return 1
+	}
+	defer func() { _ = st.Close() }()
+	// 经接口断言取能力：后端**可能**没有向量索引面（那是可选能力，不是必需依赖）。
+	var cap any = st
+	vi, ok := cap.(ports.VectorIndex)
+	if !ok {
+		fmt.Fprintln(stderr, "这个后端没有向量索引面，补算不了")
+		return 1
+	}
+	emb := ports.HashEmbedder{}
+	atoms, err := st.ListAtoms(ctx, store.Namespace(opt.Namespace), store.AtomFilter{Limit: limit})
+	if err != nil {
+		fmt.Fprintln(stderr, "取事实卡失败:", err)
+		return 1
+	}
+	n := 0
+	for _, a := range atoms {
+		vec, err := emb.Embed(ctx, a.Assertion)
+		if err != nil {
+			fmt.Fprintln(stderr, "向量化失败:", err)
+			return 1
+		}
+		if err := vi.Upsert(ctx, string(store.Namespace(opt.Namespace)), a.ID, string(a.Scope), vec); err != nil {
+			fmt.Fprintln(stderr, "写向量失败:", err)
+			return 1
+		}
+		n++
+	}
+	fmt.Fprintf(stdout, "已补算 %d 条事实的向量\n", n)
 	return 0
 }
 
