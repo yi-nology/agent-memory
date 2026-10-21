@@ -15,7 +15,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
     └──episode extraction──→ Episode
 ```
 
-## 现在有什么（v0.7.0）
+## 现在有什么（v0.8.0）
 
 | 面 | 状态 | 位置 |
 |---|---|---|
@@ -51,6 +51,18 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 > `application.Service.Search` 改成吃 `store.AtomFilter`。
 > 下游跟着改的清单见 issue #10 / #11 的回写与 tag 的发布说明。
 
+> **v0.8.0 含破坏性变更**（下游要改的清单，逐条列全）：
+>
+>   - `store.AtomStore` 新增 `SearchAtomsLoose`（**宽松**词面检索：命中任一词）。
+>     实现召回链的宿主要跟着实现它；
+>     `recall.Reader` 也多了这个方法（自造召回器的宿主同样要加）。
+>   - `store.AtomFilter` 新增 `EventSince`（事件类事实的默认召回窗口下界；
+>     零值=不限）。
+>   - `types.AtomCard` 新增 `Kind`（事实的时效类别：短期事件 / 有效期状态 / 长期经验；
+>     零值=按长期经验处理 ⇒ **老数据语义不变**）。
+>   - `lifecycle` 新增 `Expire`（按龄退役事件类事实）与 `WithEventRetention`。
+>   - `recall.Config` 新增 `EventWindow`（事件类事实的默认召回窗口，缺省 30 天）。
+>
 > **v0.7.0 含破坏性变更**（下游要改的清单，逐条列全）：
 >
 >   - `store.AtomFilter` 新增 `IDs`（按标识集合取，多路融合后一次取回）与
