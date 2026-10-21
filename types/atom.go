@@ -108,6 +108,15 @@ type AtomCard struct {
 	// 而只软退役（SupersededBy）的话，旧事实只会变成「查得到但不算数」，
 	// 追问「当初为什么这么判」时反而丢了它**什么时候对过**这个信息。
 	ValidTo time.Time
+	// Kind 时效类别（零值=按长期经验处理）。
+	//
+	// 它决定两件事：**保留期**（事件按龄退役、经验永久）与
+	// **召回窗口**（事件默认只看近期，否则模型会把三周前的一次重启
+	// 当成当前状态）。
+	//
+	// 零值=默认（长期经验）是最保守的一侧：既有事实卡没有这个维度，
+	// 升级不该让它们开始被淘汰。详见 FactKind。
+	Kind FactKind
 	// Version 版本号（同一主体 + 谓词的第几版；1 起）。
 	//
 	// 零值当 1。版本号的作用不是排序，而是**溯源**：
@@ -213,3 +222,49 @@ func AtomSignature(entityID string, scope Scope, assertion string) string {
 	}
 	return entityID + SignatureSep + string(scope) + SignatureSep + norm
 }
+
+// FactKind 事实的**时效类别**。
+//
+// # 为什么要有这个维度
+//
+// 同一件事，三类的生命周期完全不同，而**一套策略套所有事实**必然两头不讨好：
+//
+//   - 短期事件（FactEvent）：发生过一次的事（「昨天重启过一次」）。
+//     它会**过期**：过了保留期就没有召回价值——留着只会占预算、还会误导
+//     （模型看到三周前的一次重启，会当成当前状态）。
+//   - 有效期状态（FactState）：现在成立的属性（「容量是 2G」）。
+//     它**被新值取代**而不是过期（取代链已经能表达这件事，见 AtomCard.ValidTo）。
+//   - 长期经验（FactLesson）：稳定的知识与教训。
+//     它**不因时间失效**——只在被推翻时失效。
+//
+// 有了这个维度，保留期与召回窗口才能**按类分别配**：
+// 事件按龄退役，状态等到被取代，经验永久保留。
+//
+// # 零值 = 默认（按长期经验处理）
+//
+// 既有事实卡没有这个维度 ⇒ 零值必须落在**最保守**的一类：
+// 长期经验（不因时间被淘汰、也不被默认召回窗口挡掉）。
+// 零值落到「会被淘汰」的那一类，等于升级一次就丢一批老事实。
+type FactKind string
+
+const (
+	// FactDefault 零值：按长期经验处理。
+	FactDefault FactKind = ""
+	// FactEvent 短期事件：发生过一次的事，会过期。
+	FactEvent FactKind = "event"
+	// FactState 有效期状态：现在成立的属性，被新值取代。
+	FactState FactKind = "state"
+	// FactLesson 长期经验：稳定的知识与教训。
+	FactLesson FactKind = "lesson"
+)
+
+// IsEvent 是否是短期事件。
+func (k FactKind) IsEvent() bool { return k == FactEvent }
+
+// IsState 是否是有效期状态。
+func (k FactKind) IsState() bool { return k == FactState }
+
+// Durable 是否不按时间失效（长期经验与状态）。
+//
+// 零值（默认）落在 durable 一侧——理由见 FactKind 的说明。
+func (k FactKind) Durable() bool { return !k.IsEvent() }
