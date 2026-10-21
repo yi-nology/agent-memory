@@ -10,6 +10,7 @@ import (
 	"github.com/yi-nology/agent-memory/pipeline/entity"
 	"github.com/yi-nology/agent-memory/pipeline/recall"
 	"github.com/yi-nology/agent-memory/ports"
+	"github.com/yi-nology/agent-memory/storage/sqlite"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
 )
@@ -170,6 +171,86 @@ func TestVectorTrackAddsWhatLexicalMissed(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("语义路应把词面路漏掉的事实补进来: %+v", out.Snippets)
+	}
+}
+
+// vectorStoreFake 自己就是向量索引的存储。
+//
+// 模拟的是「存储层实现了 ports.VectorIndex」那种形状
+// （向量轨跟着记忆库一起活，进程一退索引不该消失）。
+type vectorStoreFake struct {
+	*sqlite.Store
+	ix *ports.MemIndex
+}
+
+func (v vectorStoreFake) Upsert(ctx context.Context, ns, id, scope string, vec []float32) error {
+	return v.ix.Upsert(ctx, ns, id, scope, vec)
+}
+
+func (v vectorStoreFake) Search(ctx context.Context, ns, scope string, vec []float32,
+	topK int) ([]ports.VectorHit, error) {
+	return v.ix.Search(ctx, ns, scope, vec, topK)
+}
+
+func (v vectorStoreFake) Delete(ctx context.Context, ns, id string) error {
+	return v.ix.Delete(ctx, ns, id)
+}
+
+// TestVectorIndexDiscoveredFromStore 存储自己就是向量索引时，装配面要能**发现**它。
+//
+// 为什么要发现而不是要求宿主显式传：
+// 宿主传的是「用哪个索引」，而存储自带的那个是最省心的选择
+// （向量跟着记忆库一起活，进程一退索引不消失）。
+// 要求宿主显式传一遍，等于让每家宿主都多写一行、且多数会忘。
+func TestVectorIndexDiscoveredFromStore(t *testing.T) {
+	ctx := context.Background()
+	base := openFresh(t)
+	ix := ports.NewMemIndex()
+	s := vectorStoreFake{Store: base, ix: ix}
+	llm := fakeLLM{
+		extract: `[{"assertion":"机器甲的存储空间不足","quote":"机器甲的存储空间不足",` +
+			`"event_id":"ev1","type":"fact","subject_name":"机器甲",` +
+			`"importance":"low","confidence":"high"}]`,
+	}
+	// 只给向量化器，**不给**索引：索引应当从存储身上发现。
+	svc, err := application.New(
+		application.Config{Namespace: ns, Host: "it"},
+		application.Deps{
+			Store: s, Redactor: ports.PatternRedactor{}, Bander: ports.MemoryBand{}, LLM: llm,
+			Embedder: synonymEmbedder{},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap, err := svc.Capture(ctx, application.CaptureInput{
+		EventID: "ev1", Type: types.EventTurnEnd,
+		Content: "机器甲的存储空间不足，需要清理", SessionID: "s1", ThreadID: "t1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cands, err := svc.Extract(ctx, ns, "s1", []*types.RawEvent{cap.Event})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCandidate(ctx, ns, cands[0]); err != nil {
+		t.Fatal(err)
+	}
+	er, err := entity.New(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := er.Register(ctx, ns, "机器甲", types.EntityType("service"), "那台研发机",
+		types.DecidedUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Promote(ctx, ns, cands[0]); err != nil {
+		t.Fatal(err)
+	}
+	// 晋升后向量写进了「存储自带」的那个索引。
+	if ix.Count(string(ns)) != 1 {
+		t.Fatalf("向量应写进存储自带的索引: %d", ix.Count(string(ns)))
 	}
 }
 

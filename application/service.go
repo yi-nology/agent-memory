@@ -114,20 +114,33 @@ func New(cfg Config, deps Deps) (*Service, error) {
 	// （保留期、运行期错误批量退役、合并……）——
 	// 不必指望每条路径都记得去删。
 	st := deps.Store
-	if deps.VectorIndex != nil {
-		st = vectorStore{Store: deps.Store, idx: deps.VectorIndex}
-	}
 	promo, err := promotion.New(promoStore{st}, deps.Escalation, promoCfg)
 	if err != nil {
 		return nil, err
 	}
+	// 向量索引：宿主显式给了就用宿主的；
+	// 没给而**存储自己实现了向量索引**（存储层实现 ports.VectorIndex）就用存储的——
+	// 那样向量轨跟着记忆库一起活（进程一退，内存索引就没了，
+	// 语义召回随之失效，等于这条轨白装）。
+	vecIdx := deps.VectorIndex
+	if vecIdx == nil {
+		if vi, ok := st.(ports.VectorIndex); ok {
+			vecIdx = vi
+		}
+	}
+	// 存储自己就是向量索引时，包一层：事实退役时同步删掉它的向量。
+	if vecIdx != nil {
+		if _, already := st.(vectorStore); !already {
+			st = vectorStore{Store: st, idx: vecIdx}
+		}
+	}
 	// 语义召回面：宿主显式配了 Semantic 就以宿主为准；
 	// 否则在给了向量化器与索引时自动装上「内核自带的向量轨」。
 	recallCfg := cfg.Recall
-	if recallCfg.Semantic == nil && deps.Embedder != nil && deps.VectorIndex != nil {
+	if recallCfg.Semantic == nil && deps.Embedder != nil && vecIdx != nil {
 		recallCfg.Semantic = ports.VectorSemanticReader{
 			Embedder: deps.Embedder,
-			Index:    deps.VectorIndex,
+			Index:    vecIdx,
 		}
 	}
 	rec, err := recall.New(recallCfg, st, deps.Estimator, deps.Bander)
@@ -142,7 +155,7 @@ func New(cfg Config, deps Deps) (*Service, error) {
 		promo:    promo,
 		rec:      rec,
 		embedder: deps.Embedder,
-		vecIdx:   deps.VectorIndex,
+		vecIdx:   vecIdx,
 		now:      func() time.Time { return time.Now().UTC() },
 	}, nil
 }
