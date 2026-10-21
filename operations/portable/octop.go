@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/yi-nology/agent-memory/store"
@@ -31,18 +30,37 @@ import (
 // occurred_at / confidence / importance …）——同一设计的两个实现，
 // 本仓是超集（多 scope / kind / valid_from / valid_to / version）。
 //
-// ⇒ 互通要补的只有三样：**信封**、**表名**、**键名**。
+// ⇒ 互通要补的有三样：**信封**、**表名**、**字段名与取值**。
 //
-// # 字段映射表（契约）
+// # 字段映射表（契约）——**逐字段对照**，不是机械翻译
 //
-// 两侧的记录体字段**几乎逐字段一致**（同一设计的两个实现）✓，
-// 本仓是**超集** ✓ ⇒ 键名翻译是**机械规则** ✓，不是逐字段手抄 ✓：
+// ⚠️ **原先这里是机械翻译**（Go 字段名 → snake_case ✓），
+// 看上去两侧就通了 ✓——**但那是假的通** ✓。
+// 两侧的模型是「同一个设计的两个实现」✓，**不是同一个模型** ✓，
+// 有一批字段**两边的名字本来就不一样** ✓。
 //
-//	Go 字段名 → snake_case：按大写边界切词，连续大写算一个词（ID / URL…）
-//	snake_case → Go 字段名：按 "_" 切 + 首字母大写 + 缩写还原（id → ID）
+// 对照的来源是对方仓库的**源码** ✓（不是文档、不是推测 ✓）：
+//   `src/octop_memory/types.py`（dataclass 字段名 = 对方的导出面 ✓）
+//   `src/octop_memory/operations/migration/import_.py`（`_build_*` = 对方的读入面 ✓）
 //
-// 例：ID → id、EntityID → entity_id、QuoteEventID → quote_event_id、
-// RawEventIDs → raw_event_ids、OccurredAt → occurred_at ✓。
+// 名字对不上的那几处：
+//
+//	本仓 Type     ↔ octop event_type       （raw_events）
+//	本仓 Type     ↔ octop candidate_type   （candidates）
+//	本仓 Body     ↔ octop summary_markdown （entity_pages）
+//	本仓 AtomIDs  ↔ octop topics           （entity_pages）
+//	本仓 At       ↔ octop timestamp        （journal）
+//	本仓 Kind     ↔ octop action           （journal）
+//	本仓 Summary  ↔ octop note             （journal）
+//
+// ⚠️ 而对方的读端是**按名字取**的 ✓（`d["event_type"]` ✓），
+// 取不到就抛 `missing required field` ✓ ⇒ **那一整张表都导不进去** ✓。
+//
+// ⚠️ 更糟的是它**不响** ✓：对方的导入器把这类错误收进 summary.errors ✓
+// 然后 `continue` ✓ ⇒ 宿主看到的是「导入成功，0 条」✓。
+//
+// ⇒ 所以这一层是**逐字段对照出来的** ✓（见 octopmap.go ✓），
+// 并且导出时**自检对方必填的字段** ✓（缺一个就在本仓这边先红 ✓）。
 //
 // **表名**对照（octop 8 张 ↔ 本仓 9 类）：
 //
@@ -60,9 +78,13 @@ import (
 // 反过来从 octop 读入时，这些字段取零值 ✓（= 全局 / 默认类别 / 无区间）✓
 // —— 即「老数据语义不变」那条纪律在跨仓时同样成立 ✓。
 //
+// ⚠️⚠️ **带归属的记录不导出**（scope ≠ 空 ⇒ 整条跳过 ✓）：
+// 归属在对方那边**没有对应字段** ✓ ⇒ 导过去就变成**全局可见** ✓
+// ⇒ 那是**内容泄漏** ✓，不是「少了个字段」✓ ⇒ 宁可少，不可漏 ✓。
+//
 // ⚠️ **键名对不上的失效形态**：Go 的 json.Unmarshal 找不到对应字段时
 // **静默丢掉**那个键 ⇒ 「导入成功但内容全空」✓，极难归因 ✓。
-// 故这里做**显式翻译** ✓，而不是指望对方迁就本仓的 Go 字段名 ✓。
+// 故这里做**显式对照** ✓，而不是指望对方迁就本仓的 Go 字段名 ✓。
 //
 // # 键名为什么也要补
 //
@@ -110,6 +132,14 @@ type OctopManifest struct {
 	SchemaVersion   string         `json:"schema_version"`
 	RowCounts       map[string]int `json:"row_counts"`
 	TotalRows       int            `json:"total_rows"`
+	// SkippedScoped 因带归属而**没有导出**的记录条数。
+	//
+	// 为什么要有这一栏：带归属的记录在 octop 那边**没有对应字段** ✓
+	// ⇒ 导过去就变成全局可见 ✓ ⇒ 那是**内容泄漏** ✓ ⇒ 所以不导 ✓。
+	//
+	// ⚠️ 但「不导」必须**看得见** ✓ —— 不然宿主看到的是
+	// 「导出成功、少了几条」✓，而它并不知道少的是哪几条、为什么少 ✓。
+	SkippedScoped int `json:"skipped_scoped,omitempty"`
 }
 
 // octopTableNames 表名映射：本仓的每类记录 → octop 侧的表名。
@@ -209,10 +239,18 @@ func ExportOctop(ctx context.Context, src Source, ns store.Namespace, w io.Write
 
 	counts := map[string]int{}
 	total := 0
+	skippedScoped := 0
 	for _, t := range octopTableNames {
 		rows, err := t.Export(ctx, src, ns)
 		if err != nil {
 			return nil, err
+		}
+		spec, ok := octopTables[t.Octop]
+		if !ok {
+			// 契约里没有的表 ⇒ 不导出（而不是原样塞过去 ✓）。
+			// 原样塞过去的后果是「对方按名字取、取不到 ⇒ 整表跳过」✓，
+			// 而宿主看到的是「导入成功、0 条」✓ ⇒ 静默 ✓。
+			continue
 		}
 		for _, row := range rows {
 			body, err := json.Marshal(row)
@@ -223,11 +261,25 @@ func ExportOctop(ctx context.Context, src Source, ns store.Namespace, w io.Write
 			if err := json.Unmarshal(body, &m); err != nil {
 				return nil, fmt.Errorf("portable: 解析 %s 记录失败: %w", t.Go, err)
 			}
-			// 键名翻译：Go 字段名 → snake_case。
+			// 键名与取值：走**逐字段对照**出来的契约 ✓（octopmap.go ✓），
+			// 不是机械翻译 ✓ —— 两边的模型不是同一个模型 ✓。
+			data, keep := spec.To(m)
+			if !keep {
+				// 带归属的记录不导出 ✓（导出去会变成全局可见 = 泄漏 ✓）。
+				// 但要**记账** ✓ —— 不然宿主不知道少了几条、也不知道为什么 ✓。
+				skippedScoped++
+				continue
+			}
+			// 自检：对方必填的字段缺一个 ⇒ 那一整表在对方那边都导不进去 ✓。
+			// ⇒ 在**本仓这边**先红 ✓，而不是等对方那边「导入成功但 0 条」✓。
+			if missing := checkOctopRequired(t.Octop, data); len(missing) > 0 {
+				return nil, fmt.Errorf("portable: %s 记录缺对方必填字段 %v（导出会在对方那边整表失败）",
+					t.Octop, missing)
+			}
 			env := map[string]any{
 				"v":     OctopExportVersion,
 				"table": t.Octop,
-				"data":  toSnakeKeys(m),
+				"data":  data,
 			}
 			line, err := json.Marshal(env)
 			if err != nil {
@@ -244,16 +296,31 @@ func ExportOctop(ctx context.Context, src Source, ns store.Namespace, w io.Write
 		return nil, fmt.Errorf("portable: 关闭 gzip 失败: %w", err)
 	}
 
+	// 打包时刻：优先用注入的时钟 ✓。
+	//
+	// 为什么必须可注入：黄金样本（跨仓对账用的那个固定包 ✓）
+	// 要求**逐字节可复现** ✓ —— 而清单里带着真实时钟的话，
+	// 每导一次就差一行 ⇒ 那个包每次都在变 ⇒ 「固定样本」名不副实 ✓。
+	//
+	// ⚠️ 这里原先直接用 time.Now()，而原生布局的导出（Export ✓）
+	// 用的是注入时钟（opt.Now ✓）—— 同一条链上两套口径，
+	// 于是「导出可复现」这条性质只对一半的布局成立 ✗。
+	packedAt := opt.Now
+	if packedAt.IsZero() {
+		packedAt = time.Now()
+	}
+
 	man := &OctopManifest{
 		PkgVersion:      OctopPkgVersion,
 		ExportVersion:   OctopExportVersion,
 		SourceHostKind:  "agent-memory",
 		SourceNamespace: string(ns),
 		AgentName:       opt.Host,
-		PackedAt:        time.Now().UTC().Format(time.RFC3339),
+		PackedAt:        packedAt.UTC().Format(time.RFC3339),
 		ToolVersion:     "agent-memory/operations/portable",
 		RowCounts:       counts,
 		TotalRows:       total,
+		SkippedScoped:   skippedScoped,
 	}
 	blob, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -369,7 +436,22 @@ func importOctopRow(ctx context.Context, table string, data json.RawMessage, tgt
 	if err := json.Unmarshal(data, &m); err != nil {
 		return 0, fmt.Errorf("portable: 解析 %s 记录失败: %w", table, err)
 	}
-	body, err := json.Marshal(toPascalKeys(m))
+	// 键名与取值：走**逐字段对照**出来的契约 ✓（octopmap.go ✓）。
+	//
+	// ⚠️ 原先这里是机械翻译（snake_case → PascalCase ✓），
+	// 而两边的模型**不是同一个模型** ✓ ⇒ 有一批字段翻译过去就找不到 ✓
+	// （`event_type` → `EventType` ≠ 本仓的 `Type` ✓）⇒ 那条记录的内容就丢了 ✓，
+	// 而症状是「导入成功、内容为空」✓。
+	spec, ok := octopTables[table]
+	if !ok {
+		// 不认识的表：跳过，不报错。
+		//
+		// 理由：本仓比 octop 多的两类（episodes / digests）、
+		// 以及未来对方新增的表，都不该让**整包导入失败**——
+		// 丢一表好过丢一整包。
+		return 0, nil
+	}
+	body, err := json.Marshal(spec.From(m))
 	if err != nil {
 		return 0, fmt.Errorf("portable: 序列化 %s 记录失败: %w", table, err)
 	}
@@ -417,124 +499,8 @@ func importOctopRow(ctx context.Context, table string, data json.RawMessage, tgt
 		}
 		return 1, tgt.AppendJournal(ctx, ns, &v)
 	default:
-		// 不认识的表：跳过，不报错。
-		//
-		// 理由：本仓比 octop 多的两类（episodes / digests）、
-		// 以及未来对方新增的表，都不该让**整包导入失败**——
-		// 丢一表好过丢一整包。
+		// 上面已按契约表拦掉了不认识的表 ✓ ⇒ 这里到不了 ✓。
+		// 保留分支是为了「将来加了新表但忘了写转换器」时不至于崩 ✓。
 		return 0, nil
 	}
-}
-
-// acronyms 缩写还原表（snake → Go 字段名时用）。
-var acronyms = map[string]string{
-	"id":    "ID",
-	"ids":   "IDs",
-	"url":   "URL",
-	"uuid":  "UUID",
-	"jsonl": "JSONL",
-}
-
-// toSnakeKeys 把 map 的键从 Go 字段名翻成 snake_case（递归）。
-func toSnakeKeys(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[snakeCase(k)] = toSnakeValue(v)
-	}
-	return out
-}
-
-// toSnakeValue 递归翻译嵌套结构里的键。
-func toSnakeValue(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		return toSnakeKeys(t)
-	case []any:
-		out := make([]any, len(t))
-		for i, e := range t {
-			out[i] = toSnakeValue(e)
-		}
-		return out
-	default:
-		return v
-	}
-}
-
-// toPascalKeys 把 map 的键从 snake_case 翻回 Go 字段名（递归）。
-func toPascalKeys(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[pascalCase(k)] = toPascalValue(v)
-	}
-	return out
-}
-
-// toPascalValue 递归翻译嵌套结构里的键。
-func toPascalValue(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		return toPascalKeys(t)
-	case []any:
-		out := make([]any, len(t))
-		for i, e := range t {
-			out[i] = toPascalValue(e)
-		}
-		return out
-	default:
-		return v
-	}
-}
-
-// snakeCase Go 字段名 → snake_case。
-//
-// 切词规则：连续大写算**一个**词（ID / URL），
-// 其余按「大写前」与「小写→大写」两处边界切。
-// 例：QuoteEventID → quote_event_id ✓；EntityID → entity_id ✓。
-func snakeCase(name string) string {
-	var words []string
-	runes := []rune(name)
-	start := 0
-	for i := 1; i < len(runes); i++ {
-		prev, cur := runes[i-1], runes[i]
-		boundary := false
-		switch {
-		case cur >= 'A' && cur <= 'Z' && prev >= 'a' && prev <= 'z':
-			// 小写→大写：小写结尾的词结束。
-			boundary = true
-		case cur >= 'A' && cur <= 'Z' && prev >= 'A' && prev <= 'Z' &&
-			i+1 < len(runes) && runes[i+1] >= 'a' && runes[i+1] <= 'z':
-			// 大写串的**最后一个**大写属于下一个词（ID → I | D）。
-			boundary = true
-		}
-		if boundary {
-			words = append(words, string(runes[start:i]))
-			start = i
-		}
-	}
-	words = append(words, string(runes[start:]))
-	lower := make([]string, 0, len(words))
-	for _, w := range words {
-		lower = append(lower, strings.ToLower(w))
-	}
-	return strings.Join(lower, "_")
-}
-
-// pascalCase snake_case → Go 字段名。
-//
-// 缩写按 acronyms 表还原（id → ID ✓），其余首字母大写 ✓。
-func pascalCase(key string) string {
-	parts := strings.Split(key, "_")
-	var b strings.Builder
-	for _, p := range parts {
-		if p == "" {
-			continue
-		}
-		if ac, ok := acronyms[p]; ok {
-			b.WriteString(ac)
-			continue
-		}
-		b.WriteString(strings.ToUpper(p[:1]))
-		b.WriteString(p[1:])
-	}
-	return b.String()
 }

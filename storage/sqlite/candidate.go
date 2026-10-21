@@ -117,7 +117,11 @@ func (s *candidateStore) ListCandidates(ctx context.Context, ns store.Namespace,
 		args = append(args, f.Session)
 	}
 	q := `SELECT ` + candidateCols + ` FROM candidates WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY created_at DESC LIMIT ?`
+		// 排序要有**全序** ✓：只按 created_at 排的话，
+		// 同一时刻建的候选先后不定 ⇒ 导出出来的包逐次不同 ✓
+		// ⇒ 跨仓对账用的黄金样本就没法固定 ✓。
+		// 兜底键与 ListRaw 的 `ts DESC, id DESC` 同款 ✓。
+		` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limitOf(f.Limit, 50))
 
 	rows, err := s.query(ctx, q, args...)

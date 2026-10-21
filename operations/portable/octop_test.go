@@ -45,7 +45,7 @@ func octopSeed(t *testing.T, path string) *sqlite.Store {
 		t.Fatal(err)
 	}
 	if err := s.SaveAtom(ctx, ns, &types.AtomCard{
-		ID: "a1", EntityID: "e1", Scope: "team-a", Assertion: "机器甲的磁盘长期偏小",
+		ID: "a1", EntityID: "e1", Assertion: "机器甲的磁盘长期偏小",
 		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
 		SearchTerms: []string{"磁盘", "偏小"},
 		Importance:  types.ImportanceHigh, Confidence: types.ConfidenceHigh,
@@ -186,8 +186,8 @@ func TestExportOctopRoundTripsThroughOctopLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 契约覆盖的字段：逐个对上。
 	if got.Assertion != want.Assertion || got.EntityID != want.EntityID ||
-		got.Scope != want.Scope || got.Kind != want.Kind ||
 		got.QuoteEventID != want.QuoteEventID ||
 		got.Importance != want.Importance || got.Confidence != want.Confidence {
 		t.Fatalf("往返后字段不一致:\n got=%+v\nwant=%+v", got, want)
@@ -198,6 +198,27 @@ func TestExportOctopRoundTripsThroughOctopLayout(t *testing.T) {
 	if !got.OccurredAt.Equal(want.OccurredAt) {
 		t.Fatalf("往返后时刻不一致: %v vs %v", got.OccurredAt, want.OccurredAt)
 	}
+	if len(got.SearchTerms) != len(want.SearchTerms) {
+		t.Fatalf("往返后检索词不一致: %v vs %v", got.SearchTerms, want.SearchTerms)
+	}
+	// 对方**没有对应字段**的那些：必须落在**安全的一侧** ✓。
+	//
+	// ⚠️ 这不是「弱化断言」✓，是断言**该丢的确实丢了、且丢在安全侧** ✓：
+	//   scope       → 空 = 全局（对方没有归属字段 ✓，带过去就是泄漏 ✓）
+	//   kind        → 空 = 长期经验（**不淘汰**的那一类 ✓，见 types.FactKind ✓）
+	//   valid_from  → 空 = 无区间（不因时效被排除 ✓）
+	//
+	// 零值落在「保守」那一侧 ✓ 是本仓的既有纪律 ✓
+	// （「误命中方向决定代价」✓：宁可多留着，不可误淘汰 ✓）。
+	if got.Scope != "" {
+		t.Errorf("归属不该被带过去（带过去会变成全局可见）: %q", got.Scope)
+	}
+	if got.Kind != types.FactDefault {
+		t.Errorf("事实类别对方没有 ⇒ 应落回缺省（长期经验、不淘汰）: %q", got.Kind)
+	}
+	if !got.ValidFrom.IsZero() || !got.ValidTo.IsZero() {
+		t.Errorf("生效区间对方没有 ⇒ 应为零值: %v ~ %v", got.ValidFrom, got.ValidTo)
+	}
 }
 
 // keysOf 取 map 的键（报错信息用）。
@@ -205,6 +226,89 @@ func keysOf(m map[string]any) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
+	}
+	return out
+}
+
+// 带归属的记录**不导出**，且要**记账**。
+//
+// 为什么：不导就会变成全局可见 ⇒ 内容泄漏；
+// 而不记账，宿主就只看到「导出成功、少了几条」，却不知道少的是什么。
+func TestExportOctopSkipsScopedRecords(t *testing.T) {
+	dir := t.TempDir()
+	src := octopSeed(t, filepath.Join(dir, "src.sqlite"))
+	defer func() { _ = src.Close() }()
+	ctx := context.Background()
+	ns := store.Namespace("interop")
+
+	// 加一条带归属的事实卡。
+	if err := src.SaveAtom(ctx, ns, &types.AtomCard{
+		ID: "a-scoped", EntityID: "e1", Scope: "team-a", Assertion: "只属于 team-a 的事实",
+		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+		Importance: types.ImportanceHigh, Confidence: types.ConfidenceHigh,
+		OccurredAt: now(), CreatedAt: now(), UpdatedAt: now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pkg := filepath.Join(dir, "out.hmpkg")
+	man, err := portable.ExportOctopFile(ctx, src, ns, pkg, portable.ExportOptions{Host: "interop-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if man.SkippedScoped != 1 {
+		t.Fatalf("应记账 1 条被跳过的带归属记录，实际 %d", man.SkippedScoped)
+	}
+	// 种子里有：1 事件 + 1 实体 + 1 事实卡（全局）+ 1 事实卡（带归属，跳过）✓
+	// ⇒ 包里是 3 条 ✓（带归属那条不进包 ✓）。
+	if man.TotalRows != 3 {
+		t.Fatalf("包里的记录数应是 3（不含被跳过的），实际 %d", man.TotalRows)
+	}
+
+	// 包里**不该**出现那条带归属的事实。
+	data := readOctopRows(t, pkg)
+	for _, rec := range data {
+		if rec["table"] == "atoms" {
+			if id, _ := rec["data"].(map[string]any)["id"].(string); id == "a-scoped" {
+				t.Fatal("带归属的事实卡不该出现在包里：导过去会变成全局可见")
+			}
+		}
+	}
+}
+
+// readOctopRows 读包里的记录行（信封展开成 table + data）。
+func readOctopRows(t *testing.T, pkg string) []map[string]any {
+	t.Helper()
+	zr, err := zip.OpenReader(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = zr.Close() }()
+	var out []map[string]any
+	for _, f := range zr.File {
+		if f.Name != "data.jsonl.gz" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		gz, err := gzip.NewReader(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec := json.NewDecoder(gz)
+		for {
+			var row map[string]any
+			if err := dec.Decode(&row); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, row)
+		}
+		_ = gz.Close()
+		_ = rc.Close()
 	}
 	return out
 }
