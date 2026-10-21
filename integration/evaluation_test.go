@@ -40,6 +40,23 @@ type evalRetriever struct {
 
 // Recall 跑一次真召回，返回事实卡 ID（按召回次序）。
 func (r evalRetriever) Recall(ctx context.Context, c evaluation.Case) ([]string, error) {
+	got, err := r.RecallTokenized(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(got))
+	for _, g := range got {
+		out = append(out, g.ID)
+	}
+	return out, nil
+}
+
+// RecallTokenized 同 Recall，但带 token 数与正文。
+//
+// 带 token 与正文是**为了能量化效率**：token 效率这个指标只在
+// 「知道每条内容多大」时才算得出；正文则供回答器用
+// （给标识等于让模型自己猜库里有什么）。
+func (r evalRetriever) RecallTokenized(ctx context.Context, c evaluation.Case) ([]evaluation.Retrieved, error) {
 	res, err := r.p.Recall(ctx, recall.Request{
 		Namespace: r.ns, Query: c.Query, Scope: c.Scope,
 		Entities: c.Entities, SessionID: c.SessionID, ThreadID: c.ThreadID,
@@ -47,12 +64,17 @@ func (r evalRetriever) Recall(ctx context.Context, c evaluation.Case) ([]string,
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(res.Snippets))
+	out := make([]evaluation.Retrieved, 0, len(res.Snippets))
 	for _, s := range res.Snippets {
 		// 只算事实卡：画像与原始事件不是「相关事实」这个标注空间里的东西。
-		if s.Source == recall.SourceAtom {
-			out = append(out, s.RefID)
+		if s.Source != recall.SourceAtom {
+			continue
 		}
+		out = append(out, evaluation.Retrieved{
+			ID:     s.RefID,
+			Tokens: s.Tokens,
+			Text:   ports.UnbandMemory(s.Body),
+		})
 	}
 	return out, nil
 }

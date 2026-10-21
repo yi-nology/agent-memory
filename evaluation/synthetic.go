@@ -44,7 +44,13 @@ var synthScopes = []types.Scope{"", "sc-a", "sc-b"}
 type SyntheticSet struct {
 	// Dataset 用例集。
 	Dataset Dataset
-	facts   []*types.AtomCard
+	// QA 同一份语料的**问答视图**。
+	//
+	// 刻意是同一份语料、同一批用例：这样检索口径与问答口径的数字
+	// 可以**并排看**（同一批查询，检索指标多少、上下文够不够答），
+	// 而不是两套不相干的数据集各说各话。
+	QA    QADataset
+	facts []*types.AtomCard
 }
 
 // Facts 返回这份数据集配套的事实卡（供召回器灌库）。
@@ -104,6 +110,7 @@ func NewSynthetic(seed int64, n int) *SyntheticSet {
 
 	set := &SyntheticSet{}
 	ds := Dataset{Name: fmt.Sprintf("synthetic(seed=%d,cases=%d)", seed, n)}
+	qa := QADataset{Name: fmt.Sprintf("synthetic-qa(seed=%d,cases=%d)", seed, n)}
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// 词元发放器：词表里的词 + 一个递增后缀，保证**全库唯一**。
@@ -195,10 +202,38 @@ func NewSynthetic(seed int64, n int) *SyntheticSet {
 			SessionID:   fmt.Sprintf("sess-%d", i%2),
 			ThreadID:    fmt.Sprintf("thr-%d", i%2),
 		})
+
+		// 问答视图：同一批用例，多三样东西。
+		//
+		//   - Question：人话形态的问句（与检索串不同，但共享词元）。
+		//   - Answer：标准答案（合成集里取**第一条相关事实的正文**——
+		//     它不是自然语言答案，但可复现且可判分；
+		//     真实基准的自然语言答案由宿主的 Judge 判）。
+		//   - SupportIDs：支撑该答案的事实（= 相关集合）。
+		qa.Cases = append(qa.Cases, QACase{
+			Case:       ds.Cases[len(ds.Cases)-1],
+			Question:   "关于 " + strings.Join(q, " ") + " 的情况是什么？",
+			Answer:     synthAnswerOf(set.facts, relevantIDs),
+			SupportIDs: relevantIDs,
+		})
 	}
 
 	set.Dataset = ds
+	set.QA = qa
 	return set
+}
+
+// synthAnswerOf 取第一条相关事实的正文当标准答案。
+func synthAnswerOf(facts []*types.AtomCard, ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	for _, f := range facts {
+		if f.ID == ids[0] {
+			return f.Assertion
+		}
+	}
+	return ""
 }
 
 // synthImps / synthConf 合成事实卡用的档位轮转表。
