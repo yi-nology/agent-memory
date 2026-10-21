@@ -131,6 +131,9 @@ jobs:
         # 这道闸从 v0.1.0 起就一直是红的：脚本剥掉 v 之后拿它当模块版本用，
         # 于是每次发版的「下游能按版本号引入」自检都失败——
         # 而它恰好是唯一能提前发现「发布物下游引不进」的那道闸。
+        # ⚠️ 显式声明 shell：GitHub 的 run 块默认走 /bin/sh（dash），
+        # 而 `set -o pipefail` 是 bash 专有——不声明就会在「set」那一步就红。
+        shell: bash
         run: |
           set -euo pipefail
           make release-check TAG="${GITHUB_REF_NAME}"

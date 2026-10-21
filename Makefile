@@ -7,6 +7,17 @@
 #   - tools/archcheck 是门禁工具的独立模块，带一个 YAML 解析依赖。
 # 主模块绿不代表工具绿——工具的门禁失效是静默的，所以两段都要跑。
 
+# ⚠️ recipe 一律用 bash 跑。
+#
+# 理由：下面 `release-check` 的 recipe 用了 `set -o pipefail`（bash 专有），
+# 而 make 的默认 shell 是 **/bin/sh**——在 Ubuntu 上那是 dash，
+# 于是 `set -euo pipefail` 直接报 "Illegal option -o pipefail"。
+#
+# ⚠️ 这个坑**本地复现不出来**：macOS 的 /bin/sh 是 bash 的 sh 模式，
+# 认 pipefail ⇒ 本地绿、CI 红（v0.7.0 的发布闸就红在这儿）。
+# 故把 shell 显式钉成 bash，别让「本地能跑」骗了自己。
+SHELL := /bin/bash
+
 GO ?= go
 export CGO_ENABLED = 0
 
