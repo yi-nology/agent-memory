@@ -61,4 +61,10 @@ const (
 	// 合成一条的话，看板上「晋升成功」与「画像已重算」就分不开了——
 	// 而后者没发生，症状只是画像内容过时，看着与正常一模一样。
 	JournalPageDirty JournalKind = "page-dirty"
+	// JournalVectorSync 向量同步失败（向量轨写/删没落上）。
+	//
+	// 单独一类：事实**已经入库**了，只是它的向量没进索引——
+	// 于是语义召回会少这一条，而症状是「召回里少了个相关的东西」，
+	// 完全看不出来。合成进别的类里就没法按原因查了。
+	JournalVectorSync JournalKind = "vector-sync"
 )

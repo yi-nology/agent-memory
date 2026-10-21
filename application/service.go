@@ -49,7 +49,10 @@ type Service struct {
 	ext   *extractor.Extractor
 	promo *promotion.Promoter
 	rec   *recall.Pipeline
-	now   func() time.Time
+	// embedder / vecIdx 向量轨的两件（nil = 不启用）。
+	embedder ports.Embedder
+	vecIdx   ports.VectorIndex
+	now      func() time.Time
 }
 
 // Deps 装配依赖。
@@ -73,6 +76,18 @@ type Deps struct {
 	Promotion *promotion.Config
 	// Estimator token 计量（可 nil：退到静态代理）。
 	Estimator ports.TokenEstimator
+	// Embedder 向量化器（可 nil：nil = 不启用向量面）。
+	//
+	// 给了它，向量轨才真正通电：召回多一路语义召回，
+	// 晋升成事实后自动把向量写进索引。
+	//
+	// 不给 = 召回**逐条**回到纯词面（零漂移），
+	// 且「没有模型也能手工写入 + 词法召回」那条降级路径不变。
+	Embedder ports.Embedder
+	// VectorIndex 向量索引（可 nil：nil = 不启用向量面）。
+	//
+	// 两者**都**给了才启用——只给一个装配不出语义路。
+	VectorIndex ports.VectorIndex
 }
 
 // New 装配服务。
@@ -91,22 +106,44 @@ func New(cfg Config, deps Deps) (*Service, error) {
 	if deps.Promotion != nil {
 		promoCfg = *deps.Promotion
 	}
-	promo, err := promotion.New(promoStore{deps.Store}, deps.Escalation, promoCfg)
+	// 存储包一层：事实退役时同步删掉它的向量。
+	//
+	// 放装配面而不是生命周期面：生命周期面只声明自己需要的窄接口，
+	// 为了一次向量清理把索引塞进它的依赖是本末倒置；
+	// 而**装饰器**让所有走装配面的退役路径都自动带上清理
+	// （保留期、运行期错误批量退役、合并……）——
+	// 不必指望每条路径都记得去删。
+	st := deps.Store
+	if deps.VectorIndex != nil {
+		st = vectorStore{Store: deps.Store, idx: deps.VectorIndex}
+	}
+	promo, err := promotion.New(promoStore{st}, deps.Escalation, promoCfg)
 	if err != nil {
 		return nil, err
 	}
-	rec, err := recall.New(cfg.Recall, deps.Store, deps.Estimator, deps.Bander)
+	// 语义召回面：宿主显式配了 Semantic 就以宿主为准；
+	// 否则在给了向量化器与索引时自动装上「内核自带的向量轨」。
+	recallCfg := cfg.Recall
+	if recallCfg.Semantic == nil && deps.Embedder != nil && deps.VectorIndex != nil {
+		recallCfg.Semantic = ports.VectorSemanticReader{
+			Embedder: deps.Embedder,
+			Index:    deps.VectorIndex,
+		}
+	}
+	rec, err := recall.New(recallCfg, st, deps.Estimator, deps.Bander)
 	if err != nil {
 		return nil, err
 	}
 	return &Service{
-		cfg:   cfg,
-		store: deps.Store,
-		cap:   cap,
-		ext:   extractor.New(deps.LLM),
-		promo: promo,
-		rec:   rec,
-		now:   func() time.Time { return time.Now().UTC() },
+		cfg:      cfg,
+		store:    st,
+		cap:      cap,
+		ext:      extractor.New(deps.LLM),
+		promo:    promo,
+		rec:      rec,
+		embedder: deps.Embedder,
+		vecIdx:   deps.VectorIndex,
+		now:      func() time.Time { return time.Now().UTC() },
 	}, nil
 }
 
@@ -147,6 +184,18 @@ func (s *Service) Promote(ctx context.Context, ns store.Namespace, c *types.Cand
 		return nil, err
 	}
 	s.markPageDirty(ctx, ns, v)
+	// 向量轨：新事实入索引，被取代的旧事实出索引。
+	//
+	// 顺序要紧：先写新的、再删旧的——反过来会有一瞬间「两条都不在索引里」
+	// （召回少一条），而先写后删最多是「两条都在」（多一条会被取回时过滤掉）。
+	if v.Decision == promotion.DecisionPromote || v.Decision == promotion.DecisionUpdate {
+		if v.Atom != nil {
+			s.indexVector(ctx, ns, v.Atom)
+		}
+	}
+	if v.Superseded != nil {
+		s.unindexVector(ctx, ns, v.Superseded.ID)
+	}
 	return v, nil
 }
 

@@ -99,6 +99,7 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 实体归一 | `pipeline/entity/entity.go` | `types/entity.go` | 合并是**改归属**，不是复制 |
 | 查询理解（时间窗/代词/实体） | `pipeline/query/` | `pipeline/recall`（取数前置）+ `types/query.go` | 解析出的实体**只补画像**，不划事实范围 |
 | 混合检索（语义 + RRF） | `ports/semantic.go` + `ports/rerank.go` | `pipeline/recall/hybrid.go` | 融合决定**池子**，排序归打分器；缺省权重 0 ⇒ 零漂移 |
+| 向量轨（向量化 + 索引） | `ports/vector.go` + `ports/index.go` | `application/vector.go`（写/删向量）+ `application/service.go`（装配语义路）+ 两个存储后端（持久化索引） | 语义强度归宿主、**管线**归内核；**归属必须进索引**（后置过滤会吃掉配额） |
 | 事实更新（取代 vs 矛盾） | `pipeline/promotion/update.go` | `types/atom.go`（时序字段）+ `store.AtomFilter.At` | 模型只做**路由**；作废与矛盾落人工 |
 | 时序事实（生效区间） | `types/atom.go` | 两个后端（加列 + 迁移）+ `store.AtomFilter.At` | `ValidFrom` 零值取 `OccurredAt`（老数据不变） |
 | 关系边与多跳 | `types/graph.go` + `pipeline/graph/` | `store.EdgeStore` + 两个后端（建表 + 迁移） | 边是**派生物**；溯源（SourceAtomID）必需 |
@@ -294,6 +295,9 @@ git show --stat --name-status HEAD  # 提交后复核文件集合
 | 查「上周」时把上周才写下的事实排除了 | 时间窗与生效区间混了（两个维度） | `types/atom.go` `ValidRange` |
 | 一句代词把整轮事实清空了 | 解析出的实体被拿去划事实范围 | `pipeline/recall` `analyze` |
 | 事实更新悄悄停了（记忆里留着两个版本） | 模型失败被静默吞掉 | `pipeline/promotion/update_llm.go` |
+| 语义召回像是没生效 | 宿主只给了 Embedder 没给 Index（或反之），两件**都**给才启用 | `application/service.go` `recallCfg.Semantic` |
+| 语义路命中率莫名偏低 | 事实退役了而向量还在索引里（死事实占槽位） | `application/vector.go` `vectorStore` |
+| 语义召回像是没生效（且与归属有关） | 归属过滤被放在**后置**（topK 之后），别家占掉了配额 | `ports.VectorIndex.Search` 的 scope 参数 |
 | 评测数字每次都不一样 | 合成数据用了全局 `rand`（被别的包推进） | `evaluation/synthetic.go` |
 | 某实体的事实全丢了 | 实体合并时按 `ActiveOnly` 过滤了退役卡 | `store/store.go` ListAtomsByEntity 注释 |
 | 召回结果偏少但看不出原因 | 丢弃没分路 | `Result.Drops` / `ports.Budget` |

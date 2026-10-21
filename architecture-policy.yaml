@@ -69,17 +69,21 @@ modules:
 
   - id: storage-sqlite
     roots: [storage/sqlite]
-    requires: [types, store, storage-parity]
+    requires: [types, store, ports, storage-parity]
     owner: memory
     managed: true
-    notes: 纯 Go SQLite 驱动（FTS5 + 表前缀隔离 namespace）。方言 SQL 只许出现在本目录。
+    notes: |
+      纯 Go SQLite 驱动（FTS5 + 表前缀隔离 namespace）。方言 SQL 只许出现在本目录。
+      ports：为了实现 ports.VectorIndex（向量索引是**持久化**也是**能力**，
+      存储层直接实现那个端口，装配面按类型断言取用，省掉一层适配胶水）。
 
   - id: storage-postgres
-    roots: [storage/postgres]
-    requires: [types, store, storage-parity]
+    roots: [types, store, ports, storage-parity]
     owner: memory
     managed: true
-    notes: PostgreSQL 后端（namespace-first 键 + 全文检索）。与 sqlite 必须同一组行为断言。
+    notes: |
+      PostgreSQL 后端（namespace-first 键 + 全文检索）。与 sqlite 必须同一组行为断言。
+      ports：同 storage-sqlite——向量索引由存储层直接实现 ports.VectorIndex。
 
   - id: pipeline-capture
     roots: [pipeline/capture]
@@ -419,7 +423,7 @@ rules:
 
       - path: github.com/oagentkit/textx
         reason: |
-          纯 stdlib（仅依赖 oekit/pkg）。用到 textutil 的三处：
+          纯 stdlib（仅依赖 oekit/pkg）。用到 textutil 的四处：
           一、代码围栏剥离——模型输出常带 ``` 围栏，本仓在提炼面与页面重生成面
           各手写了一份，而围栏形态（语言标记、闭合缺失、散文夹带）边界多；
           二、检索词元切分（Tokens）——汉字逐字成词元是中文子串检索能用的关键，
@@ -427,7 +431,10 @@ rules:
           而切法规则由上游单源给出，本仓在 store 层钉住一处；
           三、token 折算（EstTokensWithRounding）——取整方向是**参数**
           （逐段 vs 合总），本仓选逐段档：合总会把每段的零头一起吞掉，
-          在混合文本上是成规模的**低估**，而低估在预算场景里是静默的那一侧。
+          在混合文本上是成规模的**低估**，而低估在预算场景里是静默的那一侧；
+          四、向量轨的切词（Tokens）——哈希嵌入（ports.HashEmbedder）
+          与检索面必须看到**同一段文本**，否则两路融合的结果不可复现，
+          而「召回结果可复现」是评测面成立的前提。
         until: 2027-10-19
         removal: |
           该模块停更，或本仓三处都改走别的单源时移除。

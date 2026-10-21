@@ -7,31 +7,37 @@ import (
 
 // 本文件：向量化与向量索引端口。
 //
-// # 当前状态：**reserved（当前无消费点）**
+// # 当前状态：**已接通**（消费点在 pipeline/recall 与 application）
 //
-// 这两个接口定义齐全，但**本仓没有任何代码调用它们**
-// （全模块 grep Embedder / VectorIndex 只命中本文件自身）。
+// 这两个接口现在有真的消费方：
 //
-// 刻意把这件事写明，而不是让它们读起来像一项现成能力：
-// **一个定义了却零消费者的导出接口，读起来像能力，实际不是**——
-// 下游照着它接线会以为「装上就有语义检索」，而实际什么都不会发生。
+//   - 写路径：晋升成事实后把向量写进索引（application 的装配面）；
+//   - 读路径：召回时算查询向量 → 搜索引 → 与词面路用 RRF 融合
+//     （见 ports.VectorSemanticReader 与 pipeline/recall/hybrid.go）。
 //
-// # 为什么留着
+// 装配面只需给 Embedder 与 VectorIndex 两件；不给 = 不启用向量面，
+// 召回**逐条**回到纯词面（零漂移，见 AGENTS.md「混合检索」那条）。
 //
-// 三个理由，合起来是「把缝留出来」：
+// # 为什么内核自己接，而不是继续留窄缝
 //
-//  1. 类型层已经有落脚点（types.AtomCard.Vector），
-//     走语义轨的宿主不必另造一个平行结构；
-//  2. 排序侧已经有注入缝（ports.Ranker），
-//     宿主换排序口径不必绕开整条召回链自造一套；
-//  3. 真要接向量轨时，接口形状已经定过，不必再改一轮类型。
+// 此前只有一条窄缝（SemanticReader：宿主给「最像的 topK」），
+// 宿主得自己写「算向量 + 搜索引 + 归属过取」那一层胶水。
+// 胶水每家写一遍就会各写一遍：漏了归属过取的那家，
+// 语义路的配额会被别家吃掉——症状是「语义召回像是没生效」，而查不出原因。
 //
-// # 为什么现在不接
+// 语义**强度**仍然归宿主（内核不引模型 SDK，见下）；
+// 但**管线**归内核：这是本仓一贯的分工（排序口径归宿主、链路归内核）。
+//
+// # 语义强度：内核不引模型 SDK
 //
 // 上游 octop-memory 自己也把向量面标为「默认关闭、测试全为 mock、
-// 真实集成未验证」。本仓的判断相同：先把「该捞哪几层」「怎么排」
-// 这件事做对，语义相似度是第二阶段的替换件，不是第一阶段的前提。
-// 本仓的知识检索面另有 RAG 平面，两者不是一回事。
+// 真实集成未验证」。本仓的判断相同：核心一旦引了 SDK，
+// 「没有模型时手工写入 + 词法召回必须能跑」那条降级路径就没了——
+// 而它塌了之后不会立刻暴露，它塌在「用户配了模型、装了数据库」的生产环境里。
+//
+// 故本仓给的是**诚实的可跑实现**（ports.HashEmbedder：词面哈希嵌入，
+// 捕捉词面软匹配，**不是语义嵌入**），
+// 而真正接上模型的宿主注入自己的 Embedder 即可——接口形状已经定过，不必再改一轮类型。
 
 // ErrNoEmbedder 未注入向量化能力时的哨兵（语义同 ErrNoLLM）。
 var ErrNoEmbedder = errors.New("ports: no embedder injected")
@@ -41,9 +47,8 @@ var ErrNoIndex = errors.New("ports: no vector index injected")
 
 // Embedder 向量化端口。
 //
-// # reserved：当前无消费点
-//
-// 本仓不调用它（见本文件的包级说明）。
+// 本仓有一个可跑实现（HashEmbedder，词面哈希嵌入），
+// 走真模型的宿主注入自己的实现即可。
 type Embedder interface {
 	// Embed 返回文本的向量。维度由实现固定，消费方从首次返回取。
 	Embed(ctx context.Context, text string) ([]float32, error)
@@ -67,9 +72,8 @@ type VectorHit struct {
 
 // VectorIndex 向量索引端口。
 //
-// # reserved：当前无消费点
-//
-// 本仓不调用它（见本文件的包级说明）。
+// 本仓有一个可跑实现（MemIndex，**单进程**内存索引），
+// 多副本部署的宿主注入自己的持久索引（Chroma / Qdrant / PG 向量扩展……）。
 //
 // # 默认关，且**不是**关系后端
 //
@@ -78,9 +82,21 @@ type VectorHit struct {
 // 事实卡的生杀大权始终在 Store 上。
 type VectorIndex interface {
 	// Search 返回最相似的若干对象标识。
-	Search(ctx context.Context, namespace string, vec []float32, topK int) ([]VectorHit, error)
-	// Upsert 写入或更新一条。
-	Upsert(ctx context.Context, namespace, id string, vec []float32) error
+	//
+	// scope 是读者归属（空=不隔离）：非空时只返回「全局 + 同归属」的向量，
+	// 过滤**在这一层生效**（进 SQL，与 TopK 同一次求值）。
+	//
+	// # 为什么归属必须进索引
+	//
+	// 归属过滤若放在调用方后置，被别家占掉的槽位已经花掉了——
+	// 于是「该给我的那条」根本没进候选池，而症状是「语义召回像是没生效」。
+	// 过取（多取几倍）只是缓解，不是修法：取数上限仍被别家占着。
+	//
+	// 规则与 store.AtomFilter.Scope 同一条：空=不隔离，
+	// 非空时取「全局 + 同归属」。
+	Search(ctx context.Context, namespace, scope string, vec []float32, topK int) ([]VectorHit, error)
+	// Upsert 写入或更新一条（scope 是这条向量的归属）。
+	Upsert(ctx context.Context, namespace, id, scope string, vec []float32) error
 	// Delete 删除一条（索引与关系表的一致性由调用方保证）。
 	Delete(ctx context.Context, namespace, id string) error
 }
@@ -89,12 +105,14 @@ type VectorIndex interface {
 type NoopIndex struct{}
 
 // Search 恒返回 ErrNoIndex。
-func (NoopIndex) Search(context.Context, string, []float32, int) ([]VectorHit, error) {
+func (NoopIndex) Search(context.Context, string, string, []float32, int) ([]VectorHit, error) {
 	return nil, ErrNoIndex
 }
 
 // Upsert 恒返回 ErrNoIndex。
-func (NoopIndex) Upsert(context.Context, string, string, []float32) error { return ErrNoIndex }
+func (NoopIndex) Upsert(context.Context, string, string, string, []float32) error {
+	return ErrNoIndex
+}
 
 // Delete 恒返回 ErrNoIndex。
 func (NoopIndex) Delete(context.Context, string, string) error { return ErrNoIndex }
