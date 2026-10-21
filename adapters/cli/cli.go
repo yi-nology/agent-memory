@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/yi-nology/agent-memory/adapters/llm"
+	"github.com/yi-nology/agent-memory/adapters/mcp"
 	"github.com/yi-nology/agent-memory/application"
 	"github.com/yi-nology/agent-memory/operations/portable"
 	"github.com/yi-nology/agent-memory/pipeline/capture"
@@ -129,6 +130,16 @@ func readModelEnv() ModelOptions {
 
 // Run 执行一条命令，返回进程退出码。
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return RunWithIO(ctx, args, os.Stdin, stdout, stderr)
+}
+
+// RunWithIO 与 Run 相同，但**显式**给入参（含 stdin）。
+//
+// 为什么要多一个：MCP over stdio 是「宿主拉起一个子进程、逐行对话」，
+// 所以它得读 stdin —— 而 Run 的签名里没有它 ✓。
+// 把 stdin 做成参数而不是直接用 os.Stdin，是为了**能单测** ✓
+// （起一个真进程做协议往返的测试，既慢又脆 ✓）。
+func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		usage(stderr)
 		return 2
@@ -204,6 +215,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return cmdSearch(ctx, opt, stdout, stderr, query, *limit)
+	case "mcp":
+		// MCP over stdio：拉起后**一直跑着**（与其它命令跑完就退不同 ✓）。
+		return cmdMCP(ctx, opt, stdin, stdout, stderr)
 	case "query":
 		// 查询理解的自查口：把一句问句翻成「可执行的检索条件」并打印。
 		//
@@ -644,6 +658,36 @@ func cmdReindex(ctx context.Context, opt Options, stdout, stderr io.Writer, limi
 		n++
 	}
 	fmt.Fprintf(stdout, "已补算 %d 条事实的向量\n", n)
+	return 0
+}
+
+// cmdMCP 以 stdio 跑 MCP 服务器。
+//
+// # 为什么要有这个入口
+//
+// MCP over stdio 的形态是「宿主拉起一个子进程、逐行说 JSON-RPC」，
+// 所以它需要的是**一个能一直跑着的进程**——与其它命令（跑一次就退）形态不同 ✓。
+//
+// # 谁会用它
+//
+// OpenClaw 这类宿主**直接认 MCP** ✓：配置里声明一个命令即可 ✓，
+// 不需要写 Node 插件 ✓（那是别人的运行时形状决定的，不是协议要求 ✓）。
+func cmdMCP(ctx context.Context, opt Options, stdin io.Reader, stdout, stderr io.Writer) int {
+	svc, st, err := open(ctx, opt)
+	if err != nil {
+		fmt.Fprintln(stderr, "打开失败:", err)
+		return 1
+	}
+	defer func() { _ = st.Close() }()
+	srv, err := mcp.New(svc)
+	if err != nil {
+		fmt.Fprintln(stderr, "装配 MCP 服务器失败:", err)
+		return 1
+	}
+	if err := srv.Run(ctx, stdin, stdout); err != nil {
+		fmt.Fprintln(stderr, "MCP 服务器退出:", err)
+		return 1
+	}
 	return 0
 }
 

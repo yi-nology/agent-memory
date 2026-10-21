@@ -1,6 +1,7 @@
 package cli_test
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
 	"strings"
@@ -229,5 +230,31 @@ func TestExpireRetiresOnlyEvents(t *testing.T) {
 	}
 	if !lesson.Active() {
 		t.Fatal("长期经验不该被按龄退役")
+	}
+}
+
+// memory mcp：以 stdio 跑 MCP 服务器（**拉起后一直跑着**）。
+//
+// 这条验的是「宿主能直接用一条命令接上 MCP」✓ ——
+// OpenClaw 这类宿主认 MCP，配置里声明一个命令即可，不需要写 Node 插件 ✓。
+func TestMCPCommandSpeaksProtocol(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "m.sqlite")
+
+	// 一条 initialize 请求（协议层在 adapters/mcp 有自己的用例 ✓，
+	// 这里验的是「CLI 这个入口真的把它接上了」✓）。
+	in := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n")
+	var out, errb bytes.Buffer
+	code := cli.RunWithIO(context.Background(), []string{"mcp", "--db", db, "--namespace", "t"},
+		in, &out, &errb)
+	if code != 0 {
+		t.Fatalf("mcp 命令应正常退出: %d %s", code, errb.String())
+	}
+	line := strings.TrimSpace(out.String())
+	if !strings.Contains(line, `"protocolVersion"`) {
+		t.Fatalf("MCP 响应里应有 protocolVersion: %q", line)
+	}
+	if !strings.Contains(line, `"jsonrpc":"2.0"`) {
+		t.Fatalf("响应应是 JSON-RPC 2.0: %q", line)
 	}
 }

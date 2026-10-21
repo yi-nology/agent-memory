@@ -209,7 +209,7 @@ modules:
 
   - id: adapters-cli
     roots: [adapters/cli]
-    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall, pipeline-query, pipeline-entity, lifecycle, adapters-llm]
+    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall, pipeline-query, pipeline-entity, lifecycle, adapters-llm, adapters-mcp]
     owner: memory
     managed: true
     notes: |
@@ -223,6 +223,8 @@ modules:
       保留期 / 物理整理）在内核里实现了却没有入口时，既不会被用也不会被验证。
       adapters-llm 是**按需**依赖：只有要模型的子命令（extract/promote）才装配它，
       未配置模型时其余命令零影响。
+      adapters-mcp 同理按需：只有 `memory mcp` 那个子命令才装配它——
+      MCP over stdio 是「拉起子进程、逐行对话」的形态，与其它命令（跑完就退）不同。
 
   - id: adapters-llm
     roots: [adapters/llm]
