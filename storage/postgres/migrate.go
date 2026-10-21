@@ -45,6 +45,50 @@ var migrations = []migration{
 	{version: 4, apply: migrateV4AtomTemporal},
 	{version: 5, apply: migrateV5EntityEdges},
 	{version: 6, apply: migrateV6AtomVectors},
+	{version: 7, apply: migrateV7AtomKind},
+}
+
+// migrateV7AtomKind 给 atoms 加时效类别列 kind，并建它的索引。
+//
+// # 为什么要有这一段
+//
+// 事实的**生命周期**分三类（见 types.FactKind）：短期事件会过期，
+// 有效期状态被新值取代，长期经验不因时间失效。
+// 一套策略套所有事实必然两头不讨好，故每张事实卡要带上它的类别，
+// 保留期与召回窗口才能**按类分别配**。
+//
+// 这一列的形状变更必须走迁移：建表脚本是 `CREATE TABLE IF NOT EXISTS`，
+// 老库的 atoms 表已存在，脚本对它是**空操作**，新列不会凭空出现——
+// 于是新代码按新形状读旧库，第一条事实卡查询就报「column does not exist」。
+//
+// # 幂等
+//
+// 版本号那一行可能被手工改过、被老版本覆盖过，或者库是从别处拷来的，
+// 于是同一段迁移可能被跑第二次——而迁移跑第二遍而失败的话
+// **库就打不开了**。故用 ADD COLUMN IF NOT EXISTS：加列前自己判「要不要做」。
+//
+// # 为什么索引归迁移管
+//
+// 建表脚本每次打开都跑，而旧库的表还没有 kind 列——脚本里那句
+// `CREATE INDEX ... ON atoms (namespace, kind, occurred_at)` 会当场失败，
+// 整个库都打不开了。故索引在这一段里建（IF NOT EXISTS，重复跑安全）。
+func migrateV7AtomKind(ctx context.Context, db *sql.DB) error {
+	// DEFAULT '' 是必须的：老库里已有的行也得有值。
+	//
+	// 默认值取空串（= 默认 = 长期经验）而不是 'event'：
+	// 零值必须落在**不淘汰**的那一侧——既有事实卡没有这个维度，
+	// 升级不该让它们开始被淘汰（见 types.FactKind 的说明）。
+	if _, err := db.ExecContext(ctx,
+		`ALTER TABLE atoms ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("加事实卡时效类别列失败: %w", err)
+	}
+	// 索引（namespace, kind, occurred_at）：事件窗口的判据是
+	// 「类别是事件 且 发生时刻在窗口内」，两列都在索引的前缀里。
+	if _, err := db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS atoms_kind ON atoms (namespace, kind, occurred_at)`); err != nil {
+		return fmt.Errorf("建事实卡类别索引失败: %w", err)
+	}
+	return nil
 }
 
 // migrateV4AtomTemporal 给 atoms 加生效区间与版本号三列。

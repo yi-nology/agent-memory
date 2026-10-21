@@ -187,7 +187,7 @@ func (s *rawStore) SearchRaw(ctx context.Context, ns store.Namespace, scope type
 		extra = "event_id IN (SELECT id FROM raw_events WHERE namespace = ? AND (scope = '' OR scope = ?))"
 		extraArgs = []any{nsOf(ns), string(scope)}
 	}
-	ids, err := s.searchFTS(ctx, "raw_fts", nsOf(ns), query, limit, extra, extraArgs...)
+	ids, err := s.searchFTS(ctx, "raw_fts", nsOf(ns), query, limit, extra, false, extraArgs...)
 	if err != nil || len(ids) == 0 {
 		return nil, err
 	}

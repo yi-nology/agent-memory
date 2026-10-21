@@ -95,38 +95,58 @@ func (p *Pipeline) collectSemantic(ctx context.Context, req Request, limit int) 
 	return out, nil
 }
 
-// fuse 融合两路，返回按融合分降序排好的候选。
+// fuse 融合多路召回，返回按融合分降序排好的候选。
 //
-// 没有语义路时**原样返回**（连次序都不动）——
-// 那是「没装语义面」的主路径，它必须与装之前逐条一致。
+// # 为什么是「多路」而不是「一路排一路」
 //
-// 融合用 ports.RRF：它只看名次，故跨路可比、跨库稳定。
-func (p *Pipeline) fuse(ctx context.Context, lexical []*candidate, semantic []*types.AtomCard) []*candidate {
-	if len(semantic) == 0 {
+// 每一路给的是**自己的名次**（它认为什么更相关），
+// 而各路的分数**不可比**（bm25 无上界、相似度在 [-1,1]），
+// 故融合只看名次（RRF）。
+//
+// 一个 ID 出现在多路里 ⇒ 融合分更高 ⇒ 它更强：
+// 完全匹配的事实同时出现在**严格路**与**宽松路**（融合分最高），
+// 部分匹配的那些从宽松路进来，语义近的那些从语义路进来。
+//
+// # 只有一路时**原样返回**
+//
+// 零漂移：没装语义面、且没有宽松路可用时，候选的次序与从前逐条一致。
+func (p *Pipeline) fuse(ctx context.Context, lexical, loose []*candidate,
+	semantic []*types.AtomCard) []*candidate {
+	if len(loose) == 0 && len(semantic) == 0 {
 		return lexical
 	}
-	lexIDs := make([]string, 0, len(lexical))
-	lexIndex := make(map[string]*candidate, len(lexical))
-	for _, c := range lexical {
-		lexIDs = append(lexIDs, c.RefID)
-		lexIndex[c.RefID] = c
+	lists := map[string][]string{}
+	// 每条候选的来源：同一个 ID 可能出现在多路里，候选本体只造一次。
+	pool := map[string]*candidate{}
+
+	add := func(route string, cands []*candidate) {
+		for _, c := range cands {
+			if c == nil || c.RefID == "" {
+				continue
+			}
+			lists[route] = append(lists[route], c.RefID)
+			pool[c.RefID] = c
+		}
 	}
+	add("lexical", lexical)
+	add("loose", loose)
+
+	// 语义路：标识 → 事实卡 → 候选（正文取回的事实）。
 	semIDs := make([]string, 0, len(semantic))
 	semIndex := make(map[string]*types.AtomCard, len(semantic))
 	for _, a := range semantic {
+		if a == nil || a.ID == "" {
+			continue
+		}
 		semIDs = append(semIDs, a.ID)
 		semIndex[a.ID] = a
 	}
-	fused := ports.RRF(map[string][]string{
-		"lexical":  lexIDs,
-		"semantic": semIDs,
-	}, ports.DefaultRRFConstant)
+	lists["semantic"] = semIDs
 
-	// 融合出的次序里，词面路的候选沿用（它已带正文与去重键）；
-	// 语义路独有的候选要**造**一个（正文取回的事实）。
+	fused := ports.RRF(lists, ports.DefaultRRFConstant)
 	out := make([]*candidate, 0, len(fused))
 	for _, f := range fused {
-		if c, ok := lexIndex[f.ID]; ok {
+		if c, ok := pool[f.ID]; ok {
 			c.fusion = f.Score
 			out = append(out, c)
 			continue
@@ -150,4 +170,27 @@ func (p *Pipeline) fuse(ctx context.Context, lexical []*candidate, semantic []*t
 		out = append(out, c)
 	}
 	return out
+}
+
+// looseCandidates 把宽松路的事实卡变成候选片段。
+//
+// 与词面路同一套字段（角色、重要度、时刻、去重键），
+// 差别只在**它从哪一路来**（融合时看的是名次，不是来源）。
+func (p *Pipeline) looseCandidates(ctx context.Context, req Request,
+	atoms []*types.AtomCard) ([]*candidate, error) {
+	out := make([]*candidate, 0, len(atoms))
+	for _, a := range atoms {
+		c, ok, err := p.snippet(ctx, SourceAtom, a.ID, a.EntityID, "记忆", a.Assertion,
+			a.Importance, a.OccurredAt)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		c.bucket = bucketAtom
+		c.dedupKey = a.EntityID + "\x00" + a.Signature()
+		out = append(out, c)
+	}
+	return out, nil
 }

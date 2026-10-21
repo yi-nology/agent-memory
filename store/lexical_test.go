@@ -139,3 +139,27 @@ func TestFTS5QueryUsesSameTokensAsIndexSide(t *testing.T) {
 		}
 	}
 }
+
+// 宽松匹配（OR）必须与严格匹配（AND）**逐条不同**：
+// 严格路要求每个词都在，宽松路只要命中一个。
+//
+// 这条是「多话题查询打不中」那个缺陷的钉子：
+// 两条路若拼出同一个查询串，宽松路就是白加的（而症状是「召回变差一点」，
+// 看不出来）。
+func TestFTS5QueryAnyIsLooserThanAnd(t *testing.T) {
+	and := store.FTS5Query("磁盘 内存")
+	any := store.FTS5QueryAny("磁盘 内存")
+	if and == any {
+		t.Fatalf("宽松路与严格路拼出了同一个串: %q", any)
+	}
+	if !strings.Contains(any, " OR ") {
+		t.Fatalf("宽松路应是 OR 匹配: %q", any)
+	}
+	if strings.Contains(any, "NEAR") || strings.Contains(any, "AND") {
+		t.Fatalf("宽松路里不该出现运算符: %q", any)
+	}
+	// 切不出词元 → 空串（空 MATCH 是 FTS5 语法错误）。
+	if q := store.FTS5QueryAny("   "); q != "" {
+		t.Fatalf("空查询应返回空串: %q", q)
+	}
+}

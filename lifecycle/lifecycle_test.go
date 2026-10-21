@@ -34,6 +34,17 @@ func atom(id, entity, assertion, evidence string, runtimeErr bool) *types.AtomCa
 	}
 }
 
+// eventAtom 造一张**事件类**事实卡（发生时刻可指定）。
+//
+// 类别与发生时刻是按龄过期这件事的**判别特征**：两者不同，
+// 同一批事实里就分得出「哪条该过期、哪条不该」。
+func eventAtom(id, assertion string, occurred time.Time) *types.AtomCard {
+	a := atom(id, "ent1", assertion, "ev-"+id, false)
+	a.Kind = types.FactEvent
+	a.OccurredAt = occurred
+	return a
+}
+
 // 回收：原始事件按龄删除。
 func TestGCDeletesOldRaw(t *testing.T) {
 	s := seed(t)
@@ -227,5 +238,192 @@ func TestRetentionUsesInjectedClock(t *testing.T) {
 	}
 	if !entries[0].At.Equal(fixed) {
 		t.Fatalf("审计条目的时刻应取注入的时钟，期望 %v，实得 %v", fixed, entries[0].At)
+	}
+}
+
+// ── 按龄过期 ──
+
+// 过期：事件类事实过了保留期就退役。
+func TestExpireRetiresOldEvents(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+	_ = s.SaveAtom(ctx, ns, eventAtom("a-old", "两天前重启过一次", now().Add(-48*time.Hour)))
+	_ = s.SaveAtom(ctx, ns, eventAtom("a-fresh", "刚刚重启过一次", now()))
+
+	res, err := lifecycle.Expire(ctx, s, ns,
+		lifecycle.WithClock(func() time.Time { return now() }),
+		lifecycle.WithEventRetention(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.EventsRetired != 1 {
+		t.Fatalf("应退役 1 条事件类事实，实得 %d", res.EventsRetired)
+	}
+	old, err := s.GetAtom(ctx, ns, "a-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Active() {
+		t.Fatal("过了保留期的事件类事实应退役")
+	}
+	fresh, err := s.GetAtom(ctx, ns, "a-fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.Active() {
+		t.Fatal("还在保留期内的事件类事实不该被退役")
+	}
+}
+
+// 过期：**只**退役事件类。
+//
+// 状态等取代（取代链表达），经验永久保留——它们不按时间失效。
+// 误伤它们的症状是「某条老经验突然查不到了」，而它没有报错、没有告警。
+func TestExpireKeepsNonEvents(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+	st := atom("a-state", "ent1", "容量是 2G", "e1", false)
+	st.Kind = types.FactState
+	st.OccurredAt = now().Add(-48 * time.Hour)
+	ls := atom("a-lesson", "ent1", "先看日志再动手", "e2", false)
+	ls.Kind = types.FactLesson
+	ls.OccurredAt = now().Add(-48 * time.Hour)
+	plain := atom("a-plain", "ent1", "没有标注类别的老事实", "e3", false)
+	plain.OccurredAt = now().Add(-48 * time.Hour)
+	for _, a := range []*types.AtomCard{st, ls, plain} {
+		_ = s.SaveAtom(ctx, ns, a)
+	}
+
+	res, err := lifecycle.Expire(ctx, s, ns,
+		lifecycle.WithClock(func() time.Time { return now() }),
+		lifecycle.WithEventRetention(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.EventsRetired != 0 {
+		t.Fatalf("非事件类事实不该被按龄退役，实得 %d", res.EventsRetired)
+	}
+	for _, id := range []string{"a-state", "a-lesson", "a-plain"} {
+		got, err := s.GetAtom(ctx, ns, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Active() {
+			t.Fatalf("%s 不是事件类事实，不该被按龄退役", id)
+		}
+	}
+}
+
+// 缺省保留期是 30 天：不配它时也要有确定的判据，
+// 而「记得住的事实」比「忘得干净的事实」重要（忘了可以再看日志）。
+func TestExpireDefaultRetention(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+	_ = s.SaveAtom(ctx, ns, eventAtom("a-31d", "一个月前重启过一次", now().Add(-31*24*time.Hour)))
+	_ = s.SaveAtom(ctx, ns, eventAtom("a-29d", "上个月重启过一次", now().Add(-29*24*time.Hour)))
+
+	res, err := lifecycle.Expire(ctx, s, ns, lifecycle.WithClock(func() time.Time { return now() }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.EventsRetired != 1 {
+		t.Fatalf("缺省保留期（30 天）应退役 1 条，实得 %d", res.EventsRetired)
+	}
+	old, _ := s.GetAtom(ctx, ns, "a-31d")
+	if old.Active() {
+		t.Fatal("超过缺省保留期的事件类事实应退役")
+	}
+	keep, _ := s.GetAtom(ctx, ns, "a-29d")
+	if !keep.Active() {
+		t.Fatal("还在缺省保留期内的事件类事实不该被退役")
+	}
+}
+
+// 过期必须**幂等**：保留期动作是定时跑的，同一批事实会被一遍遍扫到。
+//
+// 重复退役的失效形态不是报错，而是「审计条目翻倍」——
+// 「这张卡什么时候被退役的」有了两个答案，而读的人分不出哪个是真的。
+func TestExpireIsIdempotent(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+	_ = s.SaveAtom(ctx, ns, eventAtom("a-old", "两天前重启过一次", now().Add(-48*time.Hour)))
+
+	opt := []lifecycle.Option{
+		lifecycle.WithClock(func() time.Time { return now() }),
+		lifecycle.WithEventRetention(24 * time.Hour),
+	}
+	first, err := lifecycle.Expire(ctx, s, ns, opt...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.EventsRetired != 1 {
+		t.Fatalf("第一遍应退役 1 条，实得 %d", first.EventsRetired)
+	}
+	second, err := lifecycle.Expire(ctx, s, ns, opt...)
+	if err != nil {
+		t.Fatalf("第二遍不该报错: %v", err)
+	}
+	if second.EventsRetired != 0 {
+		t.Fatalf("第二遍不该再退役（幂等），实得 %d", second.EventsRetired)
+	}
+	entries, err := s.ListJournal(ctx, ns, "a-old", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("同一条事实的退役审计应只有一条，实得 %d 条", len(entries))
+	}
+}
+
+// 退役是**软退役**：事实卡仍要查得到（追问「当初为什么这么判」是记忆系统
+// 必须能回答的问题），只是不再参与召回。
+func TestExpireRetiresButKeepsQueryable(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+	_ = s.SaveAtom(ctx, ns, eventAtom("a-old", "两天前重启过一次", now().Add(-48*time.Hour)))
+
+	if _, err := lifecycle.Expire(ctx, s, ns,
+		lifecycle.WithClock(func() time.Time { return now() }),
+		lifecycle.WithEventRetention(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAtom(ctx, ns, "a-old")
+	if err != nil {
+		t.Fatalf("退役的事实不该被删（软退役不是删）: %v", err)
+	}
+	if got.Active() {
+		t.Fatal("退役的事实不该再参与召回")
+	}
+	if got.Assertion == "" {
+		t.Fatal("退役的事实不该被清空")
+	}
+}
+
+// 退役要**留痕**：退役时刻取注入的时钟（它是审计链上的一环）。
+func TestExpireWritesJournalWithInjectedClock(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+	_ = s.SaveAtom(ctx, ns, eventAtom("a-old", "两天前重启过一次", now().Add(-48*time.Hour)))
+
+	fixed := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	if _, err := lifecycle.Expire(ctx, s, ns,
+		lifecycle.WithClock(func() time.Time { return fixed }),
+		lifecycle.WithEventRetention(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.ListJournal(ctx, ns, "a-old", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("按龄退役应写审计条目")
+	}
+	if !entries[0].At.Equal(fixed) {
+		t.Fatalf("审计条目的时刻应取注入的时钟，期望 %v，实得 %v", fixed, entries[0].At)
+	}
+	// 审计条目要说清是「按龄过期」——它与人工作废的处置不同，
+	// 而看板上这两种长得一模一样。
+	if entries[0].Summary == "" {
+		t.Fatal("审计条目应写明处置原因")
 	}
 }

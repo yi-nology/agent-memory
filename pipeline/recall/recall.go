@@ -254,6 +254,19 @@ type Config struct {
 	//
 	// 同样是**可选**：不装时行为与现在完全一致。
 	Analyzer *query.Analyzer
+	// EventWindow 事件类事实的**默认召回窗口**（零值=不限）。
+	//
+	// 存在的理由：短期事件会过期，而「过期」在召回侧是**时间**：
+	// 三周前的一次重启不该再进 prompt——它不但占预算，
+	// 还会让模型把那次重启当成当前状态。
+	//
+	// 只作用于事件类事实（types.FactKind.IsEvent）：状态与长期经验不按时间筛
+	// （状态的过期由取代链表达，经验不因时间失效）。
+	//
+	// ⚠️ **用户显式问了历史时，这条让位**：请求里带了
+	// OccurredFrom/OccurredTo（问哪个时间段）时，窗口不生效——
+	// 显式查询优先于默认策略。
+	EventWindow time.Duration
 	// Metrics 指标面（可 nil：nil = 不打点）。
 	//
 	// 打点口径由内核定（指标名见本包的指标名常量），
@@ -366,6 +379,15 @@ type Reader interface {
 	// 只在 ListAtoms 上过滤是不够的，检索路会绕过滤面直接取 TopK，
 	// 被别家的卡占掉配额（症状是「召回变少了」，看着像排序问题）。
 	SearchAtoms(ctx context.Context, ns store.Namespace, query string, f store.AtomFilter) ([]*types.AtomCard, error)
+	// SearchAtomsLoose 宽松词面检索（命中任一词）。
+	//
+	// 严格路是**隐式 AND**：每个词都要在正文里出现。
+	// 于是「多话题查询」几乎打不中——基线数字把这件事量出来了
+	// （Recall@3 之后不再上升，部分匹配的事实进不来）。
+	//
+	// 这一路与严格路**并列**（不是替代）：两路的名次交给融合器合成，
+	// 完全匹配的那条在两路都出现（融合分最高），部分匹配的那些从这一路进来。
+	SearchAtomsLoose(ctx context.Context, ns store.Namespace, query string, f store.AtomFilter) ([]*types.AtomCard, error)
 	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope) (*types.EntityPage, error)
 	UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error
 	// ListActiveEntities 读活跃实体栈（代词消解的来源）。
@@ -524,12 +546,21 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 宽松路：命中任一词的事实（严格路是隐式 AND，多话题查询打不中）。
+	looseAtoms, err := p.collectLoose(ctx, eff, limit)
+	if err != nil {
+		return nil, err
+	}
 	// 语义路（装了才有）：与词面路融合，决定**候选池里有什么**。
 	sem, err := p.collectSemantic(ctx, eff, limit)
 	if err != nil {
 		return nil, err
 	}
-	cands = p.fuse(ctx, cands, sem)
+	loose, err := p.looseCandidates(ctx, eff, looseAtoms)
+	if err != nil {
+		return nil, err
+	}
+	cands = p.fuse(ctx, cands, loose, sem)
 	p.metrics().Gauge(MetricSemanticHits, float64(len(sem)))
 
 	cands, droppedByDuplicate := p.suppress(cands, eff)

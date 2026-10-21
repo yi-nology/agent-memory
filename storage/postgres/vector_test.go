@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/yi-nology/agent-memory/ports"
@@ -83,8 +84,12 @@ func TestMigrationAtomVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读 schema_version 失败: %v", err)
 	}
-	if v != "6" {
-		t.Fatalf("版本号应升到 6，实得 %q", v)
+	// 版本号要比「打开前的形状版本」新：旧库升上来后必须落在**当前**形状版本上。
+	//
+	// 断言对着 schemaVersion 常量而不是写死某个数字：迁移是线性追加的，
+	// 写死的数字会在下一次加迁移时又红一次——而那与向量索引毫无关系。
+	if v != strconv.Itoa(schemaVersion) {
+		t.Fatalf("版本号应升到 %d，实得 %q", schemaVersion, v)
 	}
 	if _, err := s2.db.Exec(`SELECT 1 FROM atom_vectors LIMIT 1`); err != nil {
 		t.Fatalf("向量表没建出来: %v", err)

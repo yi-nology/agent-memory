@@ -223,7 +223,7 @@ func (s *rawStore) SearchRaw(ctx context.Context, ns store.Namespace, scope type
 		extra = "(scope = '' OR scope = $3)"
 		extraArgs = []any{string(scope)}
 	}
-	ids, err := s.searchFTS(ctx, "raw_events", nsOf(ns), query, limit, extra, extraArgs...)
+	ids, err := s.searchFTS(ctx, "raw_events", nsOf(ns), query, limit, extra, false, extraArgs...)
 	if err != nil || len(ids) == 0 {
 		return nil, err
 	}
@@ -293,15 +293,36 @@ func (s *rawStore) rawByIDsOrdered(ctx context.Context, ns store.Namespace, ids 
 // 后置过滤会让被滤掉的条目先占掉 LIMIT 配额，于是「该给我的那条」根本没进候选池。
 //
 // extra 为空串时行为与从前一字不差（这是绝大多数调用点的路径）。
+//
+// # loose 是**匹配方式**的开关，不是可见性的开关
+//
+// loose=false：plainto_tsquery（词元合取，每个词都要在）——严格路。
+// loose=true ：to_tsquery 的 OR 语义（命中任一词就算）——宽松路。
+//
+// 两条路的差别**只在词的匹配方式**：namespace 限定、extra 条件（归属 / 活跃 /
+// 时序 / 事件窗口 / 实体集合）、排序与 TopK 都是同一套。
+// 放宽的是「词的匹配」，**不是「可见性」**——过滤条件少一条的后果是泄漏。
 func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int,
-	extra string, extraArgs ...any) ([]string, error) {
+	extra string, loose bool, extraArgs ...any) ([]string, error) {
 	tokens := store.LexicalTokens(query)
 	if len(tokens) == 0 {
 		// 查询里没有可检索的词元（全是标点/空白）：不是错误，是「没得可查」。
 		return nil, nil
 	}
-	where := "namespace = $1 AND body_tsv @@ plainto_tsquery('simple', $2)"
-	args := []any{namespace, ftsQuery(tokens)}
+	// 排序表达式与过滤表达式用**同一个** tsquery：
+	// 两处不是同一个的话，名次算的是另一套匹配（症状是「顺序看着不对」）。
+	matchFn := "plainto_tsquery('simple', $2)"
+	matchArg := ftsQuery(tokens)
+	if loose {
+		// 宽松路：命中任一词就算 ⇒ OR 语义。
+		//
+		// 词元口径走 store.LexicalTokens（与索引侧同源）：自己拼 OR 串的话，
+		// 切法一旦与索引侧分叉就是**静默漏命中**。
+		matchFn = "to_tsquery('simple', $2)"
+		matchArg = ftsQueryAny(tokens)
+	}
+	where := "namespace = $1 AND body_tsv @@ " + matchFn
+	args := []any{namespace, matchArg}
 	if extra != "" {
 		where += " AND " + extra
 		args = append(args, extraArgs...)
@@ -309,7 +330,7 @@ func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, l
 	rows, err := s.query(ctx,
 		`SELECT id FROM `+table+`
 		 WHERE `+where+`
-		 ORDER BY ts_rank(body_tsv, plainto_tsquery('simple', $2)) DESC LIMIT $`+fmt.Sprint(len(args)+1),
+		 ORDER BY ts_rank(body_tsv, `+matchFn+`) DESC LIMIT $`+fmt.Sprint(len(args)+1),
 		append(args, limitOf(limit, 10))...)
 	if err != nil {
 		return nil, err

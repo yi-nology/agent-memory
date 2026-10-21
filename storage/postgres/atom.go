@@ -23,7 +23,7 @@ var errAtomVectorNotStored = errors.New("事实卡带了向量，但本后端不
 const atomCols = `id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,
 	quote_event_id, search_terms, occurred_at, confidence, importance,
 	created_at, updated_at, superseded_by, deprecated_at, provenance,
-	valid_from, valid_to, version`
+	valid_from, valid_to, version, kind`
 
 func (s *atomStore) scanAtom(rows *sql.Rows) (*types.AtomCard, error) {
 	var (
@@ -35,12 +35,13 @@ func (s *atomStore) scanAtom(rows *sql.Rows) (*types.AtomCard, error) {
 		validFrom                  sql.NullTime
 		validTo                    sql.NullTime
 		version                    int64
+		kind                       string
 		prov                       provenanceFields
 	)
 	if err := rows.Scan(&a.ID, &a.EntityID, &a.Scope, &a.CandidateID, &rawIDs, &a.Assertion,
 		&a.VerbatimQuote, &a.QuoteEventID, &terms, &occurred, &a.Confidence, &a.Importance,
 		&created, &updated, &a.SupersededBy, &deprecated, provScan{&prov},
-		&validFrom, &validTo, &version); err != nil {
+		&validFrom, &validTo, &version, &kind); err != nil {
 		return nil, err
 	}
 	a.RawEventIDs = parseStrings(rawIDs)
@@ -55,6 +56,10 @@ func (s *atomStore) scanAtom(rows *sql.Rows) (*types.AtomCard, error) {
 	a.ValidFrom = fromTSPtr(validFrom)
 	a.ValidTo = fromTSPtr(validTo)
 	a.Version = int(version)
+	// 时效类别：读出来就是「零值 = 默认 = 长期经验」。
+	// 列是 NOT NULL DEFAULT ''，故老库的既有行读出来是空串——
+	// 它们的语义（不因时间失效）在升级前后**逐字相同**。
+	a.Kind = types.FactKind(kind)
 	a.Provenance = types.Provenance{
 		Origin:       types.OriginKind(prov.Origin),
 		Host:         prov.Host,
@@ -86,9 +91,9 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 		(namespace, id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,
 		 quote_event_id, search_terms, occurred_at, confidence, importance,
 		 created_at, updated_at, superseded_by, deprecated_at, provenance, signature,
-		 body, body_tsv, valid_from, valid_to, version)
+		 body, body_tsv, valid_from, valid_to, version, kind)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-		        to_tsvector('simple', $20),$21,$22,$23)
+		        to_tsvector('simple', $20),$21,$22,$23,$24)
 		ON CONFLICT(namespace, id) DO UPDATE SET
 			entity_id = excluded.entity_id, scope = excluded.scope,
 			candidate_id = excluded.candidate_id,
@@ -101,13 +106,14 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 			provenance = excluded.provenance, signature = excluded.signature,
 			body = excluded.body, body_tsv = excluded.body_tsv,
 			valid_from = excluded.valid_from, valid_to = excluded.valid_to,
-			version = excluded.version`,
+			version = excluded.version,
+			kind = excluded.kind`,
 		nsOf(ns), a.ID, a.EntityID, string(a.Scope), a.CandidateID, stringsJSON(a.RawEventIDs),
 		a.Assertion, a.VerbatimQuote, a.QuoteEventID, stringsJSON(a.SearchTerms),
 		ts(a.OccurredAt), string(a.Confidence), string(a.Importance), ts(a.CreatedAt), ts(now),
 		a.SupersededBy, tsPtr(a.DeprecatedAt),
 		provenanceJSON(provenanceOf(a.Provenance)), a.Signature(), body,
-		ts(a.ValidFrom), tsPtr(a.ValidTo), a.VersionOrOne())
+		ts(a.ValidFrom), tsPtr(a.ValidTo), a.VersionOrOne(), string(a.Kind))
 	return err
 }
 
@@ -166,6 +172,13 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 //
 // start 是第一个占位符的编号：PG 的占位符带号，两条路的起号不同
 // （列表路 $1 是 namespace，检索路 $1/$2 是 namespace 与 tsquery）。
+//
+// # 事件窗口与时间窗是**两个维度**
+//
+// EventSince（「默认别把太老的事件端上来」）与
+// OccurredFrom/OccurredTo（「问哪个时间段」）问的不是同一件事：
+// 前者是召回的**默认策略**，后者是用户的**显式提问**。
+// 两者同时给时是 AND 关系（都要满足）——各管各的，谁也不许吞掉谁。
 func atomConditions(f store.AtomFilter, start int) (string, []any) {
 	var (
 		where = []string{}
@@ -219,6 +232,21 @@ func atomConditions(f store.AtomFilter, start int) (string, []any) {
 	if !f.OccurredTo.IsZero() {
 		where = append(where, "occurred_at < $"+fmt.Sprint(start))
 		args = append(args, ts(f.OccurredTo))
+		start++
+	}
+	if !f.EventSince.IsZero() {
+		// 事件窗口：**只作用于事件类**。
+		//
+		// 判据写成「不是事件类，或者发生时刻不早于下界」，
+		// 而不是「发生时刻不早于下界」——后者会把长期经验与状态
+		// 也按时间筛掉，而它们的生命周期不由时间决定：
+		// 状态的「过期」由取代链表达（见 types.AtomCard.ValidTo），
+		// 经验永久保留（只在被推翻时失效）。
+		//
+		// 零值时整条条件不出现 ⇒ 不配它时行为与从前**逐条一致**。
+		where = append(where, fmt.Sprintf("(kind <> '%s' OR occurred_at >= $%d)",
+			types.FactEvent, start))
+		args = append(args, ts(f.EventSince))
 		start++
 	}
 	if !f.At.IsZero() {
@@ -293,7 +321,38 @@ func (s *atomStore) searchAtomIDs(ctx context.Context, ns store.Namespace,
 	query string, f store.AtomFilter) ([]string, error) {
 	// 占位符起号：$1 是 namespace，$2 是 tsquery，条件从 $3 起。
 	cond, condArgs := atomConditions(f, 3)
-	return s.searchFTS(ctx, "atoms", nsOf(ns), query, f.Limit, cond, condArgs...)
+	return s.searchFTS(ctx, "atoms", nsOf(ns), query, f.Limit, cond, false, condArgs...)
+}
+
+// SearchAtomsLoose **宽松**词法检索：命中**任一**词就算（OR 匹配）。
+//
+// 与 SearchAtoms **完全同构**：同样的过滤条件（归属 / 活跃 / 时序 /
+// 事件窗口 / 实体集合）、同样在 SQL 里生效、同样按相关度排序、同样 TopK。
+// 唯一的差别是**词的匹配方式**：严格路是词元合取，宽松路是词元析取。
+//
+// # 为什么放宽的是「词」而不是「可见性」
+//
+// 过滤条件少一条的后果是**泄漏**（别家的卡进了候选池），
+// 而放宽词的匹配只是「多召回几条可能相关的」——后者由排序与融合兜着。
+// 故两条路共用同一处条件构造（atomConditions），一处也不许少。
+func (s *atomStore) SearchAtomsLoose(ctx context.Context, ns store.Namespace,
+	query string, f store.AtomFilter) ([]*types.AtomCard, error) {
+	ids, err := s.searchAtomIDsLoose(ctx, ns, query, f)
+	if err != nil || len(ids) == 0 {
+		return nil, err
+	}
+	return s.atomsByIDsOrdered(ctx, ns, ids)
+}
+
+// searchAtomIDsLoose 事实卡的宽松检索：取标识（带过滤条件）。
+//
+// 与严格路（searchAtomIDs）只差匹配方式，其余（namespace 限定、条件、
+// 排序、TopK）全部复用 searchFTS。
+func (s *atomStore) searchAtomIDsLoose(ctx context.Context, ns store.Namespace,
+	query string, f store.AtomFilter) ([]string, error) {
+	// 占位符起号与严格路相同：$1 是 namespace，$2 是 tsquery，条件从 $3 起。
+	cond, condArgs := atomConditions(f, 3)
+	return s.searchFTS(ctx, "atoms", nsOf(ns), query, f.Limit, cond, true, condArgs...)
 }
 
 func (s *atomStore) SupersedeAtom(ctx context.Context, ns store.Namespace, id, supersededBy string) error {

@@ -251,11 +251,16 @@ func TestMigrationAtomTemporal(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("写入失败: %v", err)
 	}
-	// 变回「v3 形状」：去掉三列、删掉边表、版本号改回 3。
+	// 变回「v3 形状」：去掉三列与时效类别列、删掉边表、版本号改回 3。
+	//
+	// ⚠️ 时效类别列（kind，v7 加的）**也要去掉**：它比生效区间三列**更新**，
+	// 而 ALTER 只能把新列追加到末尾——留着它，迁移补列时新列会排在它后面，
+	// 于是「迁移后的形状」与「新建的形状」列序不同（两者形状不一致的形状差异）。
 	for _, stmt := range []string{
 		`ALTER TABLE atoms DROP COLUMN valid_from`,
 		`ALTER TABLE atoms DROP COLUMN valid_to`,
 		`ALTER TABLE atoms DROP COLUMN version`,
+		`ALTER TABLE atoms DROP COLUMN kind`,
 		`DROP TABLE IF EXISTS entity_edges`,
 		`UPDATE meta SET value = '3' WHERE namespace = '' AND key = 'schema_version'`,
 	} {
@@ -362,10 +367,14 @@ func TestFreshSchemaMatchesMigratedShape(t *testing.T) {
 	defer dropTempDB(t, dsn, dbName)
 
 	// 变回「v3 形状」再打开一次，让它走一遍迁移。
+	//
+	// ⚠️ 时效类别列（kind，v7 加的）也要去掉：ALTER 只能把新列追加到末尾，
+	// 留着它，迁移补列时新列会排在它后面，于是迁移后的列序与新建的库不同。
 	for _, stmt := range []string{
 		`ALTER TABLE atoms DROP COLUMN valid_from`,
 		`ALTER TABLE atoms DROP COLUMN valid_to`,
 		`ALTER TABLE atoms DROP COLUMN version`,
+		`ALTER TABLE atoms DROP COLUMN kind`,
 		`DROP TABLE IF EXISTS entity_edges`,
 		`UPDATE meta SET value = '3' WHERE namespace = '' AND key = 'schema_version'`,
 	} {

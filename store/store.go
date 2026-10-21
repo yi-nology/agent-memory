@@ -209,6 +209,29 @@ type AtomStore interface {
 	// ActiveOnly 默认 false，故「退役事实仍可搜到」这条约定保持不变
 	// （追问「当初为什么这么判」要能搜到）。
 	SearchAtoms(ctx context.Context, ns Namespace, query string, f AtomFilter) ([]*types.AtomCard, error)
+	// SearchAtomsLoose **宽松**词法检索：命中**任一**词就算（OR 匹配）。
+	//
+	// # 为什么要有它
+	//
+	// SearchAtoms 是**隐式 AND**（每个词都要在正文里出现）。
+	// 后果是「多话题查询」几乎打不中：「磁盘 内存 清理」里只要有一条事实
+	// 没有同时含这三个词，它就不在命中集里——而它对这条查询明明是相关的。
+	//
+	// 基线数字把这件事量出来了（docs/EVAL_BASELINE.md）：
+	// Recall@3 之后**不再上升**（部分匹配的事实进不来）。
+	//
+	// # 为什么是**另一路**而不是把 AND 改成 OR
+	//
+	// 直接改成 OR：噪声一次性灌进候选池，而池内排序只能靠打分器救——
+	// 而打分器是词面重叠，于是「命中任一词」与「词面重叠高」高度相关，
+	// 噪声反而排前面。
+	//
+	// 另加一路再交给融合器（RRF）合并：完全匹配的那条在**严格路**里，
+	// 部分匹配的那些在**宽松路**里，两路名次由 RRF 合成——
+	// 严格命中在两路都出现（融合分最高）。
+	//
+	// 过滤条件与 SearchAtoms **完全一致**（归属、活跃、时序、TopK 同一次求值）。
+	SearchAtomsLoose(ctx context.Context, ns Namespace, query string, f AtomFilter) ([]*types.AtomCard, error)
 	// SupersedeAtom 软退役：被继任者推翻。旧卡保留可查。
 	SupersedeAtom(ctx context.Context, ns Namespace, id, supersededBy string) error
 	// DeprecateAtom 软退役：人工作废。

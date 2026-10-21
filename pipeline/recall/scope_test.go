@@ -185,6 +185,11 @@ func (n noRawReader) GetEntityPage(ctx context.Context, ns store.Namespace, id s
 	return n.f.GetEntityPage(ctx, ns, id, scope)
 }
 
+func (n noRawReader) SearchAtomsLoose(ctx context.Context, ns store.Namespace, q string,
+	flt store.AtomFilter) ([]*types.AtomCard, error) {
+	return n.f.SearchAtomsLoose(ctx, ns, q, flt)
+}
+
 func (n noRawReader) ListActiveEntities(ctx context.Context, ns store.Namespace, threadID string, limit int) ([]*types.ActiveEntity, error) {
 	return n.f.ListActiveEntities(ctx, ns, threadID, limit)
 }

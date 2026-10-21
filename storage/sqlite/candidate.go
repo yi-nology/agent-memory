@@ -193,7 +193,7 @@ func isValidCandidateStatus(st types.CandidateStatus) bool {
 }
 
 func (s *candidateStore) SearchCandidates(ctx context.Context, ns store.Namespace, query string, limit int) ([]*types.Candidate, error) {
-	ids, err := s.searchFTS(ctx, "candidate_fts", nsOf(ns), query, limit, "")
+	ids, err := s.searchFTS(ctx, "candidate_fts", nsOf(ns), query, limit, "", false)
 	if err != nil || len(ids) == 0 {
 		return nil, err
 	}

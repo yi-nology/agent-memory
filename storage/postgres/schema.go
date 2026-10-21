@@ -10,8 +10,9 @@ import (
 //
 // 记在 meta 表的 schema_version 键里，迁移按版本号线性追加（见 migrate.go）。
 //
-// 6 = 事实卡的生效区间与版本号（v4）+ 关系边表（v5）+ 向量索引表（v6）。
-const schemaVersion = 6
+// 7 = 事实卡的生效区间与版本号（v4）+ 关系边表（v5）+ 向量索引表（v6）
+//   - 事实卡的时效类别列（v7）。
+const schemaVersion = 7
 
 // atomVectorsDDL 向量索引表的建表语句。
 //
@@ -189,6 +190,21 @@ CREATE TABLE IF NOT EXISTS atoms (
   valid_from      TIMESTAMPTZ,
   valid_to        TIMESTAMPTZ,
   version         INTEGER NOT NULL DEFAULT 1,
+  -- 时效类别（见 types.FactKind）：空串 = 默认 = 按长期经验处理，**不因时间失效**。
+  --
+  -- 零值落在「不淘汰」那一侧是刻意的：既有事实卡没有这个维度，
+  -- 而升级不该让它们开始被淘汰——零值若落在「会被淘汰」的一侧，
+  -- 升级一次就丢一批老事实。故 DEFAULT '' 而不是 DEFAULT 'event'。
+  --
+  -- ⚠️ 这一列的**形状变更与索引**都归迁移管（见 migrate.go 的 v7）：
+  -- 本文件的 DDL 每次打开都跑，而旧库的 atoms 表还没有这一列——
+  -- 建索引的语句会当场失败，整个库都打不开了。
+  --
+  -- ⚠️ 这一列**必须排在最后**：迁移用 ALTER TABLE ADD COLUMN 补列，
+  -- 而 ALTER 只能把新列追加到末尾——建表脚本若把它插在中间，
+  -- 新建的库与迁移后的库形状就不同了（列序不同），
+  -- 而形状差异的后果是「有的库能取到、有的库取不到」。
+  kind            TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (namespace, id)
 );
 CREATE INDEX IF NOT EXISTS atoms_entity ON atoms (namespace, entity_id);

@@ -84,20 +84,18 @@ func TestRecallBaseline(t *testing.T) {
 	//
 	// 数字取自本机实测值再往下留一截余量：退化到明显不可接受才红，
 	// 而正常波动不红。
-	if got := rep.Metrics.RecallAtK[5]; got < 0.45 {
+	if got := rep.Metrics.RecallAtK[5]; got < 0.60 {
 		t.Fatalf("Recall@5 基线护栏：实得 %.3f，低于 0.45", got)
 	}
-	if got := rep.Metrics.NDCGAtK[5]; got < 0.55 {
+	if got := rep.Metrics.NDCGAtK[5]; got < 0.65 {
 		t.Fatalf("nDCG@5 基线护栏：实得 %.3f，低于 0.55", got)
 	}
 	if got := rep.Metrics.HitRate; got < 0.90 {
 		t.Fatalf("HitRate 基线护栏：实得 %.3f，低于 0.90", got)
 	}
-	// 上下文充分率当前极低（见 docs/EVAL_BASELINE.md 的分析：
-	// 词面路是隐式 AND，多话题查询几乎打不中），
-	// 故这里的护栏只挡「彻底失效」，不挡小幅波动。
-	if got := qa.Metrics.Sufficient; got < 0.01 {
-		t.Fatalf("上下文充分率基线护栏：实得 %.3f，低于 0.01（彻底失效）", got)
+	// 上下文充分率（加上宽松词面路之后从 0.025 升到 0.300）。
+	if got := qa.Metrics.Sufficient; got < 0.25 {
+		t.Fatalf("上下文充分率基线护栏：实得 %.3f，低于 0.25", got)
 	}
 	if !qa.Efficiency.Measured {
 		t.Fatal("token 效率应被测：真召回链报得出每条结果的 token")

@@ -496,9 +496,24 @@ func (s *Store) indexDelete(ctx context.Context, table, namespace, ref string) e
 // 后置过滤会让被滤掉的条目先占掉 LIMIT 配额，于是「该给我的那条」根本没进候选池。
 //
 // extra 为空串时行为与从前一字不差（这是绝大多数调用点的路径）。
+//
+// # loose 是**匹配方式**的开关，不是可见性的开关
+//
+// loose=false：隐式 AND（每个词都要在正文里出现）——严格路。
+// loose=true ：命中**任一**词就算（OR）——宽松路。
+//
+// 两条路的差别**只在词的匹配方式**：namespace 限定、extra 条件（归属 / 活跃 /
+// 时序 / 事件窗口 / 实体集合）、排序与 TopK 都是同一套。
+// 放宽的是「词的匹配」，**不是「可见性」**——过滤条件少一条的后果是泄漏。
+//
+// 宽松路的 MATCH 串走 store.FTS5QueryAny（切词口径与索引侧、严格路同源）：
+// 自己拼 OR 串的话，两侧切法一旦分叉就是**静默漏命中**。
 func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, limit int,
-	extra string, extraArgs ...any) ([]string, error) {
+	extra string, loose bool, extraArgs ...any) ([]string, error) {
 	match := ftsQuery(query)
+	if loose {
+		match = store.FTS5QueryAny(query)
+	}
 	if match == "" {
 		// 查询里没有可检索的词元（全是标点/空白）：不是错误，是「没得可查」。
 		return nil, nil

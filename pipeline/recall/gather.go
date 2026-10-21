@@ -232,6 +232,7 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 			OccurredFrom: req.OccurredFrom,
 			OccurredTo:   req.OccurredTo,
 			At:           req.At,
+			EventSince:   p.eventSince(req),
 			Limit:        limit,
 		})
 		if err != nil {
@@ -245,6 +246,7 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 		OccurredFrom: req.OccurredFrom,
 		OccurredTo:   req.OccurredTo,
 		At:           req.At,
+		EventSince:   p.eventSince(req),
 		Limit:        limit,
 	})
 	if err != nil {
@@ -281,6 +283,82 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 		add(a)
 	}
 	return out, nil
+}
+
+// collectLoose 宽松词面路：命中**任一**词的事实。
+//
+// # 为什么与严格路**并列**而不是替代它
+//
+// 严格路是隐式 AND：「磁盘 内存 清理」里只有同时含三个词的事实才算命中，
+// 而一条只含「磁盘」的事实对这条查询明明是相关的。
+// 基线数字把这件事量出来了（docs/EVAL_BASELINE.md）：Recall@3 之后不再上升。
+//
+// 直接把 AND 改成 OR 也不对：噪声一次性灌进池子，
+// 而池内排序靠打分器（词面重叠）——于是「命中任一词」与「词面重叠高」高度相关，
+// 噪声反而排前面。
+//
+// 故另加一路：两路的名次交给融合器（RRF）合成——
+// 完全匹配的那条在**两路都出现**（融合分最高），部分匹配的那些从这一路进来。
+//
+// # 归属与时序过滤在这一层同样生效
+//
+// 与严格路同一套条件（进 SQL，与 TopK 同一次求值）——
+// 放宽的是**词的匹配方式**，不是**可见性**。
+func (p *Pipeline) collectLoose(ctx context.Context, req Request, limit int) ([]*types.AtomCard, error) {
+	if strings.TrimSpace(req.Query) == "" {
+		return nil, nil
+	}
+	scope := p.entityScope(req)
+	if scope != nil && len(scope) == 0 {
+		return nil, nil
+	}
+	var entityIDs []string
+	if scope != nil {
+		entityIDs = req.Entities
+	}
+	atoms, err := p.store.SearchAtomsLoose(ctx, req.Namespace, req.Query, store.AtomFilter{
+		Scope:        req.Scope,
+		EntityIDs:    entityIDs,
+		ActiveOnly:   true,
+		OccurredFrom: req.OccurredFrom,
+		OccurredTo:   req.OccurredTo,
+		At:           req.At,
+		EventSince:   p.eventSince(req),
+		Limit:        limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// 可见性复查（纵深防御）：这一路的过滤在存储层已生效，
+	// 但它比严格路**宽松**（命中任一词即入），故复查一遍更该做。
+	out := make([]*types.AtomCard, 0, len(atoms))
+	for _, a := range atoms {
+		if !a.Active() || !a.Scope.VisibleTo(req.Scope) {
+			continue
+		}
+		if scope != nil && !scope[a.EntityID] {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// eventSince 事件类事实的默认召回窗口下界。
+//
+// 零值 = 不限。两条让位规则：
+//   - 窗口没配（零值）→ 不限；
+//   - **用户显式问了历史**（请求带了 OccurredFrom/OccurredTo）→ 不限。
+//     显式查询优先于默认策略：用户问「上周那次」时，
+//     默认窗口不该把那条挡在外面。
+func (p *Pipeline) eventSince(req Request) time.Time {
+	if p.cfg.EventWindow <= 0 {
+		return time.Time{}
+	}
+	if !req.OccurredFrom.IsZero() || !req.OccurredTo.IsZero() {
+		return time.Time{}
+	}
+	return p.now().Add(-p.cfg.EventWindow)
 }
 
 // entityScope 事实卡的范围。

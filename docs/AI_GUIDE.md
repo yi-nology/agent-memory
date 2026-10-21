@@ -103,7 +103,10 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 事实更新（取代 vs 矛盾） | `pipeline/promotion/update.go` | `types/atom.go`（时序字段）+ `store.AtomFilter.At` | 模型只做**路由**；作废与矛盾落人工 |
 | 时序事实（生效区间） | `types/atom.go` | 两个后端（加列 + 迁移）+ `store.AtomFilter.At` | `ValidFrom` 零值取 `OccurredAt`（老数据不变） |
 | 关系边与多跳 | `types/graph.go` + `pipeline/graph/` | `store.EdgeStore` + 两个后端（建表 + 迁移） | 边是**派生物**；溯源（SourceAtomID）必需 |
-| 评测面 | `evaluation/` | `integration/`（真召回链适配） | 口径写死在一处；合成数据必须可复现且带干扰项 |
+| 评测面 | `evaluation/` | `integration/`（真召回链适配 + 基线护栏） | 口径写死在一处；合成数据必须可复现且带干扰项；**基线数字见 `docs/EVAL_BASELINE.md`** |
+| token 效率 / 问答口径 | `evaluation/qa.go` | 宿主的 `Answerer` / `Judge`（判分用模型归宿主） | 「已测」与「未测」必须能分开；效率的「命中」用**检索口径**（不用「上下文充分」当分子） |
+| 事实时效类别 | `types/atom.go`（`FactKind`） | 两个后端（`kind` 列 + 迁移）+ `lifecycle`（按龄退役）+ `store.AtomFilter.EventSince` | 零值落在**不淘汰**那一类；事件窗口与时间窗是**两个维度**（显式问历史时窗口让位） |
+| 宽松词面路 | `store/lexical.go`（`FTS5QueryAny`）+ `store.SearchAtomsLoose` | `pipeline/recall/hybrid.go`（三路 RRF 融合） | 放宽的是**词的匹配方式**，不是**可见性**；别把 AND 改成 OR（噪声会灌进池子） |
 | MCP 入口 | `adapters/mcp/` | `application.Service` | 白名单四工具，无逃逸口 |
 | 生命周期 | `lifecycle/lifecycle.go` | — | 事实卡只软退役，不硬删 |
 | 迁移包格式 | `operations/portable/portable.go` | `oekit/pkg/pack` | 写面不换 pack：改了等于**改包格式**，已发布包导不回来 |
@@ -303,6 +306,8 @@ git show --stat --name-status HEAD  # 提交后复核文件集合
 | 评测数字每次都不一样 | 合成数据用了全局 `rand`（被别的包推进） | `evaluation/synthetic.go` |
 | 某实体的事实全丢了 | 实体合并时按 `ActiveOnly` 过滤了退役卡 | `store/store.go` ListAtomsByEntity 注释 |
 | 召回结果偏少但看不出原因 | 丢弃没分路 | `Result.Drops` / `ports.Budget` |
+| 多话题查询几乎打不中 | 词面路是**隐式 AND**（每个词都要在） | `store.FTS5QueryAny` + 宽松路（已在 v0.7.x 修，见 `docs/EVAL_BASELINE.md`） |
+| 一次查询给不出答一道多事实问题的上下文 | 上下文充分率低（**部分匹配的事实进不来**） | `docs/EVAL_BASELINE.md` 的充分率与修法 |
 | 画像桶恒为 0 | 画像参与了多样性裁剪被挤掉 | `TestBucketsAreIndependent` |
 | 改了依赖方向门禁就红 | 没先改 policy（policy 先行） | `architecture-policy.yaml` |
 | 中文子串检索 0 命中却「没报错」 | 切词口径漂了：FTS5 把连续汉字当**一个**词元 | `store/lexical.go` `LexicalTokens` |

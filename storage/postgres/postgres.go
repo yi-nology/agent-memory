@@ -391,6 +391,18 @@ func ftsQuery(tokens []string) string {
 	return strings.Join(tokens, " ")
 }
 
+// ftsQueryAny 把词元拼成 **OR** 语义的 tsquery 输入。
+//
+// 与 ftsQuery 同一套词元（store.LexicalTokens，与索引侧同源），
+// 只是连接符从「空格（合取）」换成「|（析取）」——
+// PG 的 tsquery 里 | 就是 OR，且它与普通词的优先级高于 &
+// （这里不与 & 混用，故不必加括号）。
+//
+// 为什么不用 plainto_tsquery：它是**合取**语义，给不了「命中任一词」。
+func ftsQueryAny(tokens []string) string {
+	return strings.Join(tokens, " | ")
+}
+
 // notFound 统一把 sql.ErrNoRows 翻成 store 哨兵。
 func notFound(err error) error {
 	if errors.Is(err, sql.ErrNoRows) {

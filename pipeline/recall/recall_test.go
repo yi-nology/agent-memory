@@ -62,6 +62,10 @@ func (f *fakeReader) ListAtoms(_ context.Context, _ store.Namespace, flt store.A
 		if !flt.OccurredTo.IsZero() && !a.OccurredAt.Before(flt.OccurredTo) {
 			continue
 		}
+		// 事件窗口同理：只作用于**事件类**事实。
+		if !flt.EventSince.IsZero() && a.Kind.IsEvent() && a.OccurredAt.Before(flt.EventSince) {
+			continue
+		}
 		// 归属过滤同理：假存储必须真的按归属筛，
 		// 否则「取数层生效」这条用例是靠召回层的兜底蒙对的。
 		if flt.Scope != "" && !a.Scope.VisibleTo(flt.Scope) {
@@ -96,6 +100,54 @@ func (f *fakeReader) ListRaw(_ context.Context, _ store.Namespace, scope types.S
 	return out, nil
 }
 
+// SearchAtomsLoose 宽松检索：命中**任一**词就算（假实现）。
+//
+// 与 SearchAtoms 的区别就是「全部词命中」与「任一词命中」——
+// 那正是宽松路与严格路的唯一差别（可见性过滤两边一致）。
+func (f *fakeReader) SearchAtomsLoose(_ context.Context, _ store.Namespace, query string,
+	flt store.AtomFilter) ([]*types.AtomCard, error) {
+	terms := strings.Fields(query)
+	var out []*types.AtomCard
+	for _, a := range f.atoms {
+		if !a.Active() {
+			continue
+		}
+		matched := false
+		for _, t := range terms {
+			if strings.Contains(a.Assertion, t) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if len(flt.IDs) > 0 && !containsStr(flt.IDs, a.ID) {
+			continue
+		}
+		if len(flt.EntityIDs) > 0 && !containsStr(flt.EntityIDs, a.EntityID) {
+			continue
+		}
+		if flt.Scope != "" && !a.Scope.VisibleTo(flt.Scope) {
+			continue
+		}
+		if !flt.OccurredFrom.IsZero() && a.OccurredAt.Before(flt.OccurredFrom) {
+			continue
+		}
+		if !flt.OccurredTo.IsZero() && !a.OccurredAt.Before(flt.OccurredTo) {
+			continue
+		}
+		if !flt.EventSince.IsZero() && a.Kind.IsEvent() && a.OccurredAt.Before(flt.EventSince) {
+			continue
+		}
+		out = append(out, a)
+		if flt.Limit > 0 && len(out) >= flt.Limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 // SearchAtoms 按查询词检索事实卡（假实现：子串匹配即可）。
 //
 // 假实现只要求能区分「命中」与「不命中」：召回测试关心的正是
@@ -118,6 +170,10 @@ func (f *fakeReader) SearchAtoms(_ context.Context, _ store.Namespace, query str
 			continue
 		}
 		if flt.Scope != "" && !a.Scope.VisibleTo(flt.Scope) {
+			continue
+		}
+		// 事件窗口：只作用于**事件类**事实。
+		if !flt.EventSince.IsZero() && a.Kind.IsEvent() && a.OccurredAt.Before(flt.EventSince) {
 			continue
 		}
 		out = append(out, a)

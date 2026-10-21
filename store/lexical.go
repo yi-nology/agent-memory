@@ -2,6 +2,7 @@ package store
 
 import (
 	"github.com/oagentkit/textx/textutil"
+	"strings"
 )
 
 // LexicalTokens 把查询串与可检索正文切成同一套词元。
@@ -76,4 +77,43 @@ func LexicalTokens(s string) []string {
 // 切不出词元时返回空串——空 MATCH 是 FTS5 的语法错误，调用方据此跳过查询。
 func FTS5Query(s string) string {
 	return textutil.FTS5Query(s)
+}
+
+// FTS5QueryAny 把查询串拼成 FTS5 的 **OR** MATCH 串（宽松匹配）。
+//
+// # 为什么需要它（2026-10-21 实弹，基线数字暴露的）
+//
+// FTS5Query 是**隐式 AND**：查询的每个词都得在正文里出现才算命中。
+// 后果是「多话题查询」几乎打不中——
+// 「磁盘 内存 清理」里只要有一条事实没有同时含这三个词，它就不在命中集里；
+// 而它对这条查询明明是相关的（用户问的是三件事）。
+//
+// 基线数字把这件事量出来了：Recall@3 之后**不再上升**（0.533 → 0.533），
+// 而 Recall@1 只有 0.404 ——
+// 说明「每条查询都能找到完全匹配的那一条」，但**部分匹配的事实进不来**。
+//
+// # 为什么是「另加一路」而不是把 AND 改成 OR
+//
+// 直接改成 OR：噪声会一次性灌进候选池（命中任一词就算），
+// 而池子里的排序只能靠打分器救——而打分器是**词面重叠**，
+// 于是「命中任一词」与「词面重叠高」高度相关，噪声反而排前面。
+//
+// 另加一路（宽松）再交给融合器（RRF）合并：完全匹配的那条在**严格路**里，
+// 部分匹配的那些在**宽松路**里，两路的名次由 RRF 合成——
+// 严格命中在两路都出现（融合分最高），部分命中的排在后面。
+//
+// # 语义边界与 FTS5Query 相同
+//
+// 词元逐个加引号（降回字面量，防止用户输入里的 AND/OR/NOT/NEAR 被当成运算符），
+// 词元之间用 " OR " 连接。切不出词元时返回空串（空 MATCH 是语法错误）。
+func FTS5QueryAny(s string) string {
+	toks := LexicalTokens(s)
+	if len(toks) == 0 {
+		return ""
+	}
+	quoted := make([]string, 0, len(toks))
+	for _, t := range toks {
+		quoted = append(quoted, `"`+t+`"`)
+	}
+	return strings.Join(quoted, " OR ")
 }

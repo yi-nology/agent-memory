@@ -279,8 +279,8 @@ func TestMigrationAtomTemporal(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("写入失败: %v", err)
 	}
-	// 变回「v3 形状」：去掉三列、删掉边表、版本号改回 3。
-	dropTemporalShape(t, s)
+	// 变回「v3 形状」：去掉三列与时效类别列、删掉边表、版本号改回 3。
+	dropPostV3Shape(t, s)
 	if _, err := s.db.Exec(
 		`UPDATE meta SET value = '3' WHERE namespace = '' AND key = 'schema_version'`); err != nil {
 		t.Fatalf("改版本号失败: %v", err)
@@ -416,16 +416,23 @@ func TestMigrationAtomTemporalIsIdempotent(t *testing.T) {
 	}
 }
 
-// dropTemporalShape 把库变回「没有生效区间三列、没有关系边表」的旧形状。
+// dropPostV3Shape 把库变回「v3 形状」（没有生效区间三列、没有时效类别列、没有关系边表）。
 //
 // 不复制一份旧 DDL：旧形状由**当前形状的反面**推导（删列、删表），
 // 故它不会随真 DDL 变化而失效（抄一份旧 DDL 的用例会绿着，而真库炸着）。
-func dropTemporalShape(t *testing.T, s *Store) {
+//
+// ⚠️ 时效类别列（kind，v7 加的）**也要去掉**：它比生效区间三列**更新**，
+// 而 ALTER 只能把新列追加到末尾——留着它，迁移补列时新列会排在它后面，
+// 于是「迁移后的形状」与「新建的形状」列序不同（两者形状不一致的形状差异）。
+func dropPostV3Shape(t *testing.T, s *Store) {
 	t.Helper()
 	for _, stmt := range []string{
 		`ALTER TABLE atoms DROP COLUMN valid_from`,
 		`ALTER TABLE atoms DROP COLUMN valid_to`,
 		`ALTER TABLE atoms DROP COLUMN version`,
+		// 先删索引：SQLite 不许删「被索引引用」的列。
+		`DROP INDEX IF EXISTS atoms_kind`,
+		`ALTER TABLE atoms DROP COLUMN kind`,
 		`DROP TABLE IF EXISTS entity_edges`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {

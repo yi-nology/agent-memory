@@ -6,11 +6,12 @@
 // 硬删掉它就无从查证「当初为什么这么判」——而那是记忆系统必须能回答的问题。
 // 故：退役是标记，清理只发生在**有明确保留期**的素材面（原始事件）上。
 //
-// # 四个动作的触发面
+// # 五个动作的触发面
 //
 //	回收 GC        原始事件按龄清理 + 孤儿索引清理
 //	合并 Consolidate 同签名事实合并（事实面是去重，不是硬删）
 //	保留期 Retention 运行期错误来源的事实批量退役
+//	过期 Expire     事件类事实按龄退役（状态与经验不按龄退役）
 //	压缩 Vacuum    后端专属的物理整理（SQLite 的 VACUUM）
 package lifecycle
 
@@ -44,7 +45,16 @@ type Option func(*opts)
 
 type opts struct {
 	now func() time.Time
+	// eventRetention 事件类事实的保留期（超过这个龄的事件按龄退役）。
+	eventRetention time.Duration
 }
+
+// defaultEventRetention 事件类事实的缺省保留期（30 天）。
+//
+// 缺省取一个月：短期事件（「昨天重启过一次」）过期太早会丢掉仍然有用的上下文，
+// 而留得太久又会把三周前的一次重启端到模型面前——
+// 症状只是「模型把旧状态当成当前状态」，在结果里完全看不出来。
+const defaultEventRetention = 30 * 24 * time.Hour
 
 // WithClock 注入时钟（测试用）。
 //
@@ -62,8 +72,21 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
+// WithEventRetention 设事件类事实的保留期。
+//
+// 零值与负值一律回落到缺省（30 天）：保留期为 0 的字面意思是
+// 「所有事件立刻过期」，而调用方想要的多半是「没配」而不是「全过期」——
+// 把「忘配」执行成「全过期」，后果是整批事件类事实被退役。
+func WithEventRetention(d time.Duration) Option {
+	return func(o *opts) {
+		if d > 0 {
+			o.eventRetention = d
+		}
+	}
+}
+
 func newOpts(opt []Option) opts {
-	o := opts{now: func() time.Time { return time.Now().UTC() }}
+	o := opts{now: func() time.Time { return time.Now().UTC() }, eventRetention: defaultEventRetention}
 	for _, f := range opt {
 		if f != nil {
 			f(&o)
@@ -281,6 +304,95 @@ func Retention(ctx context.Context, s Store, ns store.Namespace, opt ...Option) 
 			ID: "journal-retention-" + a.ID, At: o.now(),
 			Kind: types.JournalRetire, Subject: a.ID, Actor: types.DecidedRule,
 			Summary: "证据全部为运行期错误，事实退役",
+		})
+	}
+	return res, nil
+}
+
+// ── 按龄过期 ──
+
+// ExpireResult 按类别过期处理的结果。
+type ExpireResult struct {
+	// EventsRetired 按龄退役的**事件类**事实数。
+	EventsRetired int
+}
+
+// Expire 按类别按龄退役：事件类事实过了保留期就退役。
+//
+// # 为什么按**类别**分治
+//
+// 事实的生命周期分三类（见 types.FactKind），一套策略套所有事实必然两头不讨好：
+//
+//   - 短期事件（FactEvent）：发生过一次的事（「昨天重启过一次」）。
+//     它会**过期**：过了保留期就没有召回价值——留着占预算，
+//     还会误导（模型把三周前的一次重启当成当前状态）。
+//   - 有效期状态（FactState）：现在成立的属性（「容量是 2G」）。
+//     它**被新值取代**而不是过期（取代链已经能表达这件事）。
+//   - 长期经验（FactLesson / 零值默认）：稳定的知识与教训，
+//     **不因时间失效**——只在被推翻时失效。
+//
+// 故这里只退役事件类：状态等取代，经验永久。
+//
+// # 为什么是**软退役**不是删除
+//
+// 本包的首要纪律：事实卡只软退役，不硬删（见包注释）。
+// 被过期的事件**曾经是真的**（「那天确实重启过」），
+// 硬删掉它就无从查证「当初为什么这么判」——而那是记忆系统必须能回答的问题。
+// 故走 DeprecateAtom（打上退役时刻），它仍可被搜到、仍可被追问。
+//
+// # 为什么幂等是**必需的**
+//
+// 保留期动作是**定时跑**的：同一批事实会被一遍又一遍地扫到。
+// 若第二遍重复退役，症状不是报错，而是「审计条目翻倍」
+// （同一张卡两条退役记录，读的人分不清哪条是真的）——
+// 而更糟的是它会让「这张卡什么时候被退役的」这个问题有多个答案。
+// 幂等由两处保证：只取活跃事实（已退役的不再进来），
+// 且审计条目的标识由事实卡标识派生（同一张卡写一次）。
+//
+// # 留痕
+//
+// 退役会改变「这条事实还算不算数」，故必须留审计条目：
+// 没有留痕的话，看板上「这张卡不见了」与「这张卡被谁退役的」长得一模一样。
+func Expire(ctx context.Context, s Store, ns store.Namespace, opt ...Option) (*ExpireResult, error) {
+	o := newOpts(opt)
+	if s == nil {
+		return nil, errors.New("lifecycle: 存储未装配")
+	}
+	// 保留期的判据是**发生时刻**（事情发生的那一刻），
+	// 不是写入时刻：一条三天前发生、今天才记下来的事件，
+	// 它的「龄」是三天而不是零。
+	cutoff := o.now().Add(-o.eventRetention)
+	atoms, err := s.ListAtoms(ctx, ns, store.AtomFilter{ActiveOnly: true, Limit: 100000})
+	if err != nil {
+		return nil, err
+	}
+	res := &ExpireResult{}
+	for _, a := range atoms {
+		// 只退役**事件类**：状态等取代，经验永久（见函数注释的三分类）。
+		if !a.Kind.IsEvent() {
+			continue
+		}
+		// 发生时刻未设的事件不按龄退役：判据要建立在**已知**的时刻上，
+		// 「不知道什么时候发生」不等于「发生在很久以前」。
+		// 误判方向决定代价：错杀一条还新鲜的事实不可挽回，
+		// 而多留一条老事实只是占点预算。
+		if a.OccurredAt.IsZero() {
+			continue
+		}
+		if !a.OccurredAt.Before(cutoff) {
+			continue
+		}
+		if err := s.DeprecateAtom(ctx, ns, a.ID, o.now()); err != nil {
+			return res, err
+		}
+		res.EventsRetired++
+		// 审计条目：退役时刻与原因都要可追。
+		// 用既有的「人工作废」这一类审计动作——types 的枚举面不由本包扩充，
+		// 而按龄过期的**原因**写在 Summary 里（读审计的人分得出它与人工作废）。
+		_ = s.AppendJournal(ctx, ns, &types.JournalEntry{
+			ID: "journal-expire-" + a.ID, At: o.now(),
+			Kind: types.JournalDeprecate, Subject: a.ID, Actor: types.DecidedRule,
+			Summary: "按龄过期：事件类事实超过保留期（" + o.eventRetention.String() + "），退役",
 		})
 	}
 	return res, nil
