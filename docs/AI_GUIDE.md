@@ -97,6 +97,13 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | 判定规则 | `pipeline/promotion/promotion.go` | `types/` 枚举 | 送人工是默认姿态，矛盾**不许**自动裁决 |
 | 提炼（要模型） | `pipeline/extractor/extractor.go` | `types.Candidate` | 抽取与判定**必须分层** |
 | 实体归一 | `pipeline/entity/entity.go` | `types/entity.go` | 合并是**改归属**，不是复制 |
+| 查询理解（时间窗/代词/实体） | `pipeline/query/` | `pipeline/recall`（取数前置）+ `types/query.go` | 解析出的实体**只补画像**，不划事实范围 |
+| 混合检索（语义 + RRF） | `ports/semantic.go` + `ports/rerank.go` | `pipeline/recall/hybrid.go` | 融合决定**池子**，排序归打分器；缺省权重 0 ⇒ 零漂移 |
+| 事实更新（取代 vs 矛盾） | `pipeline/promotion/update.go` | `types/atom.go`（时序字段）+ `store.AtomFilter.At` | 模型只做**路由**；作废与矛盾落人工 |
+| 时序事实（生效区间） | `types/atom.go` | 两个后端（加列 + 迁移）+ `store.AtomFilter.At` | `ValidFrom` 零值取 `OccurredAt`（老数据不变） |
+| 关系边与多跳 | `types/graph.go` + `pipeline/graph/` | `store.EdgeStore` + 两个后端（建表 + 迁移） | 边是**派生物**；溯源（SourceAtomID）必需 |
+| 评测面 | `evaluation/` | `integration/`（真召回链适配） | 口径写死在一处；合成数据必须可复现且带干扰项 |
+| MCP 入口 | `adapters/mcp/` | `application.Service` | 白名单四工具，无逃逸口 |
 | 生命周期 | `lifecycle/lifecycle.go` | — | 事实卡只软退役，不硬删 |
 | 迁移包格式 | `operations/portable/portable.go` | `oekit/pkg/pack` | 写面不换 pack：改了等于**改包格式**，已发布包导不回来 |
 | CLI 命令 | `adapters/cli/{cli,admin}.go` | — | `Run(args,stdout,stderr) int`，不是 `main()` |
@@ -283,6 +290,11 @@ git show --stat --name-status HEAD  # 提交后复核文件集合
 | 换个归属就拿到上一归属的召回结果 | 缓存键漏了 `Scope`（跨租户泄漏） | `pipeline/recall/recall.go` `cacheKey` |
 | 画像里出现了没提过的东西 | 画像不按归属分视角（摘要混进别家事实） | `types/page.go` `EntityPage.Scope` |
 | `memory.page.regen` 安静地什么都不做 | 写入侧没标脏（派生标记没接线） | `application/service.go` `markPageDirty` |
+| 问「上周那次」召不回上周的事 | 时间窗没进**取数层**（只改了词面） | `store.AtomFilter.OccurredFrom/To` |
+| 查「上周」时把上周才写下的事实排除了 | 时间窗与生效区间混了（两个维度） | `types/atom.go` `ValidRange` |
+| 一句代词把整轮事实清空了 | 解析出的实体被拿去划事实范围 | `pipeline/recall` `analyze` |
+| 事实更新悄悄停了（记忆里留着两个版本） | 模型失败被静默吞掉 | `pipeline/promotion/update_llm.go` |
+| 评测数字每次都不一样 | 合成数据用了全局 `rand`（被别的包推进） | `evaluation/synthetic.go` |
 | 某实体的事实全丢了 | 实体合并时按 `ActiveOnly` 过滤了退役卡 | `store/store.go` ListAtomsByEntity 注释 |
 | 召回结果偏少但看不出原因 | 丢弃没分路 | `Result.Drops` / `ports.Budget` |
 | 画像桶恒为 0 | 画像参与了多样性裁剪被挤掉 | `TestBucketsAreIndependent` |

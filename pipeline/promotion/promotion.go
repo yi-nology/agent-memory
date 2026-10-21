@@ -30,6 +30,7 @@ import (
 
 	"github.com/oekit/pkg/container"
 
+	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
 )
@@ -46,6 +47,14 @@ const (
 	DecisionDrop Decision = "drop"
 	// DecisionReview 送人工处置。
 	DecisionReview Decision = "review"
+	// DecisionUpdate 取代：同一主体的事实换了值。
+	//
+	// 与 DecisionPromote 的区别：promote 是**新增**一条事实；
+	// update 是新事实**取代**旧事实（旧事实的有效期到新事实生效为止）。
+	//
+	// 为什么单独一类：它会**让旧事实失效**，而「让一条已存的事实失效」
+	// 是比「新增一条」重的动作——所以它必须能被单独观测、单独审计。
+	DecisionUpdate Decision = "update"
 )
 
 // Store 晋升面用到的存储。
@@ -115,6 +124,30 @@ type Config struct {
 	MaxAssertionRunes int
 	// ConflictSimilarity 相似度阈值（0=0.6）：超过且互相否定即送人工。
 	ConflictSimilarity float64
+	// UpdateSimilarity 相似度阈值（0=0.7）：超过且差异落在值上即取代。
+	//
+	// 比冲突阈值**高**：取代比送人工更重（它让旧事实失效），
+	// 故门槛要更严——「说得像」不够，还得「像到只差一个值」。
+	UpdateSimilarity float64
+	// UpdateHintSimilarity 「可能同主体」的相似度下限（0=0.35）。
+	//
+	// 落在 [UpdateHintSimilarity, UpdateSimilarity) 这一带的事实**判不清**：
+	// 规则看不出是「同一个东西换了值」还是「两件事」，
+	// 故装了模型就**问模型**（模型只做路由，处置见 update_llm.go）。
+	//
+	// 没装模型时这一带按普通晋升处理（新增一条事实）——
+	// 那正是没配模型时的既有行为，降级路径不许因为新功能而变。
+	UpdateHintSimilarity float64
+	// LLM 模型（可 nil：nil = 只用规则判定）。
+	//
+	// 事实更新（同一个东西换了值）本质是**语义判定**：
+	// 规则看得见「数字变了」，看不出「换了个说法但值也变了」。
+	// 故规则给高置信度判据，判不清时问模型。
+	//
+	// 模型的输出只做**路由**（ADD/UPDATE/DELETE/NOOP/CONFLICT），
+	// 最终动作仍由固定处置表决定（见 update_llm.go）——
+	// 「作废一条已存的事实」与「裁决矛盾」永远落在人工手里。
+	LLM ports.LLM
 	// NewEntitySuffix 新建实体的 ID 前缀。
 	NewEntitySuffix string
 	// Actor 判定者署名（0=rule）。
@@ -130,6 +163,12 @@ func (c Config) normalize() Config {
 	}
 	if c.ConflictSimilarity <= 0 {
 		c.ConflictSimilarity = 0.6
+	}
+	if c.UpdateSimilarity <= 0 {
+		c.UpdateSimilarity = 0.7
+	}
+	if c.UpdateHintSimilarity <= 0 {
+		c.UpdateHintSimilarity = 0.35
 	}
 	if c.NewEntitySuffix == "" {
 		c.NewEntitySuffix = "ent-"
@@ -164,8 +203,13 @@ type Verdict struct {
 	Reason string
 	// Check 停在第几道检查（drop/review 时有意义；promote 时为 "pass"）。
 	Check string
-	// Atom 晋升/并入的事实卡（Decision 为 promote/merge 时有值）。
+	// Atom 晋升/并入的事实卡（Decision 为 promote/merge/update 时有值）。
 	Atom *types.AtomCard
+	// Superseded 被取代的旧事实卡（Decision 为 update 时有值）。
+	//
+	// 单独给出来是为了可审计：取代是**让旧事实失效**的动作，
+	// 调用方要能一眼看到「哪条被谁顶掉了」，而不必去库里翻。
+	Superseded *types.AtomCard
 	// EntityID 归一后的实体。
 	EntityID string
 	// Actor 谁做的判定（规则 / 模型 / 人）。
@@ -253,7 +297,29 @@ func (p *Promoter) promote(ctx context.Context, ns store.Namespace, c *types.Can
 		return nil, err
 	}
 
-	// 5 矛盾：与该实体下既有事实高度相似却互相否定 → 送人工，不自动裁决
+	// 5 取代：同一主体、不同值 → 新事实取代旧事实
+	//
+	// 放在矛盾检查**之前**：矛盾（互相否定）要送人工，
+	// 而取代（同一个东西换了值）可以自动做。
+	// 两者都用「同一主体 + 高度相似」做前提，故顺序不能颠倒——
+	// 颠倒的话「已修复/未修复」会被当成「值变了」而自动取代，
+	// 那正是本仓明确禁止的自动裁决。
+	hint, err := p.checkUpdate(ctx, ns, entityID, c)
+	if err != nil {
+		return nil, err
+	}
+	if hint != nil {
+		v, err := p.decideUpdate(ctx, ns, c, entityID, ev, hint)
+		if err != nil {
+			return nil, err
+		}
+		if v != nil {
+			return v, nil
+		}
+		// 判为「不是同一件事」→ 继续走普通晋升路径。
+	}
+
+	// 6 矛盾：与该实体下既有事实高度相似却互相否定 → 送人工，不自动裁决
 	if v, err := p.checkConflict(ctx, ns, entityID, c); err != nil || v != nil {
 		return v, err
 	}
@@ -278,29 +344,7 @@ func (p *Promoter) promoteToAtom(ctx context.Context, ns store.Namespace, c *typ
 	entityID string, ev *types.RawEvent) (*Verdict, error) {
 
 	now := p.now()
-	atom := &types.AtomCard{
-		// ID 由候选 ID 派生：同一条候选被重复晋升时命中同一张卡
-		// （upsert 语义），不会凭空多出一条同签名的重复事实。
-		ID:            "atom-" + c.ID,
-		EntityID:      entityID,
-		CandidateID:   c.ID,
-		RawEventIDs:   c.RawEventIDs,
-		Assertion:     c.Assertion,
-		VerbatimQuote: c.VerbatimQuote,
-		QuoteEventID:  c.QuoteEventID,
-		SearchTerms:   searchTerms(c.Assertion),
-		OccurredAt:    occurredAt(c, ev),
-		Confidence:    c.Confidence,
-		Importance:    c.Importance,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-		// 归属继承自候选（候选的归属又继承自证据事件）：
-		// 归属在**捕获时**定下，中途不让模型参与。
-		Scope: c.Scope,
-		// 来源凭证取自**证据事件**：审计链要能从事实回到那条事件，
-		// 而事件才带 origin/host/tool 这些字段。
-		Provenance: ev.Provenance,
-	}
+	atom := p.newAtom(c, entityID, ev, 1, now)
 	if err := p.store.SaveAtom(ctx, ns, atom); err != nil {
 		return nil, err
 	}

@@ -40,6 +40,7 @@ import (
 	"github.com/yi-nology/agent-memory/application"
 	"github.com/yi-nology/agent-memory/operations/portable"
 	"github.com/yi-nology/agent-memory/pipeline/capture"
+	"github.com/yi-nology/agent-memory/pipeline/query"
 	"github.com/yi-nology/agent-memory/pipeline/recall"
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/storage/sqlite"
@@ -202,6 +203,18 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return cmdSearch(ctx, opt, stdout, stderr, query, *limit)
+	case "query":
+		// 查询理解的自查口：把一句问句翻成「可执行的检索条件」并打印。
+		//
+		// 它不进库也不召回，纯诊断——宿主配了查询理解之后，
+		// 「为什么召回少了」的第一个问题就是「这句被理解成了什么」，
+		// 而答案不该靠猜。
+		q := fs.Arg(0)
+		if q == "" {
+			fmt.Fprintln(stderr, "query 需要一句问句")
+			return 2
+		}
+		return cmdQuery(ctx, stdout, stderr, q)
 	case "stats":
 		return cmdStats(ctx, opt, stdout, stderr)
 	case "export":
@@ -258,6 +271,7 @@ func usage(w io.Writer) {
   memory promote  [--entity ID] [--limit N]        判定候选并落成事实（要模型）
   memory recall   <查询词> [--session S] [--thread T] [--limit N]
   memory search   <查询词> [--limit N]
+  memory query    <问句>                        把一句问句翻成检索条件（诊断用，不入库）
   memory stats
   memory export   --out <包路径>
   memory import   --pkg <包路径>
@@ -563,6 +577,27 @@ func cmdStats(ctx context.Context, opt Options, stdout, stderr io.Writer) int {
 		return 1
 	}
 	b, _ := json.MarshalIndent(s, "", "  ")
+	fmt.Fprintln(stdout, string(b))
+	return 0
+}
+
+// cmdQuery 解析一句问句，打印出「可执行的检索条件」。
+//
+// # 它为什么值得单开一个命令
+//
+// 查询理解是**静默**的：宿主配了它之后，召回结果就变了，
+// 而「变了」这件事没有任何输出。
+// 于是「召回怎么变了的」只能靠对比召回结果去猜——
+// 而召回结果的变化有太多可能的原因（时间窗？实体？词面？预算？）。
+// 这个命令把那一步**显式化**：一句问句进去，翻译结果出来。
+func cmdQuery(ctx context.Context, stdout, stderr io.Writer, text string) int {
+	analyzer := query.New(query.Config{})
+	plan := analyzer.Analyze(ctx, query.Input{Query: text})
+	b, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		fmt.Fprintln(stderr, "序列化失败:", err)
+		return 1
+	}
 	fmt.Fprintln(stdout, string(b))
 	return 0
 }

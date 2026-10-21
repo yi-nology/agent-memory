@@ -25,8 +25,14 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 | 架构门禁 | ✅ | `architecture-policy.yaml` + `tools/archcheck/`（**独立模块**，5 条规则 + 2 条阈值 / 18 个自证用例） |
 | SQLite 后端 | ✅ | `storage/sqlite/` —— 11 张表 + FTS5 + 事务，**零 LLM 可跑**（单套表 + namespace 列隔离，非表前缀）；带**版本化迁移**（老库打开即升级，迁移幂等） |
 | PostgreSQL 后端 | ✅ | `storage/postgres/` —— tsvector + GIN + 事务，与 SQLite **同一组行为断言** |
-| 跨后端行为断言 | ✅ | `storage/parity/` —— **39 条断言，两个后端都真跑**（PG 对着真实服务器） |
-| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测、**取数两路**（查询命中 ∪ 高价值兜底）、可按宿主实体限定、**可按归属隔离**、可无捕获面运行、**排序可注入** |
+| 跨后端行为断言 | ✅ | `storage/parity/` —— **46 条断言，两个后端都真跑**（PG 对着真实服务器） |
+| 召回流水线 | ✅ | `pipeline/recall/` —— 八段串行，**Bander 必需**、分桶配额、三路丢弃可观测、**取数两路**（查询命中 ∪ 高价值兜底）、可按宿主实体限定、**可按归属隔离**、可无捕获面运行、**排序可注入**、**可混合检索**（语义路 + RRF 融合，缺省零漂移）、**可查询理解**（时间窗/代词/实体）、**可打点**（P50/P95/token/缓存/丢弃原因） |
+| 查询理解 | ✅ | `pipeline/query/` —— 相对时间窗（上周/昨天/最近三天）、代词共指、实体提示；**零值=不约束**，不改变未装时的行为 |
+| 事实更新 | ✅ | `pipeline/promotion/` —— **取代**（同一个东西换了值，旧事实到期、版本号 +1）与**矛盾**（互相否定，送人工）分判；模型只做**路由**，作废与矛盾永远落人工 |
+| 时序事实 | ✅ | `types/atom.go` —— 生效区间（`ValidFrom`/`ValidTo`）+ 版本号；老数据语义不变（`ValidFrom` 零值取 `OccurredAt`） |
+| 图谱投影 | ✅ | `types/graph.go` + `pipeline/graph/` —— 关系边是**派生物**（溯源必需），多跳检索带归属与时间过滤 |
+| 评测面 | ✅ | `evaluation/` —— 合成数据集 + Recall@k / Precision@k / nDCG@k / MRR / HitRate，**口径写死**、数据**可复现** |
+| MCP 入口 | ✅ | `adapters/mcp/` —— stdio 上的 JSON-RPC，白名单四工具（capture/search/recall/stats），无逃逸口 |
 | 注入防伪 | ✅ | `ports.MemoryBand` —— 转义全部 `<`，9 条攻击载荷用例钉住 |
 | 脱敏 | ✅ | `ports.PatternRedactor` —— 形态兵底 + `guardx/logredact` 规则表，**掩码长度不泄露原值长度** |
 | 捕获面 | ✅ | `pipeline/capture/` —— **落库前打码**（Redactor 必需）、运行期错误与空白正文拒收 |
@@ -45,6 +51,15 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 > 下游跟着改的清单见 issue #10 / #11 的回写与 tag 的发布说明。
 
 > **未发布（含破坏性变更，发布时并入下一版说明）**：
+> `store.AtomFilter` 新增 `IDs` / `At`；`store` 新增 `EdgeStore` + `EdgeFilter`；
+> `promotion.Verdict` 新增 `Actor` / `Superseded`，`promotion.Decision` 新增 `update`；
+> `promotion.Config` 新增 `LLM` / `UpdateSimilarity` / `UpdateHintSimilarity`；
+> `recall.Config` 新增 `Semantic` / `Analyzer` / `Metrics`；
+> `recall.Request` 新增 `OccurredFrom` / `OccurredTo` / `At`；
+> `ports.RankCandidate` 新增 `FusionScore`，`ports.RankWeights` 新增 `Fusion`；
+> `application.Deps` 新增 `Promotion`；
+> `types.AtomCard` 新增 `ValidFrom` / `ValidTo` / `Version`。
+>
 > 实体页面改成**按归属分视角**（逻辑主键 `namespace + entity_id + scope`），
 > 故 `store.PageStore` 的六个方法都多了 `scope` 参数
 > （`GetEntityPage` / `ListDirtyEntityPages` / `MarkEntityPageDirty` /
@@ -55,7 +70,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 > 打开即升级。
 
 > **PG 那一行不再是「未验证」**：v0.2.0 起 PG 后端是**完整实现**，
-> 39 条 parity 断言对着**真实 PostgreSQL** 跑通，且 CI 里加了 `postgres` service
+> 46 条 parity 断言对着**真实 PostgreSQL** 跑通，且 CI 里加了 `postgres` service
 > 让它每次推送都真跑——「skipped 的 PG 用例不证明兼容」，所以它不许被 skip 掉。
 
 ## 设计取舍（先看这几条，其余都在方案文档里）
@@ -71,7 +86,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
    不破坏那条降级路径；每条登记带 `reason` + `until` + `removal`，缺一条加载即失败、
    到期即红。
 
-2. **行为一致性由共享断言保证，不由各自的单测保证。** `storage/parity` 里 39 条断言，
+2. **行为一致性由共享断言保证，不由各自的单测保证。** `storage/parity` 里 46 条断言，
    两个后端跑**同一份**，且**两个都必须真跑过**（PG 那个对着真实服务器）。
    各自单测都绿 ≠ 行为一致：软退役过滤漏一列、分页游标用
    `<=` 还是 `<`、时间窗闭开区间——这类不一致在各自单测里全都看不出来，

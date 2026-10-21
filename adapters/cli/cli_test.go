@@ -103,3 +103,18 @@ func TestUsageErrorsExitWith2(t *testing.T) {
 		t.Fatalf("缺 pkg 应退出 2，实得 %d", code)
 	}
 }
+
+// 查询理解的自查口：一句问句进去，翻译结果出来。
+//
+// 它是**诊断**命令：不动库、不召回，只回答「这句被理解成了什么」。
+// 断言只钉「有输出且含时间窗」——刻意不钉具体时刻
+// （那会把用例绑在「此刻」上，而它天然依赖当下时刻）。
+func TestQueryCommandPrintsPlan(t *testing.T) {
+	code, out, errOut := run(t, "query", "上周那个问题解决了吗")
+	if code != 0 {
+		t.Fatalf("query 命令应成功: %d %s", code, errOut)
+	}
+	if !strings.Contains(out, "Time") {
+		t.Fatalf("输出里应看得见时间窗: %s", out)
+	}
+}

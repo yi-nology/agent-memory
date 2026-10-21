@@ -185,6 +185,10 @@ func (n noRawReader) GetEntityPage(ctx context.Context, ns store.Namespace, id s
 	return n.f.GetEntityPage(ctx, ns, id, scope)
 }
 
+func (n noRawReader) ListActiveEntities(ctx context.Context, ns store.Namespace, threadID string, limit int) ([]*types.ActiveEntity, error) {
+	return n.f.ListActiveEntities(ctx, ns, threadID, limit)
+}
+
 func (n noRawReader) UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error {
 	return n.f.UpsertActiveEntity(ctx, ns, a)
 }

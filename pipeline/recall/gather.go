@@ -52,7 +52,7 @@ func withoutSource(list []Source, drop Source) []Source {
 //
 // 关键：**ActiveOnly 恒置位**。漏掉它意味着已退役与已作废的事实照进 prompt，
 // 而那种失效在数据上完全看不出来（内容看着是对的，只是过时了）。
-func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candidate, error) {
+func (p *Pipeline) gather(ctx context.Context, req Request, limit int, plan types.QueryPlan) ([]*candidate, error) {
 	var out []*candidate
 
 	if hasSource(p.cfg.Sources, SourceAtom) {
@@ -104,8 +104,15 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 		}
 	}
 
-	if hasSource(p.cfg.Sources, SourcePageHeadline) && len(req.Entities) > 0 {
-		for _, id := range req.Entities {
+	// 画像源用**宿主给的 + 查询理解解析出的**实体。
+	//
+	// 刻意不把解析出的实体塞进 req.Entities：那个字段同时承载
+	// 「本轮提到的实体」（补画像）与「会话锚点实体」（划事实范围）
+	// 两种语义相反的用法，后者要宿主用 RestrictAtomsToEntities 显式声明。
+	// 让一句代词去划事实范围，等于让「那个」清空整轮事实。
+	pageEnts := mergeEntities(req.Entities, plan.Entities)
+	if hasSource(p.cfg.Sources, SourcePageHeadline) && len(pageEnts) > 0 {
+		for _, id := range pageEnts {
 			page, err := p.pageOf(ctx, req, id)
 			if err != nil {
 				return nil, err
@@ -219,20 +226,26 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 	if strings.TrimSpace(req.Query) != "" {
 		var err error
 		hits, err = p.store.SearchAtoms(ctx, req.Namespace, req.Query, store.AtomFilter{
-			Scope:      req.Scope,
-			EntityIDs:  entityIDs,
-			ActiveOnly: true,
-			Limit:      limit,
+			Scope:        req.Scope,
+			EntityIDs:    entityIDs,
+			ActiveOnly:   true,
+			OccurredFrom: req.OccurredFrom,
+			OccurredTo:   req.OccurredTo,
+			At:           req.At,
+			Limit:        limit,
 		})
 		if err != nil {
 			return nil, err
 		}
 	}
 	base, err := p.store.ListAtoms(ctx, req.Namespace, store.AtomFilter{
-		ActiveOnly: true,
-		Scope:      req.Scope,
-		EntityIDs:  entityIDs,
-		Limit:      limit,
+		ActiveOnly:   true,
+		Scope:        req.Scope,
+		EntityIDs:    entityIDs,
+		OccurredFrom: req.OccurredFrom,
+		OccurredTo:   req.OccurredTo,
+		At:           req.At,
+		Limit:        limit,
 	})
 	if err != nil {
 		return nil, err
@@ -416,4 +429,22 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// mergeEntities 合并两处实体来源（保序去重）。
+//
+// 宿主给的排前面：宿主的判断可能来自它自己的上下文，比句面解析准。
+func mergeEntities(lists ...[]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, list := range lists {
+		for _, e := range list {
+			if e == "" || seen[e] {
+				continue
+			}
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	return out
 }

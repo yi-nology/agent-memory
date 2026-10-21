@@ -82,6 +82,9 @@ func (p *Pipeline) rank(ctx context.Context, cands []*candidate, query string, n
 			ImportanceRank: c.Importance.Rank(),
 			OccurredAt:     c.OccurredAt,
 			Tokens:         c.Tokens,
+			// 融合分交给打分器：排序口径是它的事，
+			// 内核只负责把「这一条在多路融合里排第几」如实告诉它。
+			FusionScore: c.fusion,
 		}
 	}
 	scores, err := p.cfg.Ranker.Score(ctx, query, views, now)

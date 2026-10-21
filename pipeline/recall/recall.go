@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yi-nology/agent-memory/pipeline/query"
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
@@ -160,6 +161,23 @@ type Request struct {
 	Scope types.Scope
 	// Limit 条数上限（0=用配置）。
 	Limit int
+	// OccurredFrom / OccurredTo 发生时间窗（含 From，不含 To；零值=不限）。
+	//
+	// 问「上周那次问题」时要的就是这个：**按事情发生的时刻**筛，
+	// 而不是按事实「现在还成不成立」筛（那是 At）。
+	//
+	// 宿主显式给了就以宿主为准；没给而装了查询理解时，
+	// 由查询理解从问句里解析（「上周」→ 具体起止）。
+	OccurredFrom time.Time
+	OccurredTo   time.Time
+	// At 判定时刻（零值=不按生效区间过滤）。
+	//
+	// 「那会儿的事实」与「现在的事实」是两个不同的问题：
+	// 一条事实可以「现在还成立」却「在那个时刻还不成立」
+	// （它是后来才被写下来的）。故它是**独立**于时间窗的一个维度。
+	//
+	// 零值=不按生效区间过滤（既有行为不变）。
+	At time.Time
 }
 
 // Config 召回配置。
@@ -220,6 +238,28 @@ type Config struct {
 	// 打分失败**上抛**，不许静默回退到缺省（静默回退的失效形态是
 	// 「排序悄悄变回老样子」，而调用方看不出发生了什么）。
 	Ranker ports.Ranker
+	// Semantic 语义召回面（可 nil：nil = 只走词面）。
+	//
+	// 装上它就变成**混合召回**：词面一路 + 语义一路，
+	// 两路用 RRF 融合（见 ports.RRF）——融合决定**候选池里有什么**，
+	// 排序仍归打分器。
+	//
+	// 刻意是**可选**的：没装时召回行为与装之前**逐条一致**，
+	// 那条降级路径（没有模型也能召回）必须一直能跑。
+	Semantic ports.SemanticReader
+	// Analyzer 查询理解器（可 nil：nil = 不做查询理解）。
+	//
+	// 装上它，「上周那个问题」会被翻成「上周的时间窗 + 那个实体」，
+	// 于是取数能按时间与实体收窄，而不是全靠词面碰运气。
+	//
+	// 同样是**可选**：不装时行为与现在完全一致。
+	Analyzer *query.Analyzer
+	// Metrics 指标面（可 nil：nil = 不打点）。
+	//
+	// 打点口径由内核定（指标名见本包的指标名常量），
+	// 宿主只负责把它送到自己的监控——口径分散在两处时，
+	// 两边的数字不可比，而不可比的指标比没有指标更坏。
+	Metrics ports.Metrics
 	// NoCaptureFace 宿主**没有捕获面**（只蒸馏终稿，不采集原始事件）。
 	//
 	// 缺省 false = 有捕获面。置 true 时：
@@ -328,6 +368,12 @@ type Reader interface {
 	SearchAtoms(ctx context.Context, ns store.Namespace, query string, f store.AtomFilter) ([]*types.AtomCard, error)
 	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope) (*types.EntityPage, error)
 	UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error
+	// ListActiveEntities 读活跃实体栈（代词消解的来源）。
+	//
+	// 刻意在**召回面**读而不是让宿主喂：代词消解依赖的是
+	// 「这一轮之前聊过谁」，而那是**会话状态**，
+	// 宿主每次自己喂一遍既啰嗦又容易喂错（喂了别的线程的栈）。
+	ListActiveEntities(ctx context.Context, ns store.Namespace, threadID string, limit int) ([]*types.ActiveEntity, error)
 	EvictActiveEntities(ctx context.Context, ns store.Namespace, threadID string, keep int) ([]types.ActiveEntity, error)
 }
 
@@ -407,10 +453,15 @@ func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*
 // Config 取归一后的配置（供装配层自检与测试）。
 func (p *Pipeline) Config() Config { return p.cfg }
 
-// recall 取候选片段。
+// candidate 内部候选。
 type candidate struct {
 	Snippet
 	score float64
+	// fusion 多路融合分（零值=没走融合）。
+	//
+	// 它**不直接决定次序**（次序归打分器），
+	// 而是作为一路信号交给打分器（ports.RankCandidate.FusionScore）。
+	fusion float64
 	// bucket 该片段占哪个配额桶。
 	bucket ports.BucketID
 	// dedupKey 去重键。
@@ -437,20 +488,31 @@ const (
 
 // Recalle 单次召回。
 func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
+	started := p.now()
 	if p.cfg.RecallTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, p.cfg.RecallTimeout)
 		defer cancel()
 	}
 
+	// 查询理解**在查缓存之前**跑：解析结果依赖活跃实体栈，
+	// 而栈会随对话变（「那个」指的实体变了）——
+	// 不把解析结果算进键，缓存就会把上一次的解析结果端上来。
+	//
+	// 代价是缓存命中也要多一次栈查询；那只在装了查询理解时才有。
+	eff, plan := p.analyze(ctx, req)
+
 	if p.cache != nil {
-		if hit, ok := p.cache.get(p.cacheKey(req)); ok {
+		if hit, ok := p.cache.get(p.cacheKey(eff, plan)); ok {
 			// 缓存命中也要推活跃实体栈：栈是会话状态，不是召回结果的一部分。
 			// 漏掉这一步的症状是「开了缓存之后代词消解变差」，
 			// 而原因藏在缓存那一行里，从结果上看不出来。
 			p.pushEntityIDs(ctx, req, hit.Entities)
+			p.metrics().Incr(MetricCacheHit, 1)
+			p.metrics().Observe(MetricRecallDuration, p.now().Sub(started))
 			return hit, nil
 		}
+		p.metrics().Incr(MetricCacheMiss, 1)
 	}
 
 	limit := req.Limit
@@ -458,17 +520,25 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 		limit = p.cfg.TopK
 	}
 
-	cands, err := p.gather(ctx, req, limit)
+	cands, err := p.gather(ctx, eff, limit, plan)
 	if err != nil {
 		return nil, err
 	}
-	cands, droppedByDuplicate := p.suppress(cands, req)
-	if err := p.rank(ctx, cands, req.Query, p.now()); err != nil {
+	// 语义路（装了才有）：与词面路融合，决定**候选池里有什么**。
+	sem, err := p.collectSemantic(ctx, eff, limit)
+	if err != nil {
+		return nil, err
+	}
+	cands = p.fuse(ctx, cands, sem)
+	p.metrics().Gauge(MetricSemanticHits, float64(len(sem)))
+
+	cands, droppedByDuplicate := p.suppress(cands, eff)
+	if err := p.rank(ctx, cands, eff.Query, p.now()); err != nil {
 		return nil, err
 	}
 	cands, droppedByDiversity := diversify(cands, p.cfg.PerEntityMax)
 
-	ents := p.pushEntities(ctx, req, cands)
+	ents := p.pushEntities(ctx, eff, cands)
 
 	kept, budget := p.allocate(cands)
 	// 重复与多样性两条丢弃是召回器自己的判定（不是配额判定的结果），
@@ -488,11 +558,98 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 		Drops:              drops,
 		Buckets:            budget.Kept(),
 	}
+	p.observe(res, budget, p.now().Sub(started))
 	if p.cache != nil {
-		p.cache.put(p.cacheKey(req), res)
+		p.cache.put(p.cacheKey(eff, plan), res)
 	}
 	return res, nil
 }
+
+// analyze 跑查询理解，把结果并进请求。
+//
+// 返回（生效的请求，解析计划）。
+//
+// # 谁说了算
+//
+// **宿主优先**：宿主显式给了时间窗或实体，就以宿主的为准
+// （宿主的判断可能来自它自己的上下文，比句面解析准）。
+// 只有宿主没给时，才用解析结果补上。
+//
+// # 解析出的实体只用来补画像，不用来划事实范围
+//
+// Request.Entities 同时承载两种语义相反的用法，
+// 而事实范围那一支必须由宿主用 RestrictAtomsToEntities **显式**声明。
+// 让一句代词去划事实范围，等于让「那个」清空整轮事实。
+func (p *Pipeline) analyze(ctx context.Context, req Request) (Request, types.QueryPlan) {
+	plan := types.QueryPlan{Raw: req.Query}
+	if p.cfg.Analyzer == nil {
+		return req, plan
+	}
+	// 活跃实体栈：代词消解的来源。
+	var recent []string
+	if req.ThreadID != "" {
+		if ents, err := p.store.ListActiveEntities(ctx, req.Namespace, req.ThreadID, 5); err == nil {
+			for _, e := range ents {
+				recent = append(recent, e.EntityID)
+			}
+		}
+	}
+	plan = p.cfg.Analyzer.Analyze(ctx, query.Input{
+		Query:          req.Query,
+		HostEntities:   req.Entities,
+		RecentEntities: recent,
+	})
+	if req.OccurredFrom.IsZero() {
+		req.OccurredFrom = plan.Time.From
+	}
+	if req.OccurredTo.IsZero() {
+		req.OccurredTo = plan.Time.To
+	}
+	return req, plan
+}
+
+// metrics 取指标面（没装时给一个空的，调用点不用判 nil）。
+func (p *Pipeline) metrics() ports.Metrics {
+	if p.cfg.Metrics == nil {
+		return ports.NoopMetrics{}
+	}
+	return p.cfg.Metrics
+}
+
+// observe 打点：结果规模、丢弃原因、耗时。
+//
+// 口径在这里定死（指标名见本包的常量），宿主只负责搬运。
+func (p *Pipeline) observe(res *Result, budget *ports.Budget, dur time.Duration) {
+	m := p.metrics()
+	m.Observe(MetricRecallDuration, dur)
+	m.Gauge(MetricSnippets, float64(len(res.Snippets)))
+	m.Gauge(MetricTokens, float64(budget.UsedTotal()))
+	m.Gauge(MetricEntitiesPushed, float64(len(res.Entities)))
+	for reason, n := range res.Drops {
+		m.Incr("recall.dropped."+string(reason), n)
+	}
+}
+
+// 指标名。
+//
+// 刻意集中在这里：口径分散在两处时，两边的数字不可比，
+// 而不可比的指标比没有指标更坏（它会让人得出「这个版本变慢了」的假结论）。
+const (
+	// MetricRecallDuration 单次召回耗时。
+	MetricRecallDuration = "recall.duration"
+	// MetricCacheHit 缓存命中次数。
+	MetricCacheHit = "recall.cache.hit"
+	// MetricCacheMiss 缓存未命中次数。
+	MetricCacheMiss = "recall.cache.miss"
+	// MetricSnippets 本次召回带出的片段数。
+	MetricSnippets = "recall.snippets"
+	// MetricTokens 本次召回占用的 token。
+	MetricTokens = "recall.tokens"
+	// MetricEntitiesPushed 推进活跃实体栈的实体数。
+	MetricEntitiesPushed = "recall.entities.pushed"
+	// MetricSemanticHits 语义路命中的条数。
+	MetricSemanticHits = "recall.semantic.hits"
+)
 
 // cacheKey 缓存键。
 //
@@ -532,7 +689,7 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 // 「不含才不会串会话」——那正是把它含进去的理由。方向写反的注释比没有注释更
 // 危险，因为它读起来像是想清楚了。用例 TestCacheKeyIgnoresSession 钉住了行为，
 // 但那条用例的断言文案当时也跟着写反了，一并改了。
-func (p *Pipeline) cacheKey(req Request) string {
+func (p *Pipeline) cacheKey(req Request, plan types.QueryPlan) string {
 	var b strings.Builder
 	sep := func() { b.WriteByte(0) }
 	b.WriteString(string(req.Namespace))
@@ -545,6 +702,14 @@ func (p *Pipeline) cacheKey(req Request) string {
 	sep()
 	b.WriteString(string(req.Scope))
 	sep()
+	// 解析出来的实体**排序后**再进键：代词消解依赖活跃实体栈，
+	// 而栈会随对话变（「那个」指的实体变了）——
+	// 不进键的话，缓存会把上一次的解析结果端上来，
+	// 而症状是「同一句话两次问，答案不一样」——看着像随机。
+	planEnts := append([]string(nil), plan.Entities...)
+	sort.Strings(planEnts)
+	b.WriteString(strings.Join(planEnts, "\x01"))
+	sep()
 	// 实体集合**排序后**再进键：同一组实体换个书写顺序是同一次请求，
 	// 不排序的话键会随调用点的遍历顺序变，命中率凭空掉一截
 	//（而那会让人误以为「缓存好像不太行」，去查一个本来没问题的方向）。
@@ -553,5 +718,14 @@ func (p *Pipeline) cacheKey(req Request) string {
 	b.WriteString(strings.Join(ents, "\x01"))
 	sep()
 	b.WriteString(strconv.Itoa(req.Limit))
+	sep()
+	// 时间维度同样进键：时间窗或判定时刻一变，召回结果就变。
+	// 这条纪律对自己也成立——新加的维度若不进键，
+	// 就会用「上周的窗口」去命中「今天的窗口」的缓存。
+	b.WriteString(strconv.FormatInt(req.OccurredFrom.UnixNano(), 10))
+	sep()
+	b.WriteString(strconv.FormatInt(req.OccurredTo.UnixNano(), 10))
+	sep()
+	b.WriteString(strconv.FormatInt(req.At.UnixNano(), 10))
 	return b.String()
 }

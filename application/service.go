@@ -64,6 +64,13 @@ type Deps struct {
 	Bander ports.Bander
 	// Escalation 实体归一升级通道（可 nil）。
 	Escalation promotion.Escalation
+	// Promotion 晋升配置（可 nil：nil = 用缺省配置）。
+	//
+	// 为什么要透出：事实更新判定（同一个东西换了值）需要模型，
+	// 而模型是由宿主配的（端点、密钥、模型名都是宿主的事）。
+	// 不透出的话，宿主只能「永远拿不到模型」——
+	// 于是「智能事实更新」这一支在真实宿主里永远是死的。
+	Promotion *promotion.Config
 	// Estimator token 计量（可 nil：退到静态代理）。
 	Estimator ports.TokenEstimator
 }
@@ -80,7 +87,11 @@ func New(cfg Config, deps Deps) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	promo, err := promotion.New(promoStore{deps.Store}, deps.Escalation, promotion.Config{})
+	promoCfg := promotion.Config{}
+	if deps.Promotion != nil {
+		promoCfg = *deps.Promotion
+	}
+	promo, err := promotion.New(promoStore{deps.Store}, deps.Escalation, promoCfg)
 	if err != nil {
 		return nil, err
 	}
