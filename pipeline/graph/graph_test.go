@@ -324,6 +324,49 @@ func TestTraverseCycleTerminates(t *testing.T) {
 	}
 }
 
+// TestTraversePathMatchesDepth 路径长度与深度必须自洽。
+//
+// Depth 是「离起点几跳」，Path 是「走过的实体」，两者必须对得上：
+// 深度为 d 的路径就该有 d+1 个实体（起点算第 0 个）。
+// 对不上时调用方没法把路径画成链——它会以为多跳结果是坏的，
+// 而真实原因在本包内部。
+func TestTraversePathMatchesDepth(t *testing.T) {
+	f := newFake()
+	w := newWriter(t, f)
+	tr := newTraverser(t, f)
+	ctx := context.Background()
+
+	for _, e := range []*types.EntityEdge{
+		edge("e1", "a1", "a2", "rel-1", 0.5),
+		edge("e2", "a2", "a3", "rel-1", 0.5),
+		edge("e3", "a3", "a4", "rel-1", 0.5),
+	} {
+		if err := w.Put(ctx, "ns", e); err != nil {
+			t.Fatalf("落边失败: %v", err)
+		}
+	}
+
+	got, err := tr.Traverse(ctx, "ns", []string{"a1"}, TraverseOptions{MaxDepth: 3})
+	if err != nil {
+		t.Fatalf("多跳失败: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("取到 %d 个实体，期望 3 个: %+v", len(got), got)
+	}
+	for _, g := range got {
+		if len(g.Path) != g.Depth+1 {
+			t.Fatalf("%s: 深度=%d 路径=%v（长度 %d），两者对不上",
+				g.EntityID, g.Depth, g.Path, len(g.Path))
+		}
+		if g.Path[0] != "a1" {
+			t.Fatalf("%s: 路径没从起点起头: %v", g.EntityID, g.Path)
+		}
+		if g.Path[len(g.Path)-1] != g.EntityID {
+			t.Fatalf("%s: 路径终点与实体对不上: %v", g.EntityID, g.Path)
+		}
+	}
+}
+
 func countOccurrences(list []string, v string) int {
 	n := 0
 	for _, x := range list {
@@ -438,24 +481,60 @@ func TestTraverseTimeFilter(t *testing.T) {
 	}
 }
 
+// TestTraverseTimeFilterSurvivesLeakyBackend 后端漏了时间过滤时，本包仍要挡住。
+//
+// 纵深防御：漏了时间条件的失效形态是「拿一条已经不成立的关系去连链路」，
+// 而那在结果里完全看不出来——路径看着仍然自洽，只是那条关系早已作废。
+func TestTraverseTimeFilterSurvivesLeakyBackend(t *testing.T) {
+	f := newFake()
+	f.leakAt = true
+	w := newWriter(t, f)
+	tr := newTraverser(t, f)
+	ctx := context.Background()
+
+	t0 := time.Unix(1700000000, 0).UTC()
+	e := edge("e1", "a1", "a2", "rel-1", 0)
+	e.ValidFrom = t0
+	e.ValidTo = t0.Add(time.Hour)
+	if err := w.Put(ctx, "ns", e); err != nil {
+		t.Fatalf("落边失败: %v", err)
+	}
+
+	got, err := tr.Traverse(ctx, "ns", []string{"a1"},
+		TraverseOptions{MaxDepth: 2, At: t0.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatalf("多跳失败: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("后端漏时间过滤时仍取到了已失效的边: %+v", got)
+	}
+}
+
 // TestTraverseOrdersByStrength 两条路径到同一实体时，强的在前。
 //
 // 路径强度是各段强度的**乘积**：一段弱关系会把整条链路拉弱——
 // 最弱的一环决定这条链有多可信。
+//
+// ⚠️ 这里的边顺序与两个目标实体都是**承重**的：
+//   - a4：强路径**先**被走到（a2 那条），弱路径后到；
+//   - a6：弱路径先被走到（a2 那条），强路径后到。
+//
+// 两个方向合起来才把「强者胜出」钉死：
+// 只测一个方向的话，把「总是替换」或「从不替换」任一头的实现放过去，用例照样绿。
 func TestTraverseOrdersByStrength(t *testing.T) {
 	f := newFake()
 	w := newWriter(t, f)
 	tr := newTraverser(t, f)
 	ctx := context.Background()
 
-	// 两条路径都到 a4：经 a2 的强，经 a3 的弱。
-	// 另有一条到 a5 的路径，用来验证排序不是「恰好只有一条」。
 	for _, e := range []*types.EntityEdge{
 		edge("e1", "a1", "a2", "rel-1", 0.5),
-		edge("e2", "a2", "a4", "rel-1", 0.9),
-		edge("e3", "a1", "a3", "rel-1", 0.5),
+		edge("e2", "a1", "a3", "rel-1", 0.5),
+		edge("e3", "a2", "a4", "rel-1", 0.9),
 		edge("e4", "a3", "a4", "rel-1", 0.1),
-		edge("e5", "a1", "a5", "rel-1", 0.3),
+		edge("e5", "a2", "a6", "rel-1", 0.1),
+		edge("e6", "a3", "a6", "rel-1", 0.9),
+		edge("e7", "a1", "a5", "rel-1", 0.3),
 	} {
 		if err := w.Put(ctx, "ns", e); err != nil {
 			t.Fatalf("落边失败: %v", err)
@@ -470,31 +549,94 @@ func TestTraverseOrdersByStrength(t *testing.T) {
 	for _, g := range got {
 		byID[g.EntityID] = g
 	}
+
+	// a4：强路径先到 → 弱路径不得把它顶掉。
 	a4, ok := byID["a4"]
 	if !ok {
 		t.Fatalf("没取到 a4: %+v", got)
 	}
-	// a4 只有一条记录（实体只到达一次），走的是强的那条路径。
 	if want := 0.5 * 0.9; a4.Weight != want {
 		t.Fatalf("a4 强度=%v，期望 %v", a4.Weight, want)
 	}
 	if p := a4.Path; len(p) != 3 || p[1] != "a2" {
 		t.Fatalf("a4 路径=%v，期望走强的那条", p)
 	}
-	if n := countByEntity(got, "a4"); n != 1 {
-		t.Fatalf("a4 出现 %d 次，期望 1 次", n)
+
+	// a6：弱路径先到 → 强路径必须把它顶掉。
+	a6, ok := byID["a6"]
+	if !ok {
+		t.Fatalf("没取到 a6: %+v", got)
+	}
+	if want := 0.5 * 0.9; a6.Weight != want {
+		t.Fatalf("a6 强度=%v，期望 %v", a6.Weight, want)
+	}
+	if p := a6.Path; len(p) != 3 || p[1] != "a3" {
+		t.Fatalf("a6 路径=%v，期望走强的那条", p)
+	}
+
+	// 实体只到达一次：每个实体只有一条记录。
+	for _, id := range []string{"a4", "a6"} {
+		if n := countByEntity(got, id); n != 1 {
+			t.Fatalf("%s 出现 %d 次，期望 1 次", id, n)
+		}
 	}
 	if len(got) < 3 {
 		t.Fatalf("结果只有 %d 条，排序无从验证: %+v", len(got), got)
 	}
-	// 强度高的在前：a4（0.45）在 a5（0.3）之前。
+	// 强度高的在前：a4/a6（0.45）在 a5（0.3）之前。
 	if indexOf(got, "a4") > indexOf(got, "a5") {
+		t.Fatalf("强度排序不对: %+v", got)
+	}
+	if indexOf(got, "a6") > indexOf(got, "a5") {
 		t.Fatalf("强度排序不对: %+v", got)
 	}
 	// 同强度按到达顺序稳定排序：a2 与 a3 都是 0.5，a2 先到。
 	if indexOf(got, "a2") > indexOf(got, "a3") {
 		t.Fatalf("同强度的到达顺序没保持: %+v", got)
 	}
+}
+
+// TestTraverseKeepsShallowestArrival 更深的路径不替换更浅的。
+//
+// 深度是「离起点多远」，它由**首次到达**决定：一个实体先到的那条路更近，
+// 拿更远的路去改它会让深度与实际距离对不上。
+// 同深度的另一条路才比强度（见 TestTraverseOrdersByStrength）。
+func TestTraverseKeepsShallowestArrival(t *testing.T) {
+	f := newFake()
+	w := newWriter(t, f)
+	tr := newTraverser(t, f)
+	ctx := context.Background()
+
+	for _, e := range []*types.EntityEdge{
+		edge("e1", "a1", "a2", "rel-1", 0.2),
+		edge("e2", "a1", "a3", "rel-1", 0.5),
+		edge("e3", "a3", "a2", "rel-1", 0.9),
+	} {
+		if err := w.Put(ctx, "ns", e); err != nil {
+			t.Fatalf("落边失败: %v", err)
+		}
+	}
+
+	got, err := tr.Traverse(ctx, "ns", []string{"a1"}, TraverseOptions{MaxDepth: 3})
+	if err != nil {
+		t.Fatalf("多跳失败: %v", err)
+	}
+	for _, g := range got {
+		if g.EntityID != "a2" {
+			continue
+		}
+		if g.Depth != 1 {
+			t.Fatalf("a2 深度=%d，期望 1（首次到达即定深度）", g.Depth)
+		}
+		if want := 0.2; g.Weight != want {
+			t.Fatalf("a2 强度=%v，期望 %v（更深的路径不该替换更浅的）", g.Weight, want)
+		}
+		if p := g.Path; len(p) != 2 || p[1] != "a2" {
+			t.Fatalf("a2 路径=%v，期望直达那条", p)
+		}
+		return
+	}
+	t.Fatalf("没取到 a2: %+v", got)
 }
 
 func countByEntity(list []Traversal, entityID string) int {
@@ -554,6 +696,36 @@ func TestTraverseRelationFilter(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].EntityID != "a3" {
 		t.Fatalf("取到 %+v，期望只取到 a3", got)
+	}
+}
+
+// TestTraverseRelationFilterSurvivesLeakyBackend 后端漏了关系过滤时，本包仍要挡住。
+//
+// 纵深防御：漏了关系条件的失效形态是「走出了一条调用方没要求走的关系」，
+// 而那在结果里完全看不出来——路径看着仍然自洽。
+func TestTraverseRelationFilterSurvivesLeakyBackend(t *testing.T) {
+	f := newFake()
+	f.leakRel = true
+	w := newWriter(t, f)
+	tr := newTraverser(t, f)
+	ctx := context.Background()
+
+	for _, e := range []*types.EntityEdge{
+		edge("e1", "a1", "a2", "rel-1", 0),
+		edge("e2", "a1", "a3", "rel-2", 0),
+	} {
+		if err := w.Put(ctx, "ns", e); err != nil {
+			t.Fatalf("落边失败: %v", err)
+		}
+	}
+
+	got, err := tr.Traverse(ctx, "ns", []string{"a1"},
+		TraverseOptions{MaxDepth: 2, Relations: []string{"rel-2"}})
+	if err != nil {
+		t.Fatalf("多跳失败: %v", err)
+	}
+	if len(got) != 1 || got[0].EntityID != "a3" {
+		t.Fatalf("后端漏关系过滤时取到 %+v，期望只取到 a3", got)
 	}
 }
 
