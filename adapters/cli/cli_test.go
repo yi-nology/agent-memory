@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yi-nology/agent-memory/adapters/cli"
+	"github.com/yi-nology/agent-memory/operations/portable"
 	"github.com/yi-nology/agent-memory/storage/sqlite"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
@@ -256,5 +257,36 @@ func TestMCPCommandSpeaksProtocol(t *testing.T) {
 	}
 	if !strings.Contains(line, `"jsonrpc":"2.0"`) {
 		t.Fatalf("响应应是 JSON-RPC 2.0: %q", line)
+	}
+}
+
+// memory export --format octop：按 **octop 的布局**导出（对方零改动即可读）。
+//
+// 这是「互通」这件事在本仓侧的**可操作入口** ✓：
+// 宿主导出 → octop 的 adopt 直接读 → 不用改对方任何代码 ✓。
+func TestExportInOctopFormat(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "m.sqlite")
+	pkg := filepath.Join(dir, "out.hmpkg")
+
+	code, out, errb := run(t, "capture", "--db", db, "--namespace", "t",
+		"--content", "磁盘长期偏小需要清理", "--session", "s1")
+	if code != 0 {
+		t.Fatalf("capture 失败: %s %s", out, errb)
+	}
+	code, out, errb = run(t, "export", "--db", db, "--namespace", "t",
+		"--out", pkg, "--format", "octop")
+	if code != 0 {
+		t.Fatalf("export 失败: %s %s", out, errb)
+	}
+	if !strings.Contains(out, "octop 布局") {
+		t.Fatalf("输出里应说明用的是 octop 布局: %q", out)
+	}
+	ok, err := portable.IsOctopPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("导出的包应被识别为 octop 布局")
 	}
 }

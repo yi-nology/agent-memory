@@ -489,6 +489,14 @@ type ImportReport struct {
 // （字节切片 + 字符串各一份）。改走 pack.Archive.ReadJSONL 后，
 // 峰值内存与**单行**同量级，与包体积无关。
 func Import(ctx context.Context, pkgPath string, tgt Target, ns store.Namespace) (*ImportReport, error) {
+	// **布局自动识别**：octop 布局的包（manifest.json + data.jsonl.gz）
+	// 走另一条读法 ✓。
+	//
+	// 为什么要有：两侧都叫 .hmpkg，宿主拿到一个包不该先问「这是谁导的」——
+	// 而「导入失败」这个症状（尤其是「导入成功但内容全空」）极难归因 ✓。
+	if ok, err := IsOctopPackage(pkgPath); err == nil && ok {
+		return ImportOctop(ctx, pkgPath, tgt, ns)
+	}
 	rep, err := Doctor(pkgPath)
 	if err != nil {
 		return nil, err

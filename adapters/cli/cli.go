@@ -177,6 +177,7 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 		explicit  = fs.Bool("explicit", false, "显式写入（不受自动捕获判据约束）")
 		limit     = fs.Int("limit", 10, "条数上限")
 		out       = fs.String("out", "", "导出包路径")
+		format    = fs.String("format", "", "导出格式（空=本仓原生；octop=octop 的布局）")
 		pkg       = fs.String("pkg", "", "迁移包路径")
 		before    = fs.Duration("before", 30*24*time.Hour, "回收保留期（早于此刻多久的原始事件）")
 		eventDays = fs.Int("days", 0, "事件类事实的保留期（天；0=缺省 30 天）")
@@ -237,7 +238,7 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 		//（索引里没有它们 → 语义路一条都捞不到）。
 		return cmdReindex(ctx, opt, stdout, stderr, *limit)
 	case "export":
-		return cmdExport(ctx, opt, stdout, stderr, *out)
+		return cmdExport(ctx, opt, stdout, stderr, *out, *format)
 	case "import":
 		return cmdImport(ctx, opt, stdout, stderr, *pkg)
 	case "doctor":
@@ -296,7 +297,7 @@ func usage(w io.Writer) {
   memory query    <问句>                        把一句问句翻成检索条件（诊断用，不入库）
   memory reindex  [--limit N]                   给存量事实补算向量（语义轨缺它就失灵）
   memory stats
-  memory export   --out <包路径>
+  memory export   --out <包路径> [--format octop]   导出迁移包（octop 布局供对方直接读）
   memory import   --pkg <包路径>
   memory doctor   --pkg <包路径>
 
@@ -712,7 +713,7 @@ func cmdQuery(ctx context.Context, stdout, stderr io.Writer, text string) int {
 	return 0
 }
 
-func cmdExport(ctx context.Context, opt Options, stdout, stderr io.Writer, out string) int {
+func cmdExport(ctx context.Context, opt Options, stdout, stderr io.Writer, out, format string) int {
 	if out == "" {
 		out = portable.FileName(opt.Namespace, time.Now())
 	}
@@ -723,6 +724,17 @@ func cmdExport(ctx context.Context, opt Options, stdout, stderr io.Writer, out s
 	}
 	defer func() { _ = st.Close() }()
 
+	// 格式：默认本仓原生布局；"octop" 走 octop 的布局（对方零改动即可读 ✓）。
+	if format == "octop" {
+		man, err := portable.ExportOctopFile(ctx, svc.Store(), store.Namespace(opt.Namespace), out,
+			portable.ExportOptions{Host: opt.Host})
+		if err != nil {
+			fmt.Fprintln(stderr, "导出失败:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "已导出 %s（octop 布局）：%v\n", out, man.RowCounts)
+		return 0
+	}
 	man, err := portable.ExportFile(ctx, svc.Store(), store.Namespace(opt.Namespace), out,
 		portable.ExportOptions{Host: opt.Host})
 	if err != nil {
