@@ -155,30 +155,40 @@ octop 需要 Node 插件是因为它的运行时是 Python ✓；
 | C-0 | **`memory mcp`**：stdio MCP 服务器入口（本仓已有 `adapters/mcp` 的协议层 ✓，缺的只是入口 ✓） | CLI 里跑一次真实协议往返（`initialize` → 有 `protocolVersion` ✓） | ✅ 已做 |
 | C-1 | **OpenClaw 配置片段**（`mcp.servers` + 插件项 ✓） | 配置能被 OpenClaw 读入 ✓（文档 + 片段 ✓） | ✅ 已做 |
 | C-2 | **捕获面接线**（MCP 工具 → 内核捕获面 ✓） | 一次捕获后，库里多一条原始事件 ✓ **且落在配置指定的那个库里** ✓ | ✅ 已做 |
-| C-3 | **端到端验证脚本**（`scripts/verify-openclaw-memory.sh` ✓） | 脚本在有 OpenClaw 的机器上跑通 ✓ | ✅ 已做 |
+| C-3 | **端到端验证脚本**（`scripts/verify-openclaw-memory.sh` ✓） | 脚本在有 OpenClaw 的机器上跑通 ✓（三段：本仓侧 ✓ / 宿主侧 ✓ / **真问一句看召回命中** ✓） | ✅ 已做 |
 
 ⚠️ **明确写下来：不需要写 Node 插件** ✓ —— 免得后人照着 octop 的做法去写一个 ✗
 （那是它运行时形状决定的 ✓，不是协议要求 ✓）。
 
-### C 段做完后才知道的四件事（都是「照博客写就会错」的那种 ✓）
+### C 段做完后才知道的六件事（都是「照博客写就会错」的那种 ✓）
 
 1. **配置键是 `mcp.servers`，不是 `mcpServers`** ✓。
    `mcpServers` 是 Claude Desktop 那一族的形状 ✓；
    OpenClaw 用 `mcp.servers` ✓（顶层 `mcp` 下）✓。
    而 OpenClaw 的根级 schema 是 `strictObject` ✓ ⇒ **未知根键让 Gateway 拒绝启动** ✓
    ⇒ 写错键名不是「这一项不生效」，是「起不来」✓。
-2. **工具名会被改写** ✓：`<服务器名>__<工具名>` ✓，点换成横线 ✓
-   （`memory.capture` → `agentmemory__memory-capture` ✓）。
-   ⇒ **提示词约定必须写改写后的名字** ✓ —— 写原名的话，agent 找不到那个工具 ✓
+2. **工具名有三层** ✓：协议名 `memory.recall` ✓ /
+   注册名 `agentmemory__memory-recall` ✓（`mcp probe` 打印 ✓、claude-cli 用 ✓）/
+   **agent 能调的** `MCP.agentmemory.memoryRecall` ✓（内嵌 runner ✓）。
+   ⇒ **提示词约定必须写第三层** ✓ —— 写错的话，agent 找不到那个工具 ✓
    （不报错、就是不记 ✓）。
+   ⚠️ 这一条是**agent 自己纠正的** ✓：它明说「`agentmemory__memory-recall` 不是它能调的那个名字」✓。
 3. **模式 B 有两个静默坑** ✓：`hooks.allowConversationAccess` 不开 → 永远不捕获 ✓；
    `hooks.allowPromptInjection` 不开 → 召回那一半静默失效 ✓。
 4. **官方文档与实测有出入** ✓：文档说 `openclaw mcp` 的写操作与探测要求 Gateway 停着 ✓，
    而本机 **2026.9.8** 实测在 Gateway 运行时照常可用 ✓ —— 以实测为准 ✓。
+5. **模型凭据在哪决定用哪条命令** ✓：`openclaw agent exec` 是**本地内嵌**回合 ✓，
+   要本机的模型环境变量 ✓；`openclaw agent` **走 Gateway** ✓，
+   凭据在 Gateway 那边 ✓ —— 后者才是「Gateway 当服务跑着」时的正确入口 ✓。
+6. **`memory.search` 对只有原始事件的内容返回 `[]`** ✓ —— 那是设计如此 ✓
+   （事实卡要走提炼 + 晋升 ✓），不是接线坏了 ✓。
 
 ⇒ **纪律**：接第三方宿主时，配置形状要照**它的 schema 源码**核 ✓，
 而不是照博客圈的通用形状抄 ✓ —— 后者抄来的往往是**别的宿主的形状** ✓，
 而本仓的文档会被后来人当成依据 ✓。
+⇒ **纪律二**：**工具名要问运行中的 agent**，别问文档 ✓ ——
+文档给的是某一层的形状 ✓，而模型调的是另一层 ✓，
+差一层就是「agent 找不到那个工具」✓。
 
 ---
 

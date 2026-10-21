@@ -300,11 +300,21 @@ func TestOpenclawDocToolNamesMatchServer(t *testing.T) {
 	}
 	doc := string(raw)
 
+	// 三层名字都要能对上服务器真实暴露的工具 ✓：
+	//   协议名   memory.recall
+	//   注册名   agentmemory__memory-recall      （probe 打印的、claude-cli 用的）
+	//   agent 名 MCP.agentmemory.memoryRecall    （**模型真正调的就是这个** ✓）
+	//
+	// 只查其中一层 ⇒ 另两层错了照样绿 ✓，
+	// 而写错的那一层的后果是「agent 找不到那个工具」✓（不报错、就是不记 ✓）。
 	plain := map[string]bool{}
 	re := regexp.MustCompile(`memory\.[a-z][a-z0-9_]*`)
 	for _, loc := range re.FindAllStringIndex(doc, -1) {
-		if loc[0] > 0 && strings.ContainsRune("/-_.", rune(doc[loc[0]-1])) {
-			// 文件名或路径里的片段（…/memory.sqlite、verify-openclaw-memory.sh）。
+		if loc[0] > 0 && isPartOfLargerName(doc[loc[0]-1]) {
+			// 这是**更大标识符/路径里的一段** ✓，不是工具名 ✓：
+			//   …/memory.sqlite          （路径里的文件名 ✓）
+			//   verify-openclaw-memory.sh （脚本名 ✓）
+			//   agentmemory.memoryRecall  （工具名的驼峰形 ✓ → 切成 memory.memory ✗）
 			//
 			// 这条排除是**必须的**：把它们算成工具名就是一次假红 ——
 			// 而假红是门禁的头号死法（团队会开始整体绕它，绕过的门禁等于没有）。
@@ -316,15 +326,22 @@ func TestOpenclawDocToolNamesMatchServer(t *testing.T) {
 		t.Fatal("文档里一个 memory.x 工具名都没有：文档与代码脱节了")
 	}
 
-	// 改写后的名字：<服务器名>__memory-<名字>
-	nsRe := regexp.MustCompile(`([A-Za-z0-9_]+)__memory-([a-z]+)`)
 	prefixes := map[string]bool{}
-	rewritten := map[string]bool{}
+	aliased := map[string]bool{}
+
+	// 注册名：<服务器名>__memory-<名字>
+	nsRe := regexp.MustCompile(`([A-Za-z0-9_]+)__memory-([a-z]+)`)
 	for _, m := range nsRe.FindAllStringSubmatch(doc, -1) {
 		prefixes[m[1]] = true
-		rewritten["memory."+m[2]] = true
+		aliased["memory."+m[2]] = true
 	}
-	if len(rewritten) == 0 {
+	// agent 能调的名字：MCP.<服务器名>.memory<驼峰>
+	agentRe := regexp.MustCompile(`MCP\.([A-Za-z0-9_]+)\.memory([A-Z][A-Za-z]*)`)
+	for _, m := range agentRe.FindAllStringSubmatch(doc, -1) {
+		prefixes[m[1]] = true
+		aliased["memory."+strings.ToLower(m[2])] = true
+	}
+	if len(aliased) == 0 {
 		t.Fatal("文档里没有改写后的工具名：提示词约定那节多半没了")
 	}
 
@@ -334,7 +351,7 @@ func TestOpenclawDocToolNamesMatchServer(t *testing.T) {
 			t.Errorf("文档提到的工具 %q 服务器并不提供（文档过时了？）", name)
 		}
 	}
-	for name := range rewritten {
+	for name := range aliased {
 		if !served[name] {
 			t.Errorf("文档里改写后的工具名 %q 服务器并不提供（改写规则对不上？）", name)
 		}
@@ -363,6 +380,21 @@ func contains(list []string, want string) bool {
 		if v == want {
 			return true
 		}
+	}
+	return false
+}
+
+// isPartOfLargerName 这个字节是不是「更大标识符/路径」的一部分。
+//
+// 判据：字母数字、下划线，或路径分隔符（/ - _ .）✓。
+// 于是 `agentmemory.memoryRecall` 里的 `memory.memory` 被判为「更大标识符的一段」✓，
+// 而 `memory.recall`（前面是反引号或空格 ✓）不被误伤 ✓。
+func isPartOfLargerName(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	case b == '_', b == '/', b == '-', b == '.':
+		return true
 	}
 	return false
 }

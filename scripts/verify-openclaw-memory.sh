@@ -23,6 +23,13 @@
 #    传 --install-probe 则临时装一个定义、探完**恢复原状** ✓
 #    （临时二进制 + 临时库 ✓，探完就删 ✓，不留痕 ✓）。
 #
+# C. **真问一句**（--ask ✓）：种一条带标记的记忆 ✓，让 agent 调召回工具 ✓，
+#    看它**说不说得出那个标记** ✓。
+#    这是「接上了」与「真的能用」的分界 ✓：probe 只证明服务器起得来 ✓，
+#    这一段才证明**模型能调我们的工具** ✓。
+#    ⚠️ 它会**真的调一次模型** ✓（花用户一份配额 ✓），所以是显式开关 ✓。
+#    ⚠️ `--ask` 需要服务器定义在位 ✓（配合 --install-probe 用 ✓）。
+#
 # # 为什么 A 段要读示例配置而不是自己写一套参数
 #
 # 因为示例配置是**用户真会照抄的那份**。脚本自己写一套参数，
@@ -45,12 +52,14 @@ EXAMPLE="$ROOT/docs/INTEGRATIONS/openclaw.example.json"
 
 REQUIRE_OPENCLAW=0
 INSTALL_PROBE=0
+ASK=0
 for arg in "$@"; do
 	case "$arg" in
 	--require-openclaw) REQUIRE_OPENCLAW=1 ;;
 	--install-probe) INSTALL_PROBE=1 ;;
+	--ask) ASK=1 ;;
 	*)
-		printf '用法: %s [--require-openclaw] [--install-probe]\n' "$0" >&2
+		printf '用法: %s [--require-openclaw] [--install-probe] [--ask]\n' "$0" >&2
 		exit 2
 		;;
 	esac
@@ -60,6 +69,20 @@ say() { printf '%s\n' "$*"; }
 ok() { printf '  ✓ %s\n' "$*"; }
 bad() { printf '  ✗ %s\n' "$*"; }
 skip() { printf '  ○ %s\n' "$*"; }
+
+# ── 自查：变量名后面不许直接跟多字节字符 ──
+#
+# bash 的变量名解析按字节走 ✓，而某些 locale 下 0xEF 这类首字节被当成字母 ✓，
+# 于是「美元符号 + 变量名 + 全角括号」这种写法里的全角括号会被**吞进变量名** ✓
+# ⇒ 变成去查「变量名 + 那个字节」⇒ 未绑定 ✓。
+#
+# 症状是**崩**（不是静默）✓，但崩在一个跟问题无关的地方 ⇒ 难查 ✓。
+# 本脚本已经踩过两次 ⇒ 直接在开头自查 ✓。
+if grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^ -~]' "$0" >/dev/null 2>&1; then
+	say "verify: 脚本里有「变量紧跟多字节字符」的写法（bash 会把多字节首字节吞进变量名）"
+	grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^ -~]' "$0"
+	exit 1
+fi
 
 TMP="$(mktemp -d)"
 # 装了临时定义就一定要清掉 —— 脚本不该在用户环境里留东西。
@@ -280,6 +303,9 @@ PY
 		else
 			skip "openclaw 里还没有 $SERVER_NAME 这个定义（照文档配置后重跑本脚本；"
 			skip "  想让本脚本自己装一个临时定义并探完撤销，加 --install-probe）"
+			if [ "$ASK" -eq 1 ]; then
+				skip "  （--ask 需要定义在位 ⇒ 配合 --install-probe 用）"
+			fi
 			HOST_STATUS=2
 		fi
 	fi
@@ -314,6 +340,91 @@ PY
 			bad "openclaw mcp probe 没通过"
 			cat "$TMP/probe.log" 2>/dev/null || true
 			HOST_STATUS=1
+		fi
+	fi
+
+	# ── C 段：真问一句，看召回命中 ──
+	#
+	# 这一段是「接上了」与「真的能用」的分界 ✓：
+	# 前面的 probe 只证明 OpenClaw 能起我们的服务器 ✓，
+	# 这一段证明 **模型能调我们的工具、并把召回内容说出来** ✓。
+	#
+	# ⚠️ 它会**真的调一次模型** ✓（花用户的一份配额 ✓），
+	# 所以是**显式开关** ✓（--ask ✓），默认不跑 ✓。
+	#
+	# ⚠️ agent 能不能调取决于提示词约定装没装 ✓：
+	# 模式 A 的内核**不替宿主改提示词** ✓，所以这里在**消息里**直接点名工具 ✓ ——
+	# 验的是「工具这条路通不通」✓，不是「agent 会不会自发想起调它」✓
+	# （后者要宿主把约定装进系统提示 ✓，那是宿主的活 ✓）。
+	if [ "$ASK" -eq 1 ] && [ "$HOST_STATUS" -eq 0 ]; then
+		TOKEN="memcheck-$(date +%s)-$$"
+		SEED_REQ="$(python3 - "$TOKEN" <<'PY'
+import json
+import sys
+
+token = sys.argv[1]
+print(json.dumps({
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+        "name": "memory.capture",
+        "arguments": {
+            "event_id": token,
+            "content": token + " 是本次验证种下的记忆标记",
+            "type": "manual",
+        },
+    },
+}))
+PY
+)"
+		printf '%s\n' "$SEED_REQ" | "$BIN" "${ARGS[@]}" >"$TMP/seed.out" 2>&1 || true
+		# 解析而不是 grep ✓：工具结果里的文本是**转义过的一层 JSON** ✓，
+		# 判据写成 '"accepted":true' 匹配不上（实际字节是 \"accepted\":true）✓，
+		# 而「判据匹配不上」与「功能没成」在终端上长得一模一样 ✓。
+		SEED_OK="$(python3 - "$TMP/seed.out" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    lines = [l for l in fh.read().splitlines() if l.strip()]
+if not lines:
+    print("0")
+    raise SystemExit
+try:
+    resp = json.loads(lines[0])
+    text = json.loads(resp["result"]["content"][0]["text"])
+    print("1" if text.get("accepted") else "0")
+except Exception:
+    print("0")
+PY
+)"
+		if [ "$SEED_OK" = "1" ]; then
+			ok "种下了一条带标记的记忆（${TOKEN}）"
+		else
+			bad "标记记忆没种进去"
+			cat "$TMP/seed.out"
+			HOST_STATUS=1
+		fi
+
+		if [ "$HOST_STATUS" -eq 0 ]; then
+			ASK_MSG="请调用 MCP.${SERVER_NAME}.memoryRecall 检索「${TOKEN}」，然后把检索到的内容原样告诉我，不要凭印象作答。"
+			# 走 **Gateway** 那一路 ✓（openclaw agent）✓：
+			# `agent exec` 是本地内嵌回合 ✓，要本机的模型环境变量 ✓，
+			# 而 Gateway 作为服务跑着 ✓、凭据在它那儿 ✓。
+			if openclaw agent --json --message "$ASK_MSG" >"$TMP/ask.json" 2>"$TMP/ask.err"; then
+				if grep -q "$TOKEN" "$TMP/ask.json"; then
+					ok "agent 调了召回工具并把标记原样说了出来（召回命中 ✓）"
+				else
+					bad "agent 的回复里没有那个标记（召回没命中，或它没调工具）"
+					grep -o '"text"[^}]*' "$TMP/ask.json" | head -5
+					HOST_STATUS=1
+				fi
+			else
+				bad "agent 回合没跑成"
+				cat "$TMP/ask.err" 2>/dev/null | head -10
+				HOST_STATUS=1
+			fi
 		fi
 	fi
 fi
