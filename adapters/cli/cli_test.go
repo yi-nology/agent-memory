@@ -5,8 +5,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yi-nology/agent-memory/adapters/cli"
+	"github.com/yi-nology/agent-memory/storage/sqlite"
+	"github.com/yi-nology/agent-memory/store"
+	"github.com/yi-nology/agent-memory/types"
 )
 
 func run(t *testing.T, args ...string) (int, string, string) {
@@ -116,5 +120,60 @@ func TestQueryCommandPrintsPlan(t *testing.T) {
 	}
 	if !strings.Contains(out, "Time") {
 		t.Fatalf("输出里应看得见时间窗: %s", out)
+	}
+}
+
+// memory reindex 给存量事实补算向量。
+//
+// # 为什么要有它
+//
+// 向量是**写路径**产生的（晋升成事实时顺手写），
+// 于是**存量**事实没有向量——而语义召回靠索引，
+// 索引里没有它们就一条都捞不到。症状是「语义轨像是没生效」，
+// 而查不出原因（它确实在跑，只是索引是空的）。
+//
+// # 夹具不走提炼链
+//
+// 提炼与晋升要模型，而模型没配时那条链跑不起来——
+// 用它当夹具会让本用例**整个跳过**，而跳过的用例不证明任何东西。
+// 故直接写事实卡（这正是「存量事实」的样子：早就入库了，没有向量）。
+//
+// 判据：补算后索引里有向量，且**再跑一遍结果一样**（幂等）。
+func TestReindexFillsVectors(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "m.sqlite")
+
+	// 先造一条「存量事实」：直接入库，不经晋升（故没有向量）。
+	st, err := sqlite.OpenFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := st.SaveAtom(context.Background(), store.Namespace("t"), &types.AtomCard{
+		ID: "a-old", EntityID: "e1", Assertion: "磁盘长期偏小需要清理",
+		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+		Importance: types.ImportanceMed, Confidence: types.ConfidenceMed,
+		OccurredAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, errb := run(t, "reindex", "--db", db, "--namespace", "t")
+	if code != 0 {
+		t.Fatalf("reindex 失败: %s %s", out, errb)
+	}
+	if !strings.Contains(out, "已补算 1") {
+		t.Fatalf("reindex 输出不对: %q", out)
+	}
+	// 幂等：再跑一遍，条数一样。
+	code, out2, errb := run(t, "reindex", "--db", db, "--namespace", "t")
+	if code != 0 {
+		t.Fatalf("第二次 reindex 失败: %s %s", out2, errb)
+	}
+	if out != out2 {
+		t.Fatalf("reindex 应幂等，两次输出不同: %q vs %q", out, out2)
 	}
 }
