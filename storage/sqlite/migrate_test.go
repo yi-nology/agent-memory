@@ -254,6 +254,186 @@ func TestMigrationEntityPageScopeIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestMigrationAtomTemporal 旧形状的库（事实卡没有生效区间三列、没有关系边表）
+// 打开后要能升上来，且老数据不丢、语义不变。
+//
+// # 旧形状怎么造
+//
+// **按当前代码建库，再把它改回旧形状**——不抄一份旧 DDL：
+// 抄的那份会与真 DDL 漂移，于是用例绿着而真库炸着。
+// 改回去的动作（删列、删表、改版本号）都是「当前形状的反面」，
+// 故它们不会随真 DDL 变化而失效。
+func TestMigrationAtomTemporal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "temporal.sqlite")
+	s, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("建库失败: %v", err)
+	}
+	occurred := legacyBase()
+	// 先存一条老数据（生效区间未设 = 按发生时刻算）。
+	if err := s.SaveAtom(context.Background(), "ns", &types.AtomCard{
+		ID: "a1", EntityID: "e1", Assertion: "磁盘长期偏小需要清理旧文件",
+		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+		Confidence: types.ConfidenceHigh, Importance: types.ImportanceHigh,
+		OccurredAt: occurred, CreatedAt: occurred, UpdatedAt: occurred,
+	}); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	// 变回「v3 形状」：去掉三列、删掉边表、版本号改回 3。
+	dropTemporalShape(t, s)
+	if _, err := s.db.Exec(
+		`UPDATE meta SET value = '3' WHERE namespace = '' AND key = 'schema_version'`); err != nil {
+		t.Fatalf("改版本号失败: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("关库失败: %v", err)
+	}
+
+	// 重新打开：迁移必须把列加回来、把边表建出来，且老数据还在。
+	s2, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("打开旧库失败: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	got, err := s2.GetAtom(context.Background(), "ns", "a1")
+	if err != nil {
+		t.Fatalf("读旧数据失败: %v", err)
+	}
+	if got.Assertion != "磁盘长期偏小需要清理旧文件" {
+		t.Fatalf("旧数据读出来变了: %+v", got)
+	}
+	// 老数据的生效区间是「未设」：语义等价于改动前（按发生时刻算）。
+	if !got.ValidFrom.IsZero() || !got.ValidTo.IsZero() {
+		t.Fatalf("老数据的生效区间应是未设，实得 %v ~ %v", got.ValidFrom, got.ValidTo)
+	}
+	from, to := got.ValidRange()
+	if !from.Equal(occurred) || !to.IsZero() {
+		t.Fatalf("老数据的生效区间应退回发生时刻，实得 %v ~ %v", from, to)
+	}
+	if !got.EffectiveAt(occurred) {
+		t.Fatal("老数据在发生时刻应成立")
+	}
+	// 版本号：老行由迁移补上，列的默认值是 1。
+	if got.Version != 1 {
+		t.Fatalf("老数据的版本号应为 1，实得 %d", got.Version)
+	}
+
+	// 新列要能用：升级之后写入的卡能带上生效区间与版本号。
+	scoped := &types.AtomCard{
+		ID: "a2", EntityID: "e1", Assertion: "内存占用偏高",
+		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+		Confidence: types.ConfidenceHigh, Importance: types.ImportanceHigh,
+		OccurredAt: occurred, CreatedAt: occurred, UpdatedAt: occurred,
+		ValidFrom: occurred, ValidTo: occurred.Add(time.Hour), Version: 3,
+	}
+	if err := s2.SaveAtom(context.Background(), "ns", scoped); err != nil {
+		t.Fatalf("升级后写入失败: %v", err)
+	}
+	back, err := s2.GetAtom(context.Background(), "ns", "a2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back.ValidFrom.Equal(occurred) || !back.ValidTo.Equal(occurred.Add(time.Hour)) {
+		t.Fatalf("生效区间没存上: %v ~ %v", back.ValidFrom, back.ValidTo)
+	}
+	if back.Version != 3 {
+		t.Fatalf("版本号没存上: %d", back.Version)
+	}
+
+	// 边表也要在：老库升级后能投影边。
+	if err := s2.UpsertEdge(context.Background(), "ns", &types.EntityEdge{
+		ID: "e-1", FromEntityID: "e1", ToEntityID: "e2", Relation: "关系甲",
+		CreatedAt: legacyBase(),
+	}); err != nil {
+		t.Fatalf("升级后写边失败: %v", err)
+	}
+	edge, err := s2.GetEdge(context.Background(), "ns", "e-1")
+	if err != nil {
+		t.Fatalf("升级后读边失败: %v", err)
+	}
+	if edge.FromEntityID != "e1" || edge.ToEntityID != "e2" {
+		t.Fatalf("边的两端失真: %+v", edge)
+	}
+
+	// 迁移后的形状必须与新建的库一样：两条路（建表脚本 / 迁移）
+	// 落在同一个形状上，否则「有的库能取到、有的库取不到」。
+	fresh, err := OpenMemory("fresh-temporal-" + t.Name())
+	if err != nil {
+		t.Fatalf("开新库失败: %v", err)
+	}
+	defer func() { _ = fresh.Close() }()
+	for _, table := range []string{"atoms", "entity_edges"} {
+		freshShape := tableShape(t, fresh.db, table)
+		migratedShape := tableShape(t, s2.db, table)
+		if !slices.Equal(freshShape, migratedShape) {
+			t.Fatalf("%s 的形状迁移后与新建的库不一致:\n新建: %v\n迁移后: %v",
+				table, freshShape, migratedShape)
+		}
+	}
+}
+
+// TestMigrationAtomTemporalIsIdempotent 迁移跑第二遍不报错。
+//
+// 版本号那一行可能被手工改过、被老版本覆盖过，或者库是从别处拷来的
+// ——同一段迁移可能被跑第二次，而迁移跑第二遍而失败的话
+// **库就打不开了**，而那正是「升级一下记忆库」这种日常操作最不该出的事。
+func TestMigrationAtomTemporalIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "temporal-twice.sqlite")
+	s, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveAtom(context.Background(), "ns", &types.AtomCard{
+		ID: "a1", EntityID: "e1", Assertion: "磁盘长期偏小",
+		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+		Confidence: types.ConfidenceHigh, Importance: types.ImportanceHigh,
+		CreatedAt: legacyBase(), UpdatedAt: legacyBase(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 假装这两段迁移没跑过（版本号被手工改回 3）。
+	if _, err := s.db.Exec(
+		`UPDATE meta SET value = '3' WHERE namespace = '' AND key = 'schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第二遍：列与表都已经是新形状，迁移必须认出来并跳过。
+	s2, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("第二次打开失败（迁移不幂等）: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+	got, err := s2.GetAtom(context.Background(), "ns", "a1")
+	if err != nil {
+		t.Fatalf("第二遍之后数据丢了: %v", err)
+	}
+	if got.Assertion != "磁盘长期偏小" {
+		t.Fatalf("第二遍之后数据变了: %+v", got)
+	}
+}
+
+// dropTemporalShape 把库变回「没有生效区间三列、没有关系边表」的旧形状。
+//
+// 不复制一份旧 DDL：旧形状由**当前形状的反面**推导（删列、删表），
+// 故它不会随真 DDL 变化而失效（抄一份旧 DDL 的用例会绿着，而真库炸着）。
+func dropTemporalShape(t *testing.T, s *Store) {
+	t.Helper()
+	for _, stmt := range []string{
+		`ALTER TABLE atoms DROP COLUMN valid_from`,
+		`ALTER TABLE atoms DROP COLUMN valid_to`,
+		`ALTER TABLE atoms DROP COLUMN version`,
+		`DROP TABLE IF EXISTS entity_edges`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("造旧形状失败（%s）: %v", stmt, err)
+		}
+	}
+}
+
 // tableColumn 表的一列定义。
 type tableColumn struct {
 	name    string

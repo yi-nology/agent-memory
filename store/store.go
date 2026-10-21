@@ -54,6 +54,15 @@ type (
 	AtomFilter struct {
 		// EntityIDs 限定实体集合（空=全部）。
 		EntityIDs []string
+		// IDs 限定事实卡标识集合（空=全部）。
+		//
+		// 存在的理由：多路召回（词面 + 语义）融合之后，
+		// 要把「融合出的那一批标识」**一次**取回事实卡。
+		// 不加这一栏就得逐条取（一次召回几十条 → 几十次查询），
+		// 而逐条取的成本正是「多路召回接不进来」的现实原因。
+		//
+		// 语义同 EntityIDs：空=不限。
+		IDs []string
 		// Scope 读者归属（空=不隔离）。
 		//
 		// 非空时取「**全局事实 + 同归属事实**」：归属为空的卡是全局的，
@@ -84,6 +93,18 @@ type (
 		// 召回路径**必须**置位：默认值 false 意味着「忘了过滤就捞到已作废事实」，
 		// 而那种 bug 在数据上完全看不出来。
 		ActiveOnly bool
+		// At 只要该时刻**成立**的事实（零值=不按时间过滤）。
+		//
+		// 判据：生效区间含 At（valid_from <= At < valid_to）。
+		//
+		// 零值不约束，故老数据（没有生效区间）与新代码行为一致——
+		// 加这个维度不该改判既有事实。
+		//
+		// 它与 ActiveOnly **不是一回事**：一条事实可以「现在还成立」
+		// （未被推翻、没过期），却「在那个时刻还不成立」
+		// （它是后来才写下来的）。问「上周那时候是什么状态」时，
+		// 要的是后者。
+		At time.Time
 		// Importance 限定重要度档（空=全部）。
 		Importance []types.Importance
 		// OccurredFrom / OccurredTo 发生时间窗（含 From，不含 To）。
@@ -258,6 +279,44 @@ type PageStore interface {
 	// RecordEntityPageRegenFailure 生成失败：记原因、清脏、**保持脏标记**。
 	RecordEntityPageRegenFailure(ctx context.Context, ns Namespace, entityID string, scope types.Scope,
 		reason string, at time.Time) error
+}
+
+// EdgeStore 实体关系边存取（**派生物**）。
+//
+// 边的真源是事实卡：投影丢了可以重投影，事实卡丢了投影救不回来。
+// 故这个接口只提供「落边与读边」，**不提供**任何改写事实的入口。
+type EdgeStore interface {
+	// UpsertEdge 写入或更新一条边（按 ID 幂等）。
+	UpsertEdge(ctx context.Context, ns Namespace, e *types.EntityEdge) error
+	// GetEdge 取一条边。
+	GetEdge(ctx context.Context, ns Namespace, id string) (*types.EntityEdge, error)
+	// ListEdges 按条件列边（多跳检索的取数面）。
+	ListEdges(ctx context.Context, ns Namespace, f EdgeFilter) ([]*types.EntityEdge, error)
+	// DeleteEdge 删一条边。
+	DeleteEdge(ctx context.Context, ns Namespace, id string) error
+	// DeleteEdgesBySource 删掉由某张事实卡投影出来的全部边。
+	//
+	// 事实卡被推翻时用它清投影：留着旧边等于「关系还在」，
+	// 而事实已经不成立了——那是一张说谎的图。
+	DeleteEdgesBySource(ctx context.Context, ns Namespace, sourceAtomID string) error
+}
+
+// EdgeFilter 关系边过滤条件（零值=不过滤）。
+type EdgeFilter struct {
+	// FromEntityIDs 起点实体集合（空=不限）。
+	FromEntityIDs []string
+	// ToEntityIDs 终点实体集合（空=不限）。
+	ToEntityIDs []string
+	// Relations 关系名集合（空=不限）。
+	Relations []string
+	// Scope 读者归属（空=不隔离）。
+	//
+	// 语义同 AtomFilter.Scope：非空时只取「全局 + 同归属」的边。
+	Scope types.Scope
+	// At 只要该时刻成立的边（零值=不按时间过滤）。
+	At time.Time
+	// Limit 条数上限（0=后端默认）。
+	Limit int
 }
 
 // EpisodeStore 情节与周期摘要存取。

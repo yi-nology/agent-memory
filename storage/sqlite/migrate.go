@@ -45,6 +45,8 @@ type migration struct {
 var migrations = []migration{
 	{version: 2, apply: migrateV2AtomScope},
 	{version: 3, apply: migrateV3EntityPageScope},
+	{version: 4, apply: migrateV4AtomTemporal},
+	{version: 5, apply: migrateV5EntityEdges},
 }
 
 // migrateV2AtomScope 给 atoms、raw_events、candidates 加归属列 scope 与索引。
@@ -88,6 +90,76 @@ func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("建归属索引失败（%s）: %w", stmt, err)
 		}
+	}
+	return nil
+}
+
+// migrateV4AtomTemporal 给 atoms 加生效区间与版本号三列。
+//
+// # 为什么时序是**区间**而不是只软退役
+//
+// 软退役（SupersededBy / DeprecatedAt）只说「这条不算数了」，
+// 追问「当初为什么这么判」时它就丢了「它**什么时候对过**」这个信息：
+// 「现在磁盘满了」与「三天前磁盘满了」在只软退役的模型里是同一张卡，
+// 而它们是两条事实。故事实带一个生效区间（从哪一刻成立、到哪一刻止），
+// 于是「现在的状态」与「历史上曾经的状态」能同时被查到。
+//
+// # 为什么加列必须走迁移
+//
+// 建表脚本是 `CREATE TABLE IF NOT EXISTS`：老库的 atoms 表已存在，
+// 脚本对它是**空操作**，新列不会凭空出现。于是新代码按新形状读旧库，
+// 第一条事实卡查询就报「no such column」——那正是本仓要防的失效。
+//
+// # 幂等
+//
+// 版本号那一行可能被手工改过、被老版本覆盖过，或者库是从别处拷来的，
+// 于是同一段迁移可能被跑第二遍——而迁移跑第二遍而失败的话
+// **库就打不开了**。故加列前先查列在不在（hasColumn）：不在才 ALTER。
+//
+// # 为什么这一段不建索引
+//
+// 生效判据是 COALESCE(...) 的**表达式**（显式生效点，没有就退回发生时刻），
+// 普通索引吃不上；而过滤前先按 (namespace, entity_id) / (namespace, scope)
+// 收窄候选集，那两个索引已经在了。
+func migrateV4AtomTemporal(ctx context.Context, db *sql.DB) error {
+	for _, c := range []struct{ column, ddl string }{
+		{"valid_from", `ALTER TABLE atoms ADD COLUMN valid_from INTEGER NOT NULL DEFAULT 0`},
+		{"valid_to", `ALTER TABLE atoms ADD COLUMN valid_to INTEGER`},
+		{"version", `ALTER TABLE atoms ADD COLUMN version INTEGER NOT NULL DEFAULT 1`},
+	} {
+		has, err := hasColumn(ctx, db, "atoms", c.column)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		// DEFAULT 0 是必须的：老库里已有的行也得有值，
+		// 而 NOT NULL 没有默认值的加列在有数据的表上会直接失败。
+		if _, err := db.ExecContext(ctx, c.ddl); err != nil {
+			return fmt.Errorf("加 atoms.%s 列失败: %w", c.column, err)
+		}
+	}
+	return nil
+}
+
+// migrateV5EntityEdges 建关系边表与它的索引。
+//
+// # 为什么要有这一段
+//
+// 边表是**新表**：新库由建表脚本建，老库（v3 形状）没有这张表。
+// 迁移补上它，两个来源的库必须落在**同一个形状**上——
+// 否则「有的库能投影边、有的库不能」，症状是「边存不进去」，
+// 而失败点离病因很远。
+//
+// # 幂等
+//
+// DDL 与索引都用 IF NOT EXISTS（DDL 与建表脚本共用同一份，见 schema.go）：
+// 同一段迁移可能被跑第二遍（版本号被手工改过、被老版本覆盖过、
+// 库从别处拷来），而迁移跑第二遍而失败的话**库就打不开了**。
+func migrateV5EntityEdges(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, entityEdgesDDL); err != nil {
+		return fmt.Errorf("建关系边表失败: %w", err)
 	}
 	return nil
 }

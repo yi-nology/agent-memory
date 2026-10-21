@@ -22,7 +22,8 @@ var errAtomVectorNotStored = errors.New("事实卡带了向量，但本后端不
 
 const atomCols = `id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,
 	quote_event_id, search_terms, occurred_at, confidence, importance,
-	created_at, updated_at, superseded_by, deprecated_at, provenance`
+	created_at, updated_at, superseded_by, deprecated_at, provenance,
+	valid_from, valid_to, version`
 
 func (s *atomStore) scanAtom(rows *sql.Rows) (*types.AtomCard, error) {
 	var (
@@ -31,11 +32,15 @@ func (s *atomStore) scanAtom(rows *sql.Rows) (*types.AtomCard, error) {
 		terms                      string
 		occurred, created, updated int64
 		deprecated                 sql.NullInt64
+		validFrom                  int64
+		validTo                    sql.NullInt64
+		version                    int64
 		prov                       provenanceFields
 	)
 	if err := rows.Scan(&a.ID, &a.EntityID, &a.Scope, &a.CandidateID, &rawIDs, &a.Assertion,
 		&a.VerbatimQuote, &a.QuoteEventID, &terms, &occurred, &a.Confidence, &a.Importance,
-		&created, &updated, &a.SupersededBy, &deprecated, provScan{&prov}); err != nil {
+		&created, &updated, &a.SupersededBy, &deprecated, provScan{&prov},
+		&validFrom, &validTo, &version); err != nil {
 		return nil, err
 	}
 	a.RawEventIDs = parseStrings(rawIDs)
@@ -44,6 +49,12 @@ func (s *atomStore) scanAtom(rows *sql.Rows) (*types.AtomCard, error) {
 	a.CreatedAt = fromTS(created)
 	a.UpdatedAt = fromTS(updated)
 	a.DeprecatedAt = fromTSPtr(deprecated)
+	// 生效区间读出来就是「零值 = 未设」：valid_from 的 0 读成零值时刻，
+	// 于是「按发生时刻算」这条老数据语义由 types.ValidRange 兜住
+	// （判据只有一处，不在存储层再抄一份）。
+	a.ValidFrom = fromTS(validFrom)
+	a.ValidTo = fromTSPtr(validTo)
+	a.Version = int(version)
 	a.Provenance = types.Provenance{
 		Origin:       types.OriginKind(prov.Origin),
 		Host:         prov.Host,
@@ -76,8 +87,9 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 	if _, err := s.exec(ctx, `INSERT INTO atoms
 		(namespace, id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,
 		 quote_event_id, search_terms, occurred_at, confidence, importance,
-		 created_at, updated_at, superseded_by, deprecated_at, provenance, signature)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 created_at, updated_at, superseded_by, deprecated_at, provenance, signature,
+		 valid_from, valid_to, version)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(namespace, id) DO UPDATE SET
 			entity_id = excluded.entity_id, scope = excluded.scope,
 			candidate_id = excluded.candidate_id,
@@ -87,12 +99,15 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 			confidence = excluded.confidence, importance = excluded.importance,
 			updated_at = excluded.updated_at, superseded_by = excluded.superseded_by,
 			deprecated_at = excluded.deprecated_at, provenance = excluded.provenance,
-			signature = excluded.signature`,
+			signature = excluded.signature,
+			valid_from = excluded.valid_from, valid_to = excluded.valid_to,
+			version = excluded.version`,
 		nsOf(ns), a.ID, a.EntityID, string(a.Scope), a.CandidateID, stringsJSON(a.RawEventIDs),
 		a.Assertion, a.VerbatimQuote, a.QuoteEventID, stringsJSON(a.SearchTerms), ts(a.OccurredAt),
 		string(a.Confidence), string(a.Importance), ts(a.CreatedAt), ts(now),
 		a.SupersededBy, tsPtr(a.DeprecatedAt),
 		provenanceJSON(provenanceOf(a.Provenance)), a.Signature(),
+		ts(a.ValidFrom), tsPtr(a.ValidTo), a.VersionOrOne(),
 	); err != nil {
 		return err
 	}
@@ -165,6 +180,18 @@ func atomConditions(f store.AtomFilter) (string, []any) {
 			args = append(args, e)
 		}
 	}
+	if len(f.IDs) > 0 {
+		// 标识集合：多路召回（词面 + 语义）融合之后，
+		// 要把「融合出的那一批标识」**一次**取回事实卡。
+		//
+		// 它必须在**取数层**生效（而不是取回来再筛）：
+		// 检索路有 TopK 配额，后置过滤时被别家的条目占掉的配额已经花掉了，
+		// 于是「该给我的那条」根本没进候选池——症状是「召回里混进一堆不相关的东西」。
+		where = append(where, "id IN ("+placeholders(len(f.IDs))+")")
+		for _, id := range f.IDs {
+			args = append(args, id)
+		}
+	}
 	if f.Scope != "" {
 		// 归属条件：**全局的 + 同归属的**，别家的不给。
 		//
@@ -190,6 +217,22 @@ func atomConditions(f store.AtomFilter) (string, []any) {
 	if !f.OccurredTo.IsZero() {
 		where = append(where, "occurred_at < ?")
 		args = append(args, ts(f.OccurredTo))
+	}
+	if !f.At.IsZero() {
+		// 生效判据：区间含 At，**左闭右开**。
+		//
+		// 左闭右开不是随手选的：失效时刻那一刻事实**已经不成立**
+		// （「到这一刻为止有效」），而生效时刻那一刻**恰好成立**。
+		// 两端都取闭区间的话，「A 的失效时刻」与「B 的生效时刻」
+		// 会同时命中两张卡——而现实中它们是前后相继的两条事实。
+		//
+		// COALESCE(NULLIF(valid_from,0), occurred_at) 是「显式生效点，
+		// 没有就退回发生时刻」：valid_from 的 0 是「未设」，
+		// 老数据（没有生效点）因此仍按发生时刻算——升级前后判同一张卡必须一致。
+		where = append(where,
+			"COALESCE(NULLIF(valid_from, 0), occurred_at) <= ?",
+			"(valid_to IS NULL OR ? < valid_to)")
+		args = append(args, ts(f.At), ts(f.At))
 	}
 	return strings.Join(where, " AND "), args
 }

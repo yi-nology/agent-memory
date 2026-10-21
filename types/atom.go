@@ -89,6 +89,66 @@ type AtomCard struct {
 	// 留着的意义：宿主可以在**内存里**用本仓的结构带着向量
 	// （自己落库、自己检索），不必为了带一个向量而复制一份平行模型。
 	Vector []float32 `json:"Vector,omitempty"`
+	// ValidFrom 事实**生效**的时刻（零值 = 取 OccurredAt）。
+	//
+	// # 与 OccurredAt 的区别
+	//
+	// OccurredAt 是「事情发生的那一刻」，ValidFrom 是「这条断言从什么时候开始算数」。
+	// 「上周就坏了，今天才发现」——两者的 OccurredAt 相同，
+	// 但 ValidFrom 不同（它是今天才被写下来的）。
+	// 检索「现在的状态」时，前者要后者的判据。
+	//
+	// 零值取 OccurredAt 是为了**老数据不变**：加这个维度不该改判既有事实，
+	// 否则同一个库升级前后召回到的东西不一样。
+	ValidFrom time.Time
+	// ValidTo 事实**失效**的时刻（零值 = 仍有效）。
+	//
+	// 取代关系用它：旧事实不是被删掉，而是「到这一刻为止有效」。
+	// 于是「现在的状态」与「历史上曾经的状态」能同时被查到——
+	// 而只软退役（SupersededBy）的话，旧事实只会变成「查得到但不算数」，
+	// 追问「当初为什么这么判」时反而丢了它**什么时候对过**这个信息。
+	ValidTo time.Time
+	// Version 版本号（同一主体 + 谓词的第几版；1 起）。
+	//
+	// 零值当 1。版本号的作用不是排序，而是**溯源**：
+	// 「这条是第 3 版」让「升级到 1.36」这类事实有一串可查的前身，
+	// 而不必靠「哪条 supersede 了哪条」反推（那条链在退役链被裁剪后会断）。
+	Version int
+}
+
+// EffectiveAt 这条事实在 t 时刻是否成立。
+//
+// 判据：生效区间含 t，且未被软退役。
+// 零值 ValidFrom 取 OccurredAt，故老数据（没有 ValidFrom）也有确定的区间。
+func (a *AtomCard) EffectiveAt(t time.Time) bool {
+	if !a.Active() {
+		return false
+	}
+	from, to := a.ValidRange()
+	if !from.IsZero() && t.Before(from) {
+		return false
+	}
+	if !to.IsZero() && !t.Before(to) {
+		return false
+	}
+	return true
+}
+
+// ValidRange 归一后的生效区间（ValidFrom 零值时取 OccurredAt）。
+func (a *AtomCard) ValidRange() (from, to time.Time) {
+	from = a.ValidFrom
+	if from.IsZero() {
+		from = a.OccurredAt
+	}
+	return from, a.ValidTo
+}
+
+// VersionOrOne 归一后的版本号（零值当 1）。
+func (a *AtomCard) VersionOrOne() int {
+	if a.Version <= 0 {
+		return 1
+	}
+	return a.Version
 }
 
 // Active 事实卡是否参与召回。

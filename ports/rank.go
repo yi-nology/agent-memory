@@ -61,6 +61,21 @@ type RankCandidate struct {
 	OccurredAt time.Time
 	// Tokens 该段占用的估算 token。
 	Tokens int
+	// FusionScore 该候选在**多路融合**里的分数（零值=没有融合）。
+	//
+	// # 为什么把它摊开给打分器，而不是内核自己拿它排序
+	//
+	// 融合（RRF）解决的是「**该捞哪几条**」——它决定候选池里有什么。
+	// 而「这几十条里谁排前面」是**排序口径**，那是打分器的事。
+	// 两者混在一起，就会出现两套排序口径并存（融合排过的序被重排器覆盖），
+	// 后续收敛都要付迁移成本。
+	//
+	// 故：内核用融合**决定池子**，把分数**交给**打分器；
+	// 打分器用不用它是它的选择（宿主走语义轨时多半会用）。
+	//
+	// 缺省打分器（LexicalRanker）在 Fusion 权重为 0 时**逐条等价于**
+	// 注入前——故没装语义面时，行为一点不变。
+	FusionScore float64
 }
 
 // Ranker 打分器：给候选打分，分数越大越靠前。
@@ -94,6 +109,15 @@ type RankWeights struct {
 	Importance float64
 	// Recency 新鲜度的权重。
 	Recency float64
+	// Fusion 多路融合分的权重。
+	//
+	// 缺省 0 = **不用融合分**（零漂移的关键）。
+	//
+	// 为什么缺省是 0 而不是给个正数：融合分只在「装了语义面」时才有值，
+	// 而没装时它恒为 0——权重取 0 就让「没装语义面」与
+	// 「装了但融合分不参与排序」两种情况**行为完全一致**，
+	// 于是「要不要用融合分」是宿主的一个明确选择，而不是隐含行为。
+	Fusion float64
 }
 
 // DefaultRankWeights 缺省权重（0.6 / 0.25 / 0.15）。
@@ -144,13 +168,42 @@ func (r LexicalRanker) Score(_ context.Context, query string, cands []RankCandid
 	now time.Time) ([]float64, error) {
 	w := r.weights()
 	terms := tokenize(query)
+	// 融合分**归一**后再参与：RRF 的分数量纲随路数变化（1/(k+名次)），
+	// 不归一的话它与词面分（0..1）不在一个量级上，
+	// 权重就调不出稳定的效果。
+	//
+	// 归一用「除以本批最高分」，故最高分那条得 1.0，其余按比例。
+	// 全为 0（没装语义面）时归一结果是 0 —— 融合项整体不贡献分数。
+	fusion := normalizeFusion(cands)
 	out := make([]float64, len(cands))
 	for i, c := range cands {
 		out[i] = w.Lexical*lexical(c.Body, terms) +
 			w.Importance*float64(c.ImportanceRank)/3 +
-			w.Recency*recency(c.OccurredAt, now)
+			w.Recency*recency(c.OccurredAt, now) +
+			w.Fusion*fusion[i]
 	}
 	return out, nil
+}
+
+// normalizeFusion 把融合分归一到 [0,1]。
+//
+// 除以本批最高分：最高分那条得 1，其余按比例。
+// 全为 0 时返回全 0（没装语义面 → 融合项整体不贡献分数）。
+func normalizeFusion(cands []RankCandidate) []float64 {
+	out := make([]float64, len(cands))
+	max := 0.0
+	for _, c := range cands {
+		if c.FusionScore > max {
+			max = c.FusionScore
+		}
+	}
+	if max <= 0 {
+		return out
+	}
+	for i, c := range cands {
+		out[i] = c.FusionScore / max
+	}
+	return out
 }
 
 // lexical 词面重叠度：命中词数 / 查询词数。

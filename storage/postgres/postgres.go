@@ -91,6 +91,7 @@ type Store struct {
 	candidateStore
 	entityStore
 	pageStore
+	edgeStore
 	episodeStore
 	journalStore
 	metaStore
@@ -125,6 +126,7 @@ func newStore(db *sql.DB) *Store {
 	s.candidateStore.Store = s
 	s.entityStore.Store = s
 	s.pageStore.Store = s
+	s.edgeStore.Store = s
 	s.episodeStore.Store = s
 	s.journalStore.Store = s
 	s.metaStore.Store = s

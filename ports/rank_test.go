@@ -133,3 +133,59 @@ func legacyTokenize(s string) []string {
 	}
 	return out
 }
+
+// 缺省权重下，融合分**不贡献**分数。
+//
+// 这条是「没装语义面 ⇒ 行为逐条不变」的钉子：
+// 融合分只在装了语义面时才有值，而缺省权重是 0，
+// 故它对分数的贡献恒为 0 —— 装了语义面但不想用融合分排序的宿主，
+// 与完全没装的宿主，行为**逐条一致**。
+func TestLexicalRankerIgnoresFusionByDefault(t *testing.T) {
+	cands := []ports.RankCandidate{
+		{Body: "磁盘长期偏小", ImportanceRank: 3, OccurredAt: legacyNow()},
+		{Body: "内存占用偏高", ImportanceRank: 0, OccurredAt: legacyNow(), FusionScore: 1},
+	}
+	withFusion, err := ports.LexicalRanker{}.Score(context.Background(), "磁盘", cands, legacyNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutFusion, err := ports.LexicalRanker{}.Score(context.Background(), "磁盘",
+		[]ports.RankCandidate{{Body: cands[0].Body, ImportanceRank: cands[0].ImportanceRank, OccurredAt: cands[0].OccurredAt},
+			{Body: cands[1].Body, ImportanceRank: cands[1].ImportanceRank, OccurredAt: cands[1].OccurredAt}},
+		legacyNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range withFusion {
+		if withFusion[i] != withoutFusion[i] {
+			t.Fatalf("缺省权重下融合分不该贡献分数: %v vs %v", withFusion, withoutFusion)
+		}
+	}
+}
+
+// 给了融合权重就参与，且**归一**后最高分那条得满分。
+//
+// 归一的原因：RRF 的分数量纲随路数变化（1/(k+名次)），
+// 不归一的话它与词面分（0..1）不在一个量级上，权重就调不出稳定效果。
+func TestLexicalRankerUsesFusionWhenWeighted(t *testing.T) {
+	cands := []ports.RankCandidate{
+		{Body: "无关正文", ImportanceRank: 0, OccurredAt: legacyNow(), FusionScore: 0.02},
+		{Body: "无关正文", ImportanceRank: 0, OccurredAt: legacyNow(), FusionScore: 0.01},
+	}
+	w := ports.NewRankWeights(0.6, 0.25, 0.15)
+	w.Fusion = 1
+	got, err := ports.LexicalRanker{Weights: w}.Score(context.Background(), "磁盘", cands, legacyNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] <= got[1] {
+		t.Fatalf("融合分高的那条该得分更高: %v", got)
+	}
+	// 归一：最高分那条的融合项是 1.0（权重为 1 时贡献恰好 1）。
+	if diff := got[0] - got[1]; diff < 0.49 || diff > 0.51 {
+		t.Fatalf("归一后两条的差应是 0.5（1.0-0.5）: %v", got)
+	}
+}
+
+// legacyNow 夹具用的固定时刻。
+func legacyNow() time.Time { return time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC) }

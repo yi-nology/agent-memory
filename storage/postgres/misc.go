@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/yi-nology/agent-memory/store"
@@ -18,6 +19,13 @@ var (
 
 // itoa 是 strconv.Itoa 的本地小别名（占位符拼接处用得很多）。
 func itoa(n int) string { return fmt.Sprint(n) }
+
+// edgeStore 关系边存取（**派生物**）。
+//
+// 刻意单列一个窄结构而不是平铺在 Store 上：
+// 仓里「每张表一个内嵌窄结构」那条纪律的兑现——
+// 平铺会让 Store 的方法数往上走，而门禁的阈值就是按「一个类型几个方法」判的。
+type edgeStore struct{ *Store }
 
 // ── 实体页面 ──
 //
@@ -217,6 +225,196 @@ func (s *pageStore) RecordEntityPageRegenFailure(ctx context.Context, ns store.N
 		return nil
 	}
 	return s.writePage(ctx, ns, entityID, scope, "", "", nil, true, ts(at), ts(at), reason)
+}
+
+// ── 关系边 ──
+//
+// 边是**派生物**：真源是事实卡，投影丢了可以重投影，事实卡丢了投影救不回来。
+// 故这一面只有「落边与读边」，没有任何改写事实的入口。
+//
+// # 为什么归属过滤必须在 SQL 里
+//
+// 边也参与召回的配额（多跳取边有 TopK），后置过滤的话，
+// 被别家占掉的配额已经花掉了，于是「该给我的那条」根本没进候选池——
+// 症状只是「边少了」，看着像召回不够，根因却在取数。
+
+// edgeCols 关系边列。
+const edgeCols = `id, from_entity_id, to_entity_id, relation, scope,
+	valid_from, valid_to, weight, source_atom_id, created_at`
+
+func (s *Store) scanEdge(rows *sql.Rows) (*types.EntityEdge, error) {
+	var (
+		e                  types.EntityEdge
+		validFrom, validTo sql.NullTime
+		created            sql.NullTime
+	)
+	if err := rows.Scan(&e.ID, &e.FromEntityID, &e.ToEntityID, &e.Relation, &e.Scope,
+		&validFrom, &validTo, &e.Weight, &e.SourceAtomID, &created); err != nil {
+		return nil, err
+	}
+	// 「未设」编码是 NULL，读出来就是零值时刻：
+	// 归一（零值当 1 的权重、零值即未设的生效点）由 types.EntityEdge 兜，
+	// 存储层不另抄一份判据。
+	e.ValidFrom = fromTSPtr(validFrom)
+	e.ValidTo = fromTSPtr(validTo)
+	e.CreatedAt = fromTSPtr(created)
+	return &e, nil
+}
+
+// UpsertEdge 写入或更新一条边（按标识幂等）。
+func (s *edgeStore) UpsertEdge(ctx context.Context, ns store.Namespace, e *types.EntityEdge) error {
+	if e.ID == "" {
+		return errors.New("边必须有标识")
+	}
+	if e.FromEntityID == "" || e.ToEntityID == "" {
+		return errors.New("边的两端都不能为空")
+	}
+	// upsert 而不是纯 INSERT：投影层重算一条边时给的是**新值**，
+	// 而边没有「合并」语义——同一条边的两端、关系名、归属、生效区间、
+	// 权重都以最后一次写入为准。
+	//
+	// created_at 不在更新列表里：它是这条边**首次**落库的时刻，
+	// 重投影不改变「这条边存在多久了」。
+	_, err := s.exec(ctx, `INSERT INTO entity_edges
+		(namespace, id, from_entity_id, to_entity_id, relation, scope,
+		 valid_from, valid_to, weight, source_atom_id, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		ON CONFLICT(namespace, id) DO UPDATE SET
+			from_entity_id = excluded.from_entity_id, to_entity_id = excluded.to_entity_id,
+			relation = excluded.relation, scope = excluded.scope,
+			valid_from = excluded.valid_from, valid_to = excluded.valid_to,
+			weight = excluded.weight, source_atom_id = excluded.source_atom_id`,
+		nsOf(ns), e.ID, e.FromEntityID, e.ToEntityID, e.Relation, string(e.Scope),
+		ts(e.ValidFrom), tsPtr(e.ValidTo), e.Weight, e.SourceAtomID, ts(e.CreatedAt))
+	return err
+}
+
+// GetEdge 取一条边。取不到返回 store.ErrNotFound。
+func (s *edgeStore) GetEdge(ctx context.Context, ns store.Namespace, id string) (*types.EntityEdge, error) {
+	rows, err := s.query(ctx,
+		`SELECT `+edgeCols+` FROM entity_edges WHERE namespace = $1 AND id = $2`, nsOf(ns), id)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		return nil, absentOr(rows.Err())
+	}
+	return s.scanEdge(rows)
+}
+
+// ListEdges 按条件列边（多跳检索的取数面）。
+//
+// 末尾的 id ASC 是**并列时的稳定序**：同一时刻建的边不止一条时，
+// 没有它时返回顺序不确定——而多跳遍历的顺序会跟着变，
+// 于是「同样的一批边，每次走出来的路径不一样」。
+func (s *edgeStore) ListEdges(ctx context.Context, ns store.Namespace, f store.EdgeFilter) ([]*types.EntityEdge, error) {
+	where := []string{"namespace = $1"}
+	args := []any{nsOf(ns)}
+	cond, condArgs := edgeConditions(f, len(args)+1)
+	if cond != "" {
+		where = append(where, cond)
+		args = append(args, condArgs...)
+	}
+	q := `SELECT ` + edgeCols + ` FROM entity_edges WHERE ` + strings.Join(where, " AND ") +
+		` ORDER BY created_at ASC, id ASC LIMIT $` + fmt.Sprint(len(args)+1)
+	args = append(args, limitOf(f.Limit, 100))
+
+	rows, err := s.query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*types.EntityEdge
+	for rows.Next() {
+		e, err := s.scanEdge(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// edgeConditions 关系边的过滤条件（SQL 片段 + 参数）。
+//
+// 各切片空=不限；归属非空=只取「全局 + 同归属」；
+// 时刻非零=只取该时刻成立的边。
+//
+// start 是第一个占位符的编号（$1 是 namespace，故从 $2 起）。
+func edgeConditions(f store.EdgeFilter, start int) (string, []any) {
+	var (
+		where = []string{}
+		args  = []any{}
+	)
+	if len(f.FromEntityIDs) > 0 {
+		where = append(where, "from_entity_id IN ("+numberedPlaceholders(start, len(f.FromEntityIDs))+")")
+		for _, id := range f.FromEntityIDs {
+			args = append(args, id)
+		}
+		start += len(f.FromEntityIDs)
+	}
+	if len(f.ToEntityIDs) > 0 {
+		where = append(where, "to_entity_id IN ("+numberedPlaceholders(start, len(f.ToEntityIDs))+")")
+		for _, id := range f.ToEntityIDs {
+			args = append(args, id)
+		}
+		start += len(f.ToEntityIDs)
+	}
+	if len(f.Relations) > 0 {
+		where = append(where, "relation IN ("+numberedPlaceholders(start, len(f.Relations))+")")
+		for _, r := range f.Relations {
+			args = append(args, r)
+		}
+		start += len(f.Relations)
+	}
+	if f.Scope != "" {
+		// 归属条件：**全局的 + 同归属的**，别家的不给。
+		// 「归属为空=不过滤」这条语义在 store.EdgeFilter.Scope 的注释里，
+		// 这里是它的可执行形态。
+		where = append(where, "(scope = '' OR scope = $"+fmt.Sprint(start)+")")
+		args = append(args, string(f.Scope))
+		start++
+	}
+	if !f.At.IsZero() {
+		// 生效判据：区间含 At，**左闭右开**——
+		// At 恰等于失效时刻时已不成立（那正是「到这一刻为止有效」）。
+		//
+		// valid_from 的 NULL 是「未设」：边是投影物，它**存在**的时刻
+		// （created_at）就是它生效的时刻，故退回 created_at。
+		where = append(where,
+			"(COALESCE(valid_from, created_at) IS NULL OR COALESCE(valid_from, created_at) <= $"+fmt.Sprint(start)+")")
+		args = append(args, ts(f.At))
+		start++
+		where = append(where, "(valid_to IS NULL OR $"+fmt.Sprint(start)+" < valid_to)")
+		args = append(args, ts(f.At))
+		start++
+	}
+	return strings.Join(where, " AND "), args
+}
+
+// DeleteEdge 删一条边。
+//
+// 删不到不报错：删投影是清理动作，同一条边被清两次是常态
+// （事实卡被推翻两次、清理流程重跑），报错只会让清理路径变脆。
+func (s *edgeStore) DeleteEdge(ctx context.Context, ns store.Namespace, id string) error {
+	_, err := s.exec(ctx, `DELETE FROM entity_edges WHERE namespace = $1 AND id = $2`, nsOf(ns), id)
+	return err
+}
+
+// DeleteEdgesBySource 删掉由某张事实卡投影出来的全部边。
+//
+// 事实卡被推翻时用它清投影：留着旧边等于「关系还在」，
+// 而事实已经不成立了——那是一张说谎的图。
+func (s *edgeStore) DeleteEdgesBySource(ctx context.Context, ns store.Namespace, sourceAtomID string) error {
+	if sourceAtomID == "" {
+		// 空来源会命中「没有溯源的边」（source_atom_id 为空的那批），
+		// 一次清理就把它们全删了——那是不可逆的数据损失，故响亮失败。
+		return errors.New("来源事实卡 ID 不能为空：空来源会误删没有溯源的边")
+	}
+	_, err := s.exec(ctx,
+		`DELETE FROM entity_edges WHERE namespace = $1 AND source_atom_id = $2`, nsOf(ns), sourceAtomID)
+	return err
 }
 
 // ── 情节与周期摘要 ──

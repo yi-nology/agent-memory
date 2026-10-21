@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -221,6 +222,216 @@ func TestFreshSchemaHasPageScopeShape(t *testing.T) {
 	if !hasIdx {
 		t.Fatal("新库缺少归属索引 pages_scope_dirty")
 	}
+}
+
+// TestMigrationAtomTemporal 旧形状的库（事实卡没有生效区间三列、没有关系边表）
+// 打开后要能升上来，且老数据不丢、语义不变。
+//
+// # 旧形状怎么造
+//
+// **按当前代码建库，再把它改回旧形状**——不抄一份旧 DDL：
+// 抄的那份会与真 DDL 漂移，于是用例绿着而真库炸着。
+// 改回去的动作（删列、删表、改版本号）都是「当前形状的反面」，
+// 故它们不会随真 DDL 变化而失效。
+func TestMigrationAtomTemporal(t *testing.T) {
+	dsn := Dsn()
+	if dsn == "" {
+		t.Skipf("未配置 %s：PG 迁移路径**未验证**（skipped 用例不证明兼容）", DsnEnv)
+	}
+	s, dbName := openTempDB(t, dsn)
+	defer dropTempDB(t, dsn, dbName)
+
+	occurred := pgBase()
+	// 先存一条老数据（生效区间未设 = 按发生时刻算）。
+	if err := s.SaveAtom(context.Background(), "ns", &types.AtomCard{
+		ID: "a1", EntityID: "e1", Assertion: "磁盘长期偏小需要清理旧文件",
+		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+		Confidence: types.ConfidenceHigh, Importance: types.ImportanceHigh,
+		OccurredAt: occurred, CreatedAt: occurred, UpdatedAt: occurred,
+	}); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	// 变回「v3 形状」：去掉三列、删掉边表、版本号改回 3。
+	for _, stmt := range []string{
+		`ALTER TABLE atoms DROP COLUMN valid_from`,
+		`ALTER TABLE atoms DROP COLUMN valid_to`,
+		`ALTER TABLE atoms DROP COLUMN version`,
+		`DROP TABLE IF EXISTS entity_edges`,
+		`UPDATE meta SET value = '3' WHERE namespace = '' AND key = 'schema_version'`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("造旧形状失败（%s）: %v", stmt, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("关库失败: %v", err)
+	}
+
+	// 重新打开：迁移必须把列加回来、把边表建出来，且老数据还在。
+	s2, err := Open(tempDSN(t, dsn, dbName))
+	if err != nil {
+		t.Fatalf("打开旧库失败: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	got, err := s2.GetAtom(context.Background(), "ns", "a1")
+	if err != nil {
+		t.Fatalf("读旧数据失败: %v", err)
+	}
+	if got.Assertion != "磁盘长期偏小需要清理旧文件" {
+		t.Fatalf("旧数据读出来变了: %+v", got)
+	}
+	// 老数据的生效区间是「未设」：语义等价于改动前（按发生时刻算）。
+	if !got.ValidFrom.IsZero() || !got.ValidTo.IsZero() {
+		t.Fatalf("老数据的生效区间应是未设，实得 %v ~ %v", got.ValidFrom, got.ValidTo)
+	}
+	from, to := got.ValidRange()
+	if !from.Equal(occurred) || !to.IsZero() {
+		t.Fatalf("老数据的生效区间应退回发生时刻，实得 %v ~ %v", from, to)
+	}
+	if !got.EffectiveAt(occurred) {
+		t.Fatal("老数据在发生时刻应成立")
+	}
+	if got.Version != 1 {
+		t.Fatalf("老数据的版本号应为 1，实得 %d", got.Version)
+	}
+
+	// 新列要能用：升级之后写入的卡能带上生效区间与版本号。
+	scoped := &types.AtomCard{
+		ID: "a2", EntityID: "e1", Assertion: "内存占用偏高",
+		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+		Confidence: types.ConfidenceHigh, Importance: types.ImportanceHigh,
+		OccurredAt: occurred, CreatedAt: occurred, UpdatedAt: occurred,
+		ValidFrom: occurred, ValidTo: occurred.Add(time.Hour), Version: 3,
+	}
+	if err := s2.SaveAtom(context.Background(), "ns", scoped); err != nil {
+		t.Fatalf("升级后写入失败: %v", err)
+	}
+	back, err := s2.GetAtom(context.Background(), "ns", "a2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back.ValidFrom.Equal(occurred) || !back.ValidTo.Equal(occurred.Add(time.Hour)) {
+		t.Fatalf("生效区间没存上: %v ~ %v", back.ValidFrom, back.ValidTo)
+	}
+	if back.Version != 3 {
+		t.Fatalf("版本号没存上: %d", back.Version)
+	}
+
+	// 边表也要在：老库升级后能投影边。
+	if err := s2.UpsertEdge(context.Background(), "ns", &types.EntityEdge{
+		ID: "e-1", FromEntityID: "e1", ToEntityID: "e2", Relation: "关系甲",
+		CreatedAt: pgBase(),
+	}); err != nil {
+		t.Fatalf("升级后写边失败: %v", err)
+	}
+	edge, err := s2.GetEdge(context.Background(), "ns", "e-1")
+	if err != nil {
+		t.Fatalf("升级后读边失败: %v", err)
+	}
+	if edge.FromEntityID != "e1" || edge.ToEntityID != "e2" {
+		t.Fatalf("边的两端失真: %+v", edge)
+	}
+
+	// 迁移跑第二遍不报错（幂等）：两段迁移都自己判「要不要做」。
+	if err := migrateV4AtomTemporal(context.Background(), s2.db); err != nil {
+		t.Fatalf("时序迁移跑第二遍失败（不幂等）: %v", err)
+	}
+	if err := migrateV5EntityEdges(context.Background(), s2.db); err != nil {
+		t.Fatalf("边表迁移跑第二遍失败（不幂等）: %v", err)
+	}
+	if got, err := s2.GetAtom(context.Background(), "ns", "a1"); err != nil {
+		t.Fatalf("第二遍迁移后读事实卡失败: %v", err)
+	} else if got.Assertion != "磁盘长期偏小需要清理旧文件" {
+		t.Fatalf("第二遍迁移后数据变了: %+v", got)
+	}
+}
+
+// TestFreshSchemaMatchesMigratedShape 新建的库与迁移后的库形状一致。
+//
+// 建表脚本（新库）与迁移（老库）是两条路，两条路必须落在同一个形状上——
+// 否则「新库能跑、老库跑不通」这类问题要等到用户升级时才炸。
+// 断言用**列集合 + 主键形状**比对：迁移出来的表此后就是这个库实际用的表，
+// 两者不同形的话「有的库能取到、有的库取不到」。
+func TestFreshSchemaMatchesMigratedShape(t *testing.T) {
+	dsn := Dsn()
+	if dsn == "" {
+		t.Skipf("未配置 %s：PG 迁移路径**未验证**（skipped 用例不证明兼容）", DsnEnv)
+	}
+	s, dbName := openTempDB(t, dsn)
+	defer dropTempDB(t, dsn, dbName)
+
+	// 变回「v3 形状」再打开一次，让它走一遍迁移。
+	for _, stmt := range []string{
+		`ALTER TABLE atoms DROP COLUMN valid_from`,
+		`ALTER TABLE atoms DROP COLUMN valid_to`,
+		`ALTER TABLE atoms DROP COLUMN version`,
+		`DROP TABLE IF EXISTS entity_edges`,
+		`UPDATE meta SET value = '3' WHERE namespace = '' AND key = 'schema_version'`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("造旧形状失败（%s）: %v", stmt, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("关库失败: %v", err)
+	}
+	migrated, err := Open(tempDSN(t, dsn, dbName))
+	if err != nil {
+		t.Fatalf("打开旧库失败: %v", err)
+	}
+	defer func() { _ = migrated.Close() }()
+
+	// 新库：按当前建表脚本建的库。
+	fresh, freshName := openTempDB(t, dsn)
+	defer dropTempDB(t, dsn, freshName)
+	defer func() { _ = fresh.Close() }()
+
+	for _, table := range []string{"atoms", "entity_edges"} {
+		freshShape := tableShapePG(t, fresh.db, table)
+		migratedShape := tableShapePG(t, migrated.db, table)
+		if !slices.Equal(freshShape, migratedShape) {
+			t.Fatalf("%s 的形状迁移后与新建的库不一致:\n新建: %v\n迁移后: %v",
+				table, freshShape, migratedShape)
+		}
+		freshPK := pkColumns(t, fresh.db, table)
+		migratedPK := pkColumns(t, migrated.db, table)
+		if !slices.Equal(freshPK, migratedPK) {
+			t.Fatalf("%s 的主键迁移后与新建的库不一致:\n新建: %v\n迁移后: %v",
+				table, freshPK, migratedPK)
+		}
+	}
+}
+
+// tableShapePG 表的形状指纹（列名、类型、可空、默认值，按列序）。
+//
+// 读的是**现库实际的形状**（系统目录），而不是某份抄下来的 DDL——
+// 抄下来的那份会与真 DDL 漂移。
+func tableShapePG(t *testing.T, db *sql.DB, table string) []string {
+	t.Helper()
+	rows, err := db.Query(`
+		SELECT column_name, data_type, is_nullable, coalesce(column_default, '')
+		FROM information_schema.columns
+		WHERE table_name = $1
+		ORDER BY ordinal_position`, table)
+	if err != nil {
+		t.Fatalf("读 %s 的列失败: %v", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var (
+			name, typ, nullable, def string
+		)
+		if err := rows.Scan(&name, &typ, &nullable, &def); err != nil {
+			t.Fatalf("读 %s 的列定义失败: %v", table, err)
+		}
+		out = append(out, fmt.Sprintf("%s|%s|nullable=%s|default=%s", name, typ, nullable, def))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("读 %s 的列定义失败: %v", table, err)
+	}
+	return out
 }
 
 // ── 夹具 ──

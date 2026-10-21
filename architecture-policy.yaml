@@ -104,10 +104,13 @@ modules:
 
   - id: pipeline-recall
     roots: [pipeline/recall]
-    requires: [types, ports, store]
+    requires: [types, ports, store, pipeline-query]
     owner: memory
     managed: true
-    notes: 召回全链（路由/多源/重排/去冗/抑制/预算/活跃实体栈/缓存/超时）+ 注入防伪。
+    notes: |
+      召回全链（路由/多源/重排/去冗/抑制/预算/活跃实体栈/缓存/超时）+ 注入防伪。
+      依赖 pipeline-query：查询理解是**取数的前置**——
+      「上周那个问题」不解析成时间窗与实体，词面匹配只能碰运气。
 
   - id: pipeline-entity
     roots: [pipeline/entity]
@@ -125,6 +128,48 @@ modules:
     owner: memory
     managed: true
     notes: 实体页面脏标记与重生成。页面是派生物，事实卡才是真源。
+
+  - id: pipeline-query
+    roots: [pipeline/query]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: |
+      查询理解：相对时间窗（上周/昨天/最近三天）、代词共指、实体提示。
+      它把「用户那句话」翻成「可执行的检索条件」，
+      故它是**取数面**的前置：没有它，「上周那个问题」只能退化成词面匹配。
+
+  - id: pipeline-graph
+    roots: [pipeline/graph]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: |
+      图谱投影：实体关系边是**派生**的（从事实卡与宿主给的关系声明投影出来），
+      多跳检索走的是这张投影。事实卡仍是真源，边丢了可以重投影。
+
+  - id: evaluation
+    roots: [evaluation]
+    requires: [types, ports, store]
+    owner: memory
+    managed: true
+    notes: |
+      评测面：合成数据集 + 指标（Recall@k / nDCG@k / MRR）。
+      它是**判据面**不是产品面：没有它，「召回准不准」只能靠感觉。
+
+  - id: adapters-mcp
+    roots: [adapters/mcp]
+    requires: [application, types, store, ports, pipeline-recall, storage-sqlite]
+    owner: memory
+    managed: true
+    notes: |
+      MCP Server（stdio 上的 JSON-RPC）：宿主不必是 Go 时的第二个入口。
+      与 bridge 平级，两者都是「宿主把记忆当工具调」的那条口。
+      白名单方法，不提供执行任意动作的逃逸口。
+
+      pipeline-recall 与 storage-sqlite 两条方向是照 bridge 的既有做法：
+      召回的请求/结果类型住在 pipeline/recall（application 只重导出了 CaptureInput），
+      而用例要**真后端**（mock 掉的那一层正是最可能断的地方）。
 
   - id: pipeline-episode
     roots: [pipeline/episode]
@@ -160,12 +205,15 @@ modules:
 
   - id: adapters-cli
     roots: [adapters/cli]
-    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall, pipeline-entity, lifecycle, adapters-llm]
+    requires: [application, operations-portable, storage-sqlite, ports, types, store, pipeline-capture, pipeline-recall, pipeline-query, pipeline-entity, lifecycle, adapters-llm]
     owner: memory
     managed: true
     notes: |
       命令行面。`Run(args, stdout, stderr) int` 而非 `main()`——命令逻辑因此
       可被单测直接调用，不用起子进程。
+      pipeline-query 是 `memory query` 那条自查命令要的：
+      把一句问句翻成「可执行的检索条件」并打印，让宿主能看见
+      「这句话被理解成了什么」——而不用去猜召回为什么变了。
       requires 里的 pipeline-entity 与 lifecycle 是库管理面的依赖：
       实体归一的修正（合并 / 登记别名）与生命周期四动作（回收 / 合并 /
       保留期 / 物理整理）在内核里实现了却没有入口时，既不会被用也不会被验证。
@@ -232,7 +280,7 @@ modules:
     requires: [types, ports, store, pipeline-capture, pipeline-extractor, pipeline-promotion,
                pipeline-recall, pipeline-entity, pipeline-page, pipeline-episode,
                lifecycle, operations, operations-portable, application,
-               storage-sqlite, storage-parity]
+               storage-sqlite, storage-parity, evaluation]
     owner: memory
     managed: true
     notes: |

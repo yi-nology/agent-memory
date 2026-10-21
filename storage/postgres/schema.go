@@ -9,7 +9,43 @@ import (
 // schemaVersion 本后端的库形状版本号。
 //
 // 记在 meta 表的 schema_version 键里，迁移按版本号线性追加（见 migrate.go）。
-const schemaVersion = 3
+//
+// 5 = 事实卡的生效区间与版本号（v4）+ 关系边表（v5）。
+const schemaVersion = 5
+
+// entityEdgesDDL 关系边表的建表语句。
+//
+// 建表脚本与迁移共用**同一份** DDL（见 migrate.go 的 v5）：
+// 两份各写一遍的话，改了一处就会漂，而漂了的失效形态是
+// 「有的库有这张表、有的库没有」——症状出现在「边查不到」，离病因很远。
+//
+// 实体关系边（**派生物**）：边的真源是事实卡，投影丢了可以重投影。
+//
+// 归属与事实卡同口径：scope 非空且不等于读者的边**一条都不给**。
+// 生效区间与事实卡同口径：**左闭右开**（valid_to 那一刻已不成立）。
+//
+// ⚠️ 本后端的「未设」编码是 NULL（与本后端其它时刻列同款）：
+// 边是投影物，它**存在**的时刻（created_at）就是它生效的时刻，
+// 故未设生效点的边按 created_at 参与比较。
+const entityEdgesDDL = `
+CREATE TABLE IF NOT EXISTS entity_edges (
+  namespace      TEXT NOT NULL,
+  id             TEXT NOT NULL,
+  from_entity_id TEXT NOT NULL,
+  to_entity_id   TEXT NOT NULL,
+  relation       TEXT NOT NULL,
+  scope          TEXT NOT NULL DEFAULT '',
+  valid_from     TIMESTAMPTZ,
+  valid_to       TIMESTAMPTZ,
+  weight         REAL NOT NULL DEFAULT 0,
+  source_atom_id TEXT NOT NULL DEFAULT '',
+  created_at     TIMESTAMPTZ,
+  PRIMARY KEY (namespace, id)
+);
+CREATE INDEX IF NOT EXISTS entity_edges_from  ON entity_edges (namespace, from_entity_id);
+CREATE INDEX IF NOT EXISTS entity_edges_to    ON entity_edges (namespace, to_entity_id);
+CREATE INDEX IF NOT EXISTS entity_edges_scope ON entity_edges (namespace, scope);
+`
 
 // schema 是本后端的建表脚本。
 //
@@ -97,6 +133,17 @@ CREATE TABLE IF NOT EXISTS atoms (
   signature       TEXT NOT NULL DEFAULT '',
   body            TEXT NOT NULL DEFAULT '',
   body_tsv        tsvector,
+  -- 生效区间：事实从 valid_from 起成立，到 valid_to 止（**不含**那一刻）。
+  --
+  -- valid_from 的 NULL 是「未设」= 按发生时刻算（老数据的语义不变）；
+  -- valid_to 的 NULL 是「未设」= 仍有效。
+  --
+  -- ⚠️ 这三列的**形状变更**归迁移管（见 migrate.go 的 v4）：
+  -- 本文件的 DDL 每次打开都跑，而旧库的 atoms 表还没有这三列——
+  -- 脚本对旧库是**空操作**（CREATE TABLE IF NOT EXISTS），新列不会凭空出现。
+  valid_from      TIMESTAMPTZ,
+  valid_to        TIMESTAMPTZ,
+  version         INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (namespace, id)
 );
 CREATE INDEX IF NOT EXISTS atoms_entity ON atoms (namespace, entity_id);
@@ -166,6 +213,7 @@ CREATE TABLE IF NOT EXISTS entity_pages (
   PRIMARY KEY (namespace, entity_id, scope)
 );
 CREATE INDEX IF NOT EXISTS pages_dirty ON entity_pages (namespace, dirty);
+` + entityEdgesDDL + `
 
 CREATE TABLE IF NOT EXISTS episodes (
   namespace      TEXT NOT NULL,

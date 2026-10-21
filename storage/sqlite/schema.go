@@ -20,7 +20,43 @@
 package sqlite
 
 // schemaVersion 当前 schema 版本。新增迁移时 +1，并在 migrations 里追加一段。
-const schemaVersion = 3
+//
+// 5 = 事实卡的生效区间与版本号（v4）+ 关系边表（v5）。
+const schemaVersion = 5
+
+// entityEdgesDDL 关系边表的建表语句。
+//
+// 建表脚本与迁移共用**同一份** DDL（见 migrate.go 的 v5）：
+// 两份各写一遍的话，改了一处就会漂，而漂了的失效形态是
+// 「有的库有这张表、有的库没有」——症状出现在「边查不到」，离病因很远。
+//
+// 实体关系边（**派生物**）：边的真源是事实卡，投影丢了可以重投影。
+//
+// 归属与事实卡同口径：scope 非空且不等于读者的边**一条都不给**。
+// 生效区间与事实卡同口径：**左闭右开**（valid_to 那一刻已不成立）。
+//
+// ⚠️ 这里的「未设」编码是 0（valid_from/valid_to 都是）：
+// 边是投影物，它**存在**的时刻（created_at）就是它生效的时刻，
+// 故未设生效点的边按 created_at 参与比较。
+const entityEdgesDDL = `
+CREATE TABLE IF NOT EXISTS entity_edges (
+  namespace      TEXT NOT NULL,
+  id             TEXT NOT NULL,
+  from_entity_id TEXT NOT NULL,
+  to_entity_id   TEXT NOT NULL,
+  relation       TEXT NOT NULL,
+  scope          TEXT NOT NULL DEFAULT '',
+  valid_from     INTEGER NOT NULL DEFAULT 0,
+  valid_to       INTEGER NOT NULL DEFAULT 0,
+  weight         REAL NOT NULL DEFAULT 0,
+  source_atom_id TEXT NOT NULL DEFAULT '',
+  created_at     INTEGER NOT NULL,
+  PRIMARY KEY (namespace, id)
+);
+CREATE INDEX IF NOT EXISTS entity_edges_from  ON entity_edges (namespace, from_entity_id);
+CREATE INDEX IF NOT EXISTS entity_edges_to    ON entity_edges (namespace, to_entity_id);
+CREATE INDEX IF NOT EXISTS entity_edges_scope ON entity_edges (namespace, scope);
+`
 
 // schema 建表语句。
 //
@@ -101,6 +137,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS candidate_fts USING fts5(
 -- ⚠️ 这一列的**索引**不在本文件里，而在迁移里（见 migrate.go）：
 -- 本文件的 DDL 每次打开都跑，而旧库（v1 形状）的 atoms 表还没有这一列——
 -- 建索引的语句会当场失败，整个库就都打不开了。
+--
+-- ⚠️ 生效区间那三列的**形状变更**同样归迁移管（见 migrate.go 的 v4）：
+-- 老库的 atoms 表没有这三列，而本文件的 DDL 对老库是**空操作**
+-- （CREATE TABLE IF NOT EXISTS），新列不会凭空出现——
+-- 于是新代码按新形状读旧库，第一条事实卡查询就报「no such column」。
+--
+-- 三列的「未设」编码（**每种含义各一种编码，别混**）：
+--   valid_from 的 0  = 未设 = 按发生时刻算（老数据的语义不变）；
+--   valid_to 的 NULL = 未设 = 仍有效（与 deprecated_at 的 NULL 同款约定）。
 CREATE TABLE IF NOT EXISTS atoms (
   namespace       TEXT NOT NULL,
   id              TEXT NOT NULL,
@@ -121,6 +166,9 @@ CREATE TABLE IF NOT EXISTS atoms (
   deprecated_at   INTEGER,
   provenance      TEXT NOT NULL DEFAULT '{}',
   signature       TEXT NOT NULL DEFAULT '',
+  valid_from      INTEGER NOT NULL DEFAULT 0,
+  valid_to        INTEGER,
+  version         INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (namespace, id)
 );
 CREATE INDEX IF NOT EXISTS atoms_entity      ON atoms (namespace, entity_id);
@@ -180,6 +228,7 @@ CREATE TABLE IF NOT EXISTS entity_pages (
   PRIMARY KEY (namespace, entity_id, scope)
 );
 CREATE INDEX IF NOT EXISTS entity_pages_dirty ON entity_pages (namespace, dirty, updated_at);
+` + entityEdgesDDL + `
 
 -- 记忆树：组织视图。leaf 只持 atom_id（不复制正文，见 types/node.go）。
 
