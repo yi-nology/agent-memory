@@ -87,6 +87,37 @@ func cmdRetention(ctx context.Context, opt Options, stdout, stderr io.Writer) in
 	return 0
 }
 
+// cmdExpire 按龄过期**事件类**事实。
+//
+// # 为什么要单独一个命令
+//
+// 事件的「过期」与其它三类事实不同：状态是被**取代**，经验是**不因时间失效**，
+// 只有事件会**到期**。故它有自己的动作与自己的保留期
+// （缺省 30 天，与召回侧的默认事件窗口一致）。
+//
+// 退役是**软退役**（不删）：被推翻的事实曾经是真的，
+// 而「当初发生过什么」仍要能查到（见 lifecycle 包的说明）。
+func cmdExpire(ctx context.Context, opt Options, stdout, stderr io.Writer, retention time.Duration) int {
+	svc, st, err := open(ctx, opt)
+	if err != nil {
+		fmt.Fprintln(stderr, "打开失败:", err)
+		return 1
+	}
+	defer func() { _ = st.Close() }()
+
+	opts := []lifecycle.Option{}
+	if retention > 0 {
+		opts = append(opts, lifecycle.WithEventRetention(retention))
+	}
+	res, err := lifecycle.Expire(ctx, svc.Store(), store.Namespace(opt.Namespace), opts...)
+	if err != nil {
+		fmt.Fprintln(stderr, "按龄过期失败:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "已按龄退役 %d 张事件类事实卡\n", res.EventsRetired)
+	return 0
+}
+
 // cmdVacuum 物理整理（后端专属能力）。
 func cmdVacuum(ctx context.Context, opt Options, stdout, stderr io.Writer) int {
 	_, st, err := open(ctx, opt)

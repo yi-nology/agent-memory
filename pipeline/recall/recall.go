@@ -254,7 +254,7 @@ type Config struct {
 	//
 	// 同样是**可选**：不装时行为与现在完全一致。
 	Analyzer *query.Analyzer
-	// EventWindow 事件类事实的**默认召回窗口**（零值=不限）。
+	// EventWindow 事件类事实的**默认召回窗口**（零值=用 DefaultEventWindow）。
 	//
 	// 存在的理由：短期事件会过期，而「过期」在召回侧是**时间**：
 	// 三周前的一次重启不该再进 prompt——它不但占预算，
@@ -326,6 +326,9 @@ func (c Config) normalize() (Config, error) {
 	}
 	if c.MaxRaw <= 0 {
 		c.MaxRaw = 5
+	}
+	if c.EventWindow <= 0 {
+		c.EventWindow = DefaultEventWindow
 	}
 	// 缺省打分器：词面 + 重要度 + 新鲜度（权重 0.6/0.25/0.15）。
 	//
@@ -660,6 +663,16 @@ func (p *Pipeline) observe(res *Result, budget *ports.Budget, dur time.Duration)
 		m.Incr("recall.dropped."+string(reason), n)
 	}
 }
+
+// DefaultEventWindow 事件类事实的缺省召回窗口（30 天）。
+//
+// 与 lifecycle 的缺省事件保留期**一致**：一条事件的「过期」在两处是同一件事，
+// 两处口径不同就会出现「生命周期说它过期了、召回却还端上来」的错位
+// （症状是「模型把三周前的一次重启当成当前状态」）。
+//
+// ⚠️ 它**不影响既有事实**：它们的 kind 是空串（= 长期经验），
+// 而事件窗口只作用于事件类——所以开启它不改变任何老数据的行为。
+const DefaultEventWindow = 30 * 24 * time.Hour
 
 // 指标名。
 //

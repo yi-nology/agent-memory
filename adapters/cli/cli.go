@@ -168,6 +168,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		out       = fs.String("out", "", "导出包路径")
 		pkg       = fs.String("pkg", "", "迁移包路径")
 		before    = fs.Duration("before", 30*24*time.Hour, "回收保留期（早于此刻多久的原始事件）")
+		eventDays = fs.Int("days", 0, "事件类事实的保留期（天；0=缺省 30 天）")
 		toID      = fs.String("to", "", "合并目标实体 ID")
 		fromID    = fs.String("from", "", "合并来源实体 ID")
 		entityID  = fs.String("entity", "", "实体 ID 或规范名")
@@ -239,6 +240,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return cmdConsolidate(ctx, opt, stdout, stderr)
 	case "retention":
 		return cmdRetention(ctx, opt, stdout, stderr)
+	case "expire":
+		// 按龄过期**事件类**事实（保留期缺省 30 天）。
+		return cmdExpire(ctx, opt, stdout, stderr, time.Duration(*eventDays)*24*time.Hour)
 	case "vacuum":
 		return cmdVacuum(ctx, opt, stdout, stderr)
 	case "entity":
@@ -286,6 +290,7 @@ func usage(w io.Writer) {
   memory gc [--before 720h]              按龄回收原始事件（默认保留 30 天）
   memory consolidate                     合并同签名事实
   memory retention                       退役证据全来自运行期错误的事实
+  memory expire [--days N]                按龄退役事件类事实（缺省 30 天）
   memory vacuum                          物理整理（后端专属）
   memory entity list [--limit N]         列出实体
   memory entity merge --to ID --from ID  合并两个实体

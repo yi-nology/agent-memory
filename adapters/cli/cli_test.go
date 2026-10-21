@@ -177,3 +177,57 @@ func TestReindexFillsVectors(t *testing.T) {
 		t.Fatalf("reindex 应幂等，两次输出不同: %q vs %q", out, out2)
 	}
 }
+
+// memory expire 按龄退役**事件类**事实；长期经验与状态不受影响。
+//
+// 这条钉的是「按类别分治」：一套策略套所有事实必然两头不讨好
+// （事件被永久留着污染召回，经验被按时间淘汰丢掉知识）。
+func TestExpireRetiresOnlyEvents(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "m.sqlite")
+
+	// 造两条事实卡：一条事件类（很老）、一条长期经验（同样很老）。
+	st, err := sqlite.OpenFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().AddDate(0, 0, -60)
+	mk := func(id, kind string) *types.AtomCard {
+		return &types.AtomCard{
+			ID: id, EntityID: "e1", Assertion: "磁盘 清理 " + id, Kind: types.FactKind(kind),
+			QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+			Importance: types.ImportanceMed, Confidence: types.ConfidenceMed,
+			OccurredAt: old, CreatedAt: old, UpdatedAt: old,
+		}
+	}
+	for _, a := range []*types.AtomCard{mk("a-event", "event"), mk("a-lesson", "lesson")} {
+		if err := st.SaveAtom(context.Background(), store.Namespace("t"), a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, errb := run(t, "expire", "--db", db, "--namespace", "t", "--days", "30")
+	if code != 0 {
+		t.Fatalf("expire 失败: %s %s", out, errb)
+	}
+	if !strings.Contains(out, "已按龄退役 1 张") {
+		t.Fatalf("只应退役那一条事件类事实: %q", out)
+	}
+
+	// 长期经验不该被按龄退役（它不因时间失效）。
+	st2, err := sqlite.OpenFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st2.Close() }()
+	lesson, err := st2.GetAtom(context.Background(), store.Namespace("t"), "a-lesson")
+	if err != nil {
+		t.Fatalf("长期经验不该被退役: %v", err)
+	}
+	if !lesson.Active() {
+		t.Fatal("长期经验不该被按龄退役")
+	}
+}
