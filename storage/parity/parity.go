@@ -87,6 +87,8 @@ func Run(t *testing.T, open OpenFn) {
 		{"页面：标脏在页面不存在时自建", tPageMarkDirtyCreates},
 		{"页面：重生成失败保持脏标记", tPageRegenFailureKeepsDirty},
 		{"页面：重生成成功清脏清失败", tPageRegenSuccessClears},
+		{"页面：按归属分视角隔离", tPageScopeIsolation},
+		{"页面：标脏按归属传播", tPageDirtyScopePropagation},
 		{"情节与周期摘要", tEpisodeDigest},
 		{"审计条目按主体检索", tJournalBySubject},
 		{"元数据按命名空间隔离", tMetaIsolation},
@@ -490,13 +492,13 @@ func tActiveEntityOrder(t *testing.T, s store.Store) {
 // 晋升先于首次生成是常态，所以标脏必须能自建页面——
 // 报「页面不存在」会把一次正常写入变成错误。
 func tPageMarkDirtyCreates(t *testing.T, s store.Store) {
-	if _, err := s.GetEntityPage(bg(), nsA, "e-new"); !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.GetEntityPage(bg(), nsA, "e-new", ""); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("前置条件失真，页面本不该存在: %v", err)
 	}
-	if err := s.MarkEntityPageDirty(bg(), nsA, "e-new", base); err != nil {
+	if err := s.MarkEntityPageDirty(bg(), nsA, "e-new", "", base); err != nil {
 		t.Fatalf("标脏失败: %v", err)
 	}
-	got, err := s.GetEntityPage(bg(), nsA, "e-new")
+	got, err := s.GetEntityPage(bg(), nsA, "e-new", "")
 	if err != nil {
 		t.Fatalf("标脏应自建页面: %v", err)
 	}
@@ -506,9 +508,9 @@ func tPageMarkDirtyCreates(t *testing.T, s store.Store) {
 }
 
 func tPageRegenFailureKeepsDirty(t *testing.T, s store.Store) {
-	_ = s.MarkEntityPageDirty(bg(), nsA, "e1", base)
-	_ = s.RecordEntityPageRegenFailure(bg(), nsA, "e1", "模型超时", base)
-	got, err := s.GetEntityPage(bg(), nsA, "e1")
+	_ = s.MarkEntityPageDirty(bg(), nsA, "e1", "", base)
+	_ = s.RecordEntityPageRegenFailure(bg(), nsA, "e1", "", "模型超时", base)
+	got, err := s.GetEntityPage(bg(), nsA, "e1", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,12 +526,12 @@ func tPageRegenFailureKeepsDirty(t *testing.T, s store.Store) {
 }
 
 func tPageRegenSuccessClears(t *testing.T, s store.Store) {
-	_ = s.MarkEntityPageDirty(bg(), nsA, "e1", base)
-	_ = s.RecordEntityPageRegenFailure(bg(), nsA, "e1", "上次超时", base)
-	_ = s.ApplyEntityPageRegen(bg(), nsA, "e1", &types.EntityPage{
+	_ = s.MarkEntityPageDirty(bg(), nsA, "e1", "", base)
+	_ = s.RecordEntityPageRegenFailure(bg(), nsA, "e1", "", "上次超时", base)
+	_ = s.ApplyEntityPageRegen(bg(), nsA, "e1", "", &types.EntityPage{
 		Headline: "长期偏小", Body: "正文", AtomIDs: []string{"a1"},
 	}, base)
-	got, err := s.GetEntityPage(bg(), nsA, "e1")
+	got, err := s.GetEntityPage(bg(), nsA, "e1", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -538,6 +540,117 @@ func tPageRegenSuccessClears(t *testing.T, s store.Store) {
 	}
 	if len(got.AtomIDs) != 1 || got.AtomIDs[0] != "a1" {
 		t.Fatalf("覆盖的事实集合丢失: %+v", got.AtomIDs)
+	}
+}
+
+// 页面必须**按归属分视角**：同一实体在不同归属下各有一页，
+// 互相取不到——取到就是内容泄漏（别家的画像进了 prompt），
+// 而画像是人读的一整段话，读者分不清哪句属于自己。
+func tPageScopeIsolation(t *testing.T, s store.Store) {
+	const scopeA = types.Scope("team-a")
+	const scopeB = types.Scope("team-b")
+
+	for _, p := range []*types.EntityPage{
+		{EntityID: "e-shared", Scope: scopeA, Headline: "a 视角", Body: "a 正文"},
+		{EntityID: "e-shared", Scope: scopeB, Headline: "b 视角", Body: "b 正文"},
+		{EntityID: "e-shared", Scope: "", Headline: "全局视角", Body: "全局正文"},
+	} {
+		if err := s.UpsertEntityPage(bg(), nsA, p); err != nil {
+			t.Fatalf("写页面失败(scope=%q): %v", p.Scope, err)
+		}
+	}
+
+	// 各视角取回自己的那一页
+	for _, tc := range []struct {
+		scope types.Scope
+		want  string
+	}{
+		{scopeA, "a 视角"},
+		{scopeB, "b 视角"},
+		{"", "全局视角"},
+	} {
+		got, err := s.GetEntityPage(bg(), nsA, "e-shared", tc.scope)
+		if err != nil {
+			t.Fatalf("取页面失败(scope=%q): %v", tc.scope, err)
+		}
+		if got.Headline != tc.want {
+			t.Fatalf("scope=%q 取到了别的视角的页面: %q", tc.scope, got.Headline)
+		}
+		if got.Scope != tc.scope {
+			t.Fatalf("页面归属字段失真: 期望 %q 实得 %q", tc.scope, got.Scope)
+		}
+	}
+
+	// 没建立过的视角取不到（取不到就是取不到，不回退成别的视角）
+	if _, err := s.GetEntityPage(bg(), nsA, "e-shared", types.Scope("team-c")); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("未建立的视角应取不到, 实得: %v", err)
+	}
+
+	// 跨视角全列（导包要完整）：三个视角都得在
+	all, err := s.ListEntityPages(bg(), nsA, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[types.Scope]bool{}
+	for _, p := range all {
+		if p.EntityID == "e-shared" {
+			seen[p.Scope] = true
+		}
+	}
+	for _, want := range []types.Scope{scopeA, scopeB, ""} {
+		if !seen[want] {
+			t.Fatalf("跨视角全列漏了 scope=%q 的页面", want)
+		}
+	}
+}
+
+// 标脏的传播范围：全局事实出现在**每个视角**的画像里，
+// 它一变，所有视角都过时；归属事实只影响自己那一视角。
+//
+// 只标一页的后果不是「少了一次重生成」，而是**别家的画像停在旧版本**，
+// 而看板上「页面存在且是旧的」与「页面正常」长得一模一样。
+func tPageDirtyScopePropagation(t *testing.T, s store.Store) {
+	const scopeA = types.Scope("team-a")
+	for _, p := range []*types.EntityPage{
+		{EntityID: "e-g", Scope: scopeA, Headline: "旧"},
+		{EntityID: "e-g", Scope: "", Headline: "旧"},
+	} {
+		if err := s.UpsertEntityPage(bg(), nsA, p); err != nil {
+			t.Fatalf("写页面失败: %v", err)
+		}
+	}
+
+	// 归属事实 → 只标该视角
+	if err := s.MarkEntityPageDirty(bg(), nsA, "e-g", scopeA, base); err != nil {
+		t.Fatalf("标脏失败: %v", err)
+	}
+	g, err := s.GetEntityPage(bg(), nsA, "e-g", scopeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.Dirty {
+		t.Fatal("归属事实应把本视角的页面标脏")
+	}
+	g, err = s.GetEntityPage(bg(), nsA, "e-g", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Dirty {
+		t.Fatal("归属事实不该把全局页标脏：全局页只汇总全局事实")
+	}
+
+	// 全局事实 → 所有视角都标脏
+	if err := s.MarkEntityPageDirty(bg(), nsA, "e-g", "", base); err != nil {
+		t.Fatalf("标脏失败: %v", err)
+	}
+	for _, sc := range []types.Scope{scopeA, ""} {
+		g, err := s.GetEntityPage(bg(), nsA, "e-g", sc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !g.Dirty {
+			t.Fatalf("全局事实变了，scope=%q 的页面也该标脏", sc)
+		}
 	}
 }
 

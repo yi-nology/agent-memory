@@ -33,13 +33,17 @@ import (
 )
 
 // Store 页面面用到的存储。
+//
+// 页面按**归属视角**分页（逻辑主键 namespace + entity_id + scope），
+// 故下面每个写/读口都带 scope。
 type Store interface {
-	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string) (*types.EntityPage, error)
-	ListDirtyEntityPages(ctx context.Context, ns store.Namespace, limit int) ([]*types.EntityPage, error)
-	MarkEntityPageDirty(ctx context.Context, ns store.Namespace, entityID string, when time.Time) error
-	ApplyEntityPageRegen(ctx context.Context, ns store.Namespace, entityID string,
+	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope) (*types.EntityPage, error)
+	ListDirtyEntityPages(ctx context.Context, ns store.Namespace, scope types.Scope, limit int) ([]*types.EntityPage, error)
+	MarkEntityPageDirty(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope, when time.Time) error
+	ApplyEntityPageRegen(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope,
 		p *types.EntityPage, at time.Time) error
-	RecordEntityPageRegenFailure(ctx context.Context, ns store.Namespace, entityID, reason string, at time.Time) error
+	RecordEntityPageRegenFailure(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope,
+		reason string, at time.Time) error
 	ListAtomsByEntity(ctx context.Context, ns store.Namespace, entityID string) ([]*types.AtomCard, error)
 }
 
@@ -141,8 +145,12 @@ type Result struct {
 }
 
 // RegenerateDirty 重生成所有到期脏页面。
-func (r *Regenerator) RegenerateDirty(ctx context.Context, ns store.Namespace) (*Result, error) {
-	pages, err := r.store.ListDirtyEntityPages(ctx, ns, r.cfg.BatchSize)
+//
+// scope 是**这一轮的视角**：只重生成该视角下的脏页面。
+// 页面按归属分页，各视角的页面互不相干，
+// 一轮里把别的视角也重生成掉，等于用这个视角的模型调用去改别人的页面。
+func (r *Regenerator) RegenerateDirty(ctx context.Context, ns store.Namespace, scope types.Scope) (*Result, error) {
+	pages, err := r.store.ListDirtyEntityPages(ctx, ns, scope, r.cfg.BatchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -153,16 +161,16 @@ func (r *Regenerator) RegenerateDirty(ctx context.Context, ns store.Namespace) (
 			res.Skipped++
 			continue
 		}
-		if err := r.regenerateOne(ctx, ns, p.EntityID, res); err != nil {
+		if err := r.regenerateOne(ctx, ns, p.EntityID, scope, res); err != nil {
 			return res, err
 		}
 	}
 	return res, nil
 }
 
-// RegenerateOne 重生成指定实体的页面。
-func (r *Regenerator) RegenerateOne(ctx context.Context, ns store.Namespace, entityID string) error {
-	return r.regenerateOne(ctx, ns, entityID, &Result{Failures: map[string]string{}})
+// RegenerateOne 重生成指定实体的页面（指定视角）。
+func (r *Regenerator) RegenerateOne(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope) error {
+	return r.regenerateOne(ctx, ns, entityID, scope, &Result{Failures: map[string]string{}})
 }
 
 // regenerateOne 重生成一页。
@@ -170,7 +178,8 @@ func (r *Regenerator) RegenerateOne(ctx context.Context, ns store.Namespace, ent
 // 失败**不**返回错误：一次生成失败是常态（模型超时、上下文超长），
 // 它已经记进页面（失败原因 + 保持脏），不该让整轮重生成中断。
 // 只有存储故障才上抛。
-func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, entityID string, res *Result) error {
+func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, entityID string,
+	scope types.Scope, res *Result) error {
 	all, err := r.store.ListAtomsByEntity(ctx, ns, entityID)
 	if err != nil {
 		return err
@@ -181,11 +190,28 @@ func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, ent
 	//
 	// 被推翻的事实并没有丢：它仍在事实卡里，仍可被搜到并看到「已被谁取代」
 	// （见 types.AtomCard 的软退役约定）。摘要不必承担那份责任。
+	//
+	// 摘要还只用**对这一视角可见**的事实（全局 + 同归属）：
+	// 画像是事实的摘要，摘要若揉进别家的事实，这一页就成了
+	// 「一张所有人都能看到的、混着别人内容的画像」——内容泄漏。
+	//
+	// 过滤放在**进提示词之前**：提示词是要发给模型的那一份，
+	// 过滤放在它后面等于把别家的事实先发出去再处理。
+	//
+	// 判据用 types.Scope.VisibleTo（与存储层 SQL 的 `(scope='' OR scope=?)`
+	// 同一形状、与召回层的复查同一判据）：一处判据，三个后端不会分叉。
+	// 之所以在内存里过滤而不在 SQL 里过滤：这里的取数是「某实体的全部事实」
+	// （条数已被 MaxAtoms 封顶），没有 TopK 配额竞争，
+	// 不存在「被别家占掉配额」那种失效形态；而放在一处判据上更不容易分叉。
 	atoms := make([]*types.AtomCard, 0, len(all))
 	for _, a := range all {
-		if a.Active() {
-			atoms = append(atoms, a)
+		if !a.Active() {
+			continue
 		}
+		if !a.Scope.VisibleTo(scope) {
+			continue
+		}
+		atoms = append(atoms, a)
 	}
 	if len(atoms) == 0 {
 		// 没有活跃事实就没有页面可写。标脏保持不变（事实将来会有），
@@ -198,7 +224,7 @@ func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, ent
 	}
 	if r.llm == nil {
 		err := ErrNoLLM
-		_ = r.store.RecordEntityPageRegenFailure(ctx, ns, entityID, err.Error(), r.now())
+		_ = r.store.RecordEntityPageRegenFailure(ctx, ns, entityID, scope, err.Error(), r.now())
 		res.Failed++
 		res.Failures[entityID] = err.Error()
 		return nil
@@ -211,7 +237,7 @@ func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, ent
 		MaxTokens: 1200,
 	})
 	if err != nil {
-		_ = r.store.RecordEntityPageRegenFailure(ctx, ns, entityID, err.Error(), r.now())
+		_ = r.store.RecordEntityPageRegenFailure(ctx, ns, entityID, scope, err.Error(), r.now())
 		res.Failed++
 		res.Failures[entityID] = err.Error()
 		return nil
@@ -219,7 +245,7 @@ func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, ent
 
 	headline, body, perr := parsePage(out)
 	if perr != nil {
-		_ = r.store.RecordEntityPageRegenFailure(ctx, ns, entityID, perr.Error(), r.now())
+		_ = r.store.RecordEntityPageRegenFailure(ctx, ns, entityID, scope, perr.Error(), r.now())
 		res.Failed++
 		res.Failures[entityID] = perr.Error()
 		return nil
@@ -230,9 +256,9 @@ func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, ent
 		ids = append(ids, a.ID)
 	}
 	pg := &types.EntityPage{
-		EntityID: entityID, Headline: headline, Body: body, AtomIDs: ids,
+		EntityID: entityID, Scope: scope, Headline: headline, Body: body, AtomIDs: ids,
 	}
-	if err := r.store.ApplyEntityPageRegen(ctx, ns, entityID, pg, r.now()); err != nil {
+	if err := r.store.ApplyEntityPageRegen(ctx, ns, entityID, scope, pg, r.now()); err != nil {
 		return err
 	}
 	res.Regenerated++

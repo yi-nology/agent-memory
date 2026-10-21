@@ -84,6 +84,7 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 |---|---|---|---|
 | 领域结构（加字段/加枚举） | `types/` | 两个后端的 `storage/{sqlite,postgres}/` | `types` 零依赖，加字段要同步 `schema.go` + **迁移** |
 | 记录级归属（多组共用一套库） | `types/scope.go` | `store.AtomFilter.Scope` + 两个后端的查询 + `pipeline/recall/gather.go` | 过滤**在取数层**（进 SQL）；签名必须含归属 |
+| 实体画像（按归属分视角） | `types/page.go` | `store.PageStore` 全接口 + 两个后端（**加列 + 改主键 + 迁移**）+ `pipeline/page` + `pipeline/recall/gather.go` | 画像的 scope 是**键的一部分**（不是过滤面）；全局页只汇总全局事实 |
 | schema 加列 | `storage/{sqlite,postgres}/schema.go` | `storage/{sqlite,postgres}/migrate.go` | 建表脚本**没有 ALTER**；迁移**必须幂等**；索引归迁移管 |
 | 排序口径（打分器） | `ports/rank.go` | `pipeline/recall/rank.go` + `recall.Config.Ranker` | 缺省**零漂移**（旧公式在测试里重写一遍当期望值） |
 | 模型调用/脱敏/防伪 | `ports/` | 注入它的 `application.Deps` | 新增第三方须登记 `allow_third_party` |
@@ -164,8 +165,16 @@ adapters/{cli,bridge,llm}  →  cmd/memory
    `DropQuota`（该调分桶占比）与 `DropBudget`（该调总预算）**必须分开**，
    合成一个数就看不出是哪一种。
 
-> **验收提醒**：召回的排序是**实现细节**，别把它写成断言。
-> 断言「命中集合正确」即可，别断言名次。
+> **验收提醒**：**名次**是实现细节，别把它写成断言——断言「命中集合正确」即可。
+> 但**方向不是**实现细节：`ports.Ranker` 的契约明写「分数越大越靠前」，
+> 那是**对外契约**，必须在召回层断言（`TestHigherScoreComesFirst`）。
+> 这两者的分界：后端给什么顺序是实现细节（所以 parity 不断言名次），
+> 而「高分在前」是契约（所以召回层必须断言）。
+>
+> ⚠️ 这条边界曾经被人读反过：照字面执行「别断言名次」，
+> 就会漏掉方向那条断言——而方向写反了，预算一紧**先丢最相关的事实**，
+> 症状只是「召回少了」，看着像内容不够。
+> （真实教训见 AGENTS.md「2026-10-21 三 P0 实弹」段。）
 
 ### 3.4 加一个 CLI 命令
 
@@ -269,6 +278,11 @@ git show --stat --name-status HEAD  # 提交后复核文件集合
 | 嵌套掩码 `«url-«secret-assignment:****»»` | 掩码类型名含敏感键名表里的词 | `ports/redact.go` 类型名约束 |
 | 模型说「没什么」被当成成功 | 返回了空串而不是 `ErrNoLLM` | `ports/llm.go` |
 | 记忆里的话被当系统指令执行 | 没包数据区 / 转义规则与实际 band 不配 | `ports/band.go` |
+| 召回里留着的是最不相关的那条 | 排序方向与 `ports.Ranker` 契约反了（升序） | `pipeline/recall/rank.go` `sortByScore` |
+| 预算一紧就丢最该留的事实 | 同上（分配按排序**逐条接收**，顺序即取舍） | `TestTightBudgetKeepsMostRelevant` |
+| 换个归属就拿到上一归属的召回结果 | 缓存键漏了 `Scope`（跨租户泄漏） | `pipeline/recall/recall.go` `cacheKey` |
+| 画像里出现了没提过的东西 | 画像不按归属分视角（摘要混进别家事实） | `types/page.go` `EntityPage.Scope` |
+| `memory.page.regen` 安静地什么都不做 | 写入侧没标脏（派生标记没接线） | `application/service.go` `markPageDirty` |
 | 某实体的事实全丢了 | 实体合并时按 `ActiveOnly` 过滤了退役卡 | `store/store.go` ListAtomsByEntity 注释 |
 | 召回结果偏少但看不出原因 | 丢弃没分路 | `Result.Drops` / `ports.Budget` |
 | 画像桶恒为 0 | 画像参与了多样性裁剪被挤掉 | `TestBucketsAreIndependent` |
@@ -316,6 +330,7 @@ cat architecture-policy.yaml
 | `pending` 不与活跃实体栈合并 | 表面都是跨轮状态，生命周期相反 |
 | 迁移包写面不换 `pack` | 本仓清单多了两个溯源字段，换过去等于改包格式 |
 | PG parity 需要真服务器 | 没配 DSN 时它**显式 skip**，跳过不证明兼容 |
+| 画像：读者不隔离时只拿到全局页 | `Request.Scope` 为空，在**过滤面**是「不隔离」，在**画像面**是「全局视角」——刻意不同：全局页若也收进所有事实，它就是一张所有人都能看的、揉着别人内容的摘要（泄漏）。少一段摘要只是少点上下文，泄漏是内容事故 |
 | 门禁的 `severity` 字段未生效 | policy 里声明了 `severity`，但门禁**只按 error 处理**，warn 与 error 行为相同 |
 | 门禁 `exceptions` 的 `until` 只解析不比较 | 例外到期**不自动失效**；真要限时，得走 `allow_third_party` 那条路（那条会到期即红） |
 

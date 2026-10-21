@@ -17,8 +17,13 @@ var (
 )
 
 // ── 实体页面 ──
+//
+// 页面的逻辑主键是 (namespace, entity_id, scope)：归属是**键的一部分**，不是过滤面。
+// 页面是事实的摘要，而事实已按归属隔离；摘要若不分视角，
+// 等于把别家的事实揉进一张画像里（内容泄漏），而画像是人读的一整段话，
+// 读者分不清哪句属于自己。所以取页是**精确取键**：别的视角取不到，不回退。
 
-const pageCols = `entity_id, headline, body, atom_ids, dirty, updated_at, last_regen_at, regen_failure`
+const pageCols = `entity_id, scope, headline, body, atom_ids, dirty, updated_at, last_regen_at, regen_failure`
 
 func (s *pageStore) scanPage(rows *sql.Rows) (*types.EntityPage, error) {
 	var (
@@ -27,7 +32,7 @@ func (s *pageStore) scanPage(rows *sql.Rows) (*types.EntityPage, error) {
 		updated int64
 		regen   sql.NullInt64
 	)
-	if err := rows.Scan(&p.EntityID, &p.Headline, &p.Body, &atomIDs, &p.Dirty,
+	if err := rows.Scan(&p.EntityID, &p.Scope, &p.Headline, &p.Body, &atomIDs, &p.Dirty,
 		&updated, &regen, &p.RegenFailure); err != nil {
 		return nil, err
 	}
@@ -41,27 +46,33 @@ func (s *pageStore) UpsertEntityPage(ctx context.Context, ns store.Namespace, p 
 	if p.EntityID == "" {
 		return errors.New("页面必须有归属实体")
 	}
-	return s.writePage(ctx, ns, p.EntityID, p.Headline, p.Body, p.AtomIDs, boolToInt(p.Dirty),
+	return s.writePage(ctx, ns, p.EntityID, p.Scope, p.Headline, p.Body, p.AtomIDs, boolToInt(p.Dirty),
 		ts(p.UpdatedAt), tsPtr(p.LastRegenAt), p.RegenFailure)
 }
 
-func (s *pageStore) writePage(ctx context.Context, ns store.Namespace, entityID, headline, body string,
-	atomIDs []string, dirty int, updated any, regen any, failure string) error {
+func (s *pageStore) writePage(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope,
+	headline, body string, atomIDs []string, dirty int, updated any, regen any, failure string) error {
 	_, err := s.exec(ctx, `INSERT INTO entity_pages
-		(namespace, entity_id, headline, body, atom_ids, dirty, updated_at, last_regen_at, regen_failure)
-		VALUES (?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(namespace, entity_id) DO UPDATE SET
+		(namespace, entity_id, scope, headline, body, atom_ids, dirty, updated_at, last_regen_at, regen_failure)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(namespace, entity_id, scope) DO UPDATE SET
 			headline = excluded.headline, body = excluded.body,
 			atom_ids = excluded.atom_ids, dirty = excluded.dirty,
 			updated_at = excluded.updated_at, last_regen_at = excluded.last_regen_at,
 			regen_failure = excluded.regen_failure`,
-		nsOf(ns), entityID, headline, body, stringsJSON(atomIDs), dirty, updated, regen, failure)
+		nsOf(ns), entityID, string(scope), headline, body, stringsJSON(atomIDs), dirty, updated, regen, failure)
 	return err
 }
 
-func (s *pageStore) GetEntityPage(ctx context.Context, ns store.Namespace, entityID string) (*types.EntityPage, error) {
-	rows, err := s.query(ctx, `SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? AND entity_id = ?`,
-		nsOf(ns), entityID)
+// GetEntityPage 精确取 (namespace, entity_id, scope) 这一页。
+//
+// **不回退**：别的视角的页面取不到就是取不到（store.ErrNotFound）。
+// 回退策略归召回层管——它知道读者是谁；存储层替它猜，猜错就是内容泄漏。
+func (s *pageStore) GetEntityPage(ctx context.Context, ns store.Namespace, entityID string,
+	scope types.Scope) (*types.EntityPage, error) {
+	rows, err := s.query(ctx,
+		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? AND entity_id = ? AND scope = ?`,
+		nsOf(ns), entityID, string(scope))
 	if err != nil {
 		return nil, err
 	}
@@ -72,10 +83,13 @@ func (s *pageStore) GetEntityPage(ctx context.Context, ns store.Namespace, entit
 	return s.scanPage(rows)
 }
 
-func (s *pageStore) ListDirtyEntityPages(ctx context.Context, ns store.Namespace, limit int) ([]*types.EntityPage, error) {
+// ListDirtyEntityPages 列出该视角下的脏页面。
+func (s *pageStore) ListDirtyEntityPages(ctx context.Context, ns store.Namespace, scope types.Scope,
+	limit int) ([]*types.EntityPage, error) {
 	rows, err := s.query(ctx,
-		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? AND dirty = 1
-		 ORDER BY updated_at ASC LIMIT ?`, nsOf(ns), limitOf(limit, 50))
+		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? AND scope = ? AND dirty = 1
+		 ORDER BY updated_at ASC, entity_id ASC, scope ASC LIMIT ?`,
+		nsOf(ns), string(scope), limitOf(limit, 50))
 	if err != nil {
 		return nil, err
 	}
@@ -91,10 +105,13 @@ func (s *pageStore) ListDirtyEntityPages(ctx context.Context, ns store.Namespace
 	return out, rows.Err()
 }
 
-// ListEntityPages 列出全部页面。
+// ListEntityPages 列出全部页面（**跨视角全列**）。
+//
+// 导包要的是这个命名空间的全部记忆：只导一个视角等于导出时把别家的画像
+// 悄悄丢了，而导入方看不出来（包是完整的，只是少了几页）。
 func (s *Store) ListEntityPages(ctx context.Context, ns store.Namespace, limit int) ([]*types.EntityPage, error) {
 	rows, err := s.query(ctx,
-		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? ORDER BY entity_id LIMIT ?`,
+		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? ORDER BY entity_id ASC, scope ASC LIMIT ?`,
 		nsOf(ns), limitOf(limit, 1000))
 	if err != nil {
 		return nil, err
@@ -113,38 +130,65 @@ func (s *Store) ListEntityPages(ctx context.Context, ns store.Namespace, limit i
 
 // MarkEntityPageDirty 标脏。
 //
+// scope 是**这条事实的归属**，不是目标页面的视角：
+//
+//   - 归属事实（非空）→ 只有本视角的页面收录它，故只标本视角那一页；
+//   - 全局事实（空）→ 它出现在**每个视角的画像里**，故所有视角都过时。
+//
+// 只标一页的后果不是「少了一次重生成」，而是**别家的画像停在旧版本**，
+// 而看板上「页面存在且是旧的」与「页面正常」长得一模一样。
+//
 // 页面不存在时**不报错而是建一条空脏页**：晋升先于首次生成是常态，
 // 而「实体还没有页面」不该让晋升流程失败——那会把一个正常的写入变成错误。
-func (s *pageStore) MarkEntityPageDirty(ctx context.Context, ns store.Namespace, entityID string, when time.Time) error {
+func (s *pageStore) MarkEntityPageDirty(ctx context.Context, ns store.Namespace, entityID string,
+	scope types.Scope, when time.Time) error {
 	if when.IsZero() {
 		when = time.Now().UTC()
 	}
+	if scope.IsGlobal() {
+		// 全局事实：所有视角的页面都收录它，全都要标脏。
+		res, err := s.exec(ctx,
+			`UPDATE entity_pages SET dirty = 1, updated_at = ? WHERE namespace = ? AND entity_id = ?`,
+			ts(when), nsOf(ns), entityID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			return nil
+		}
+		return s.writePage(ctx, ns, entityID, scope, "", "", nil, 1, ts(when), nil, "")
+	}
 	res, err := s.exec(ctx,
-		`UPDATE entity_pages SET dirty = 1, updated_at = ? WHERE namespace = ? AND entity_id = ?`,
-		ts(when), nsOf(ns), entityID)
+		`UPDATE entity_pages SET dirty = 1, updated_at = ?
+		 WHERE namespace = ? AND entity_id = ? AND scope = ?`,
+		ts(when), nsOf(ns), entityID, string(scope))
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		return nil
 	}
-	return s.writePage(ctx, ns, entityID, "", "", nil, 1, ts(when), nil, "")
+	return s.writePage(ctx, ns, entityID, scope, "", "", nil, 1, ts(when), nil, "")
 }
 
 // ApplyEntityPageRegen 生成成功：落正文、清脏、清失败原因。
+//
+// scope 是**键的一部分**：生成结果写到 (entity_id, scope) 那一页，
+// 不覆盖同实体别的视角的页面。
 func (s *pageStore) ApplyEntityPageRegen(ctx context.Context, ns store.Namespace, entityID string,
-	p *types.EntityPage, at time.Time) error {
+	scope types.Scope, p *types.EntityPage, at time.Time) error {
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
 	p.EntityID = entityID
+	p.Scope = scope
 	p.Dirty = false
 	p.LastRegenAt = at
 	p.RegenFailure = ""
 	if p.UpdatedAt.IsZero() {
 		p.UpdatedAt = at
 	}
-	return s.writePage(ctx, ns, entityID, p.Headline, p.Body, p.AtomIDs, 0,
+	return s.writePage(ctx, ns, entityID, scope, p.Headline, p.Body, p.AtomIDs, 0,
 		ts(p.UpdatedAt), ts(at), "")
 }
 
@@ -152,20 +196,22 @@ func (s *pageStore) ApplyEntityPageRegen(ctx context.Context, ns store.Namespace
 //
 // 保持脏是关键：清掉脏标记会让这条页面永远不再进重生成队列，
 // 而用户看到的是「页面存在、内容过时」——与「页面正常」长得一模一样。
-func (s *pageStore) RecordEntityPageRegenFailure(ctx context.Context, ns store.Namespace, entityID, reason string, at time.Time) error {
+func (s *pageStore) RecordEntityPageRegenFailure(ctx context.Context, ns store.Namespace, entityID string,
+	scope types.Scope, reason string, at time.Time) error {
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
 	res, err := s.exec(ctx,
-		`UPDATE entity_pages SET dirty = 1, regen_failure = ?, last_regen_at = ? WHERE namespace = ? AND entity_id = ?`,
-		reason, ts(at), nsOf(ns), entityID)
+		`UPDATE entity_pages SET dirty = 1, regen_failure = ?, last_regen_at = ?
+		 WHERE namespace = ? AND entity_id = ? AND scope = ?`,
+		reason, ts(at), nsOf(ns), entityID, string(scope))
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		return nil
 	}
-	return s.writePage(ctx, ns, entityID, "", "", nil, 1, ts(at), ts(at), reason)
+	return s.writePage(ctx, ns, entityID, scope, "", "", nil, 1, ts(at), ts(at), reason)
 }
 
 // ── 情节与周期摘要 ──

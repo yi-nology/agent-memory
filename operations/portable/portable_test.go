@@ -50,6 +50,13 @@ func seed(t *testing.T) *sqlite.Store {
 	must(s.UpsertEntityPage(ctx, ns, &types.EntityPage{
 		EntityID: "ent1", Headline: "磁盘偏小的机器", Body: "长期磁盘不足", UpdatedAt: now(),
 	}))
+	// 再来一张**带归属**的画像：导出导入必须把归属一起带走。
+	//
+	// 丢归属的后果不是「少了一段画像」，而是**归属被拍平成全局**——
+	// 一张只该本组看的画像，导进新库后成了所有人都能读的那张。
+	must(s.UpsertEntityPage(ctx, ns, &types.EntityPage{
+		EntityID: "ent1", Scope: "team-a", Headline: "甲组视角的画像", Body: "甲组补充", UpdatedAt: now(),
+	}))
 	must(s.SaveEpisode(ctx, ns, &types.Episode{
 		ID: "ep1", SessionID: "s1", Title: "一次排查", Summary: "定位到磁盘",
 		OccurredAt: now(), CreatedAt: now(),
@@ -112,6 +119,26 @@ func TestExportDoctorImportRoundTrip(t *testing.T) {
 	// 命名空间隔离：导入进别的库，原库不受影响。
 	if _, err := dst.GetAtom(context.Background(), ns, "a1"); !errorsIsNotFound(err) {
 		t.Fatalf("导入不该跨命名空间可见: %v", err)
+	}
+	// 画像的归属必须一起迁移过去。
+	scoped, err := dst.GetEntityPage(context.Background(), store.Namespace("other"), "ent1", "team-a")
+	if err != nil {
+		t.Fatalf("导入后带归属的画像取不到: %v", err)
+	}
+	if scoped.Headline != "甲组视角的画像" {
+		t.Fatalf("导入后画像内容失真: %+v", scoped)
+	}
+	// ⚠️ 归属不许被拍平成全局：拍平了，一张只该本组看的画像
+	// 就变成了所有人都能读的那张——那是泄漏，且导出方完全看不出来。
+	//
+	// 判据不是「全局页还在不在」（它当然在，那是另一张图），
+	// 而是「全局页里装的还是不是全局那份内容」。
+	global, err := dst.GetEntityPage(context.Background(), store.Namespace("other"), "ent1", "")
+	if err != nil {
+		t.Fatalf("导入后全局画像取不到: %v", err)
+	}
+	if global.Headline != "磁盘偏小的机器" {
+		t.Fatalf("带归属的画像被拍进了全局页: %+v", global)
 	}
 }
 

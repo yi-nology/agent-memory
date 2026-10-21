@@ -123,11 +123,55 @@ func (s *Service) Extract(ctx context.Context, ns store.Namespace, sessionID str
 }
 
 // Promote 判定一条候选。
+//
+// 晋升成功后**顺带把该实体的画像标脏**：事实卡是**真源**，画像是它的摘要，
+// 事实变了摘要就该重算。少了这一步，画像永远停在「晋升之前」的那一版，
+// 而宿主侧的 `memory.page.regen` 只重生成**脏**页面——于是它会安静地什么都不做。
 func (s *Service) Promote(ctx context.Context, ns store.Namespace, c *types.Candidate) (*promotion.Verdict, error) {
 	if ns == "" {
 		ns = s.cfg.Namespace
 	}
-	return s.promo.Promote(ctx, ns, c)
+	v, err := s.promo.Promote(ctx, ns, c)
+	if err != nil {
+		return nil, err
+	}
+	s.markPageDirty(ctx, ns, v)
+	return v, nil
+}
+
+// markPageDirty 晋升成事实后标脏该实体的画像。
+//
+// # 为什么在装配面做，而不是在晋升面
+//
+// 晋升面只声明自己需要的窄接口（阶段只声明自己需要的子接口）。
+// 为了一次标脏把整张页面表塞进晋升面的依赖，是**为了一个派生标记**扩大依赖面。
+// 装配面本来就看得见全量存储，故这一步落在它这里。
+//
+// # 只在「晋升成新事实」时标
+//
+// 并入（merge）只补证据不改断言，画像的正文由断言决定，故并入不必标脏——
+// 标了就是白花一次模型调用去重算一份一模一样的摘要。
+//
+// # 标脏失败**不阻断晋升**
+//
+// 事实卡是真源，画像是派生物。让一次派生标记的失败把一条真源记忆挡在门外，
+// 是本末倒置。但失败必须**留痕**：画像会停在旧版本，
+// 而「页面存在且是旧的」与「页面正常」在看板上长得一模一样——
+// 没有留痕就没人知道该去重算它。
+func (s *Service) markPageDirty(ctx context.Context, ns store.Namespace, v *promotion.Verdict) {
+	if v == nil || v.Decision != promotion.DecisionPromote || v.Atom == nil || v.EntityID == "" {
+		return
+	}
+	now := s.now()
+	if err := s.store.MarkEntityPageDirty(ctx, ns, v.EntityID, v.Atom.Scope, now); err != nil {
+		// 留痕失败本身也只记一次：审计条目写不进去时，存储已经不可靠了，
+		// 这时再抛错会把「标脏失败」变成「晋升失败」，那是更糟的失真。
+		_ = s.store.AppendJournal(ctx, ns, &types.JournalEntry{
+			ID: "journal-page-dirty-" + v.Atom.ID, At: now,
+			Kind: types.JournalPageDirty, Subject: v.Atom.ID, Actor: v.Actor,
+			Summary: "事实已晋升，但实体画像标脏失败：" + err.Error(),
+		})
+	}
 }
 
 // Recall 召回。

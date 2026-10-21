@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 )
 
@@ -27,7 +28,7 @@ import (
 //
 // 版本号那一行可能被手工改过、被老版本覆盖过，或者库是从别处拷来的
 // （拷贝时带了旧版本号）。于是同一段迁移可能被跑第二次——
-// 故每段迁移自己判「要不要做」（见 migrateV2AtomScope）。
+// 故每段迁移自己判「要不要做」（见 migrateV2AtomScope、migrateV3EntityPageScope）。
 // 幂等不是风格偏好：迁移跑第二遍而失败的话，**库就打不开了**，
 // 而那正是「升级一下记忆库」这种日常操作最不该出的事。
 type migration struct {
@@ -43,6 +44,7 @@ type migration struct {
 // 顺序不能反：迁移要按版本号跑，版本号是排序依据。
 var migrations = []migration{
 	{version: 2, apply: migrateV2AtomScope},
+	{version: 3, apply: migrateV3EntityPageScope},
 }
 
 // migrateV2AtomScope 给 atoms、raw_events、candidates 加归属列 scope 与索引。
@@ -90,13 +92,154 @@ func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// rowQuerier 能查库的东西。*sql.DB 与 *sql.Tx 都满足它。
+//
+// 用接口而不是只认 *sql.DB：迁移的形状判定必须在**事务里**做
+// （重建表那段整段都得在事务里），而事务里拿到的是 *sql.Tx。
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// entityPagePK 实体页面表的主键列（按主键序）。
+var entityPagePK = []string{"namespace", "entity_id", "scope"}
+
+// entityPagesNewShape 重建后 entity_pages 的新形状。
+//
+// ⚠️ 这一段 DDL 与 schema.go 里的那份**必须同形**：迁移重建出来的表
+// 就是此后这个库实际用的表，两者不一致的话迁移后的库与新建的库行为不同
+// （而症状是「有的库能取到、有的库取不到」这种没法一眼归因的差异）。
+// 用例 TestMigrationEntityPageScope 拿形状指纹把两者钉在一起。
+const entityPagesNewShape = `
+CREATE TABLE entity_pages_new (
+  namespace     TEXT NOT NULL,
+  entity_id     TEXT NOT NULL,
+  scope         TEXT NOT NULL DEFAULT '',
+  headline      TEXT NOT NULL DEFAULT '',
+  body          TEXT NOT NULL DEFAULT '',
+  atom_ids      TEXT NOT NULL DEFAULT '[]',
+  dirty         INTEGER NOT NULL DEFAULT 0,
+  updated_at    INTEGER NOT NULL,
+  last_regen_at INTEGER,
+  regen_failure TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (namespace, entity_id, scope)
+)`
+
+// migrateV3EntityPageScope 给实体页面表加归属列，并把主键扩成三列。
+//
+// # 为什么归属是键的一部分而不是过滤面
+//
+// 页面是事实卡的摘要，而事实卡已经按归属隔离了。摘要若不分视角，
+// 等于把别家的事实揉进一张全局画像里——那是**内容泄漏**，不是「少取」：
+// 画像是人读的一整段话，读者分不清哪句属于自己。
+// 所以归属进主键：同一实体在不同归属下**各有一页**，互相取不到。
+//
+// # 两步，为什么不能一步
+//
+// SQLite 不能 ALTER 主键，只能重建表：
+//  1. 先加 scope 列（NOT NULL 且默认空串：老库里已有的行也得有值，
+//     而 NOT NULL 没有默认值的加列在有数据的表上会直接失败）；
+//  2. 再重建表，把主键换成 (namespace, entity_id, scope)，老行搬过去
+//     （scope 取刚加的那列，老行自然是空串，即全局视角）。
+//
+// # 为什么整段在一个事务里
+//
+// 重建是「建新表 → 搬数据 → 删旧表 → 改名」四步。中间失败会留下半张表
+// （旧表没了、新表还没改名），而那正是「库打不开了」——
+// 迁移失败的后果不该是库报废，只能是「升级没成功，库还是原来那个形状」。
+// 故这两步放在同一个事务里：任何一步出错都整体回滚。
+//
+// # 幂等
+//
+// 版本号那一行可能被手工改过、被老版本覆盖过，或者库是从别处拷来的，
+// 于是同一段迁移可能被跑第二遍——而迁移跑第二遍而失败的话**库就打不开了**。
+// 故两处都要自己判「要不要做」：
+//   - 加列前查列在不在（hasColumn）；
+//   - 重建前读主键列，已是新形状就跳过（primaryKeyColumns）。
+func migrateV3EntityPageScope(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开迁移事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 步骤一：加归属列。
+	has, err := hasColumn(ctx, tx, "entity_pages", "scope")
+	if err != nil {
+		return err
+	}
+	if !has {
+		// DEFAULT '' 是必须的：老库里已有的行也得有值，
+		// 而 NOT NULL 没有默认值的加列在有数据的表上会直接失败。
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE entity_pages ADD COLUMN scope TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("加 entity_pages.scope 列失败: %w", err)
+		}
+	}
+
+	// 步骤二：主键扩列（重建表）。
+	pk, err := primaryKeyColumns(ctx, tx, "entity_pages")
+	if err != nil {
+		return err
+	}
+	if len(pk) == 0 {
+		// 表不存在（建表脚本保证它在，但别赌）：没什么可迁的。
+		return tx.Commit()
+	}
+	if !slices.Equal(pk, entityPagePK) {
+		for _, stmt := range []string{
+			entityPagesNewShape,
+			`INSERT INTO entity_pages_new
+				(namespace, entity_id, scope, headline, body, atom_ids, dirty, updated_at, last_regen_at, regen_failure)
+			 SELECT namespace, entity_id, scope, headline, body, atom_ids, dirty, updated_at, last_regen_at, regen_failure
+			 FROM entity_pages`,
+			`DROP TABLE entity_pages`,
+			`ALTER TABLE entity_pages_new RENAME TO entity_pages`,
+			// 删表会把挂在它身上的索引一起带走，故改名后要把它建回来。
+			// 这一条索引只用到 (namespace, dirty, updated_at)，不依赖新列，
+			// 所以它能一直留在建表脚本里（新库老库都建得出来）。
+			`CREATE INDEX IF NOT EXISTS entity_pages_dirty ON entity_pages (namespace, dirty, updated_at)`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("重建 entity_pages 失败（%s）: %w", stmt, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交迁移事务失败: %w", err)
+	}
+	return nil
+}
+
+// primaryKeyColumns 表的主键列，按主键序排。
+//
+// 用 pragma_table_info 的 pk 列：pk>0 的行按 pk 值排就是主键的列序。
+// 「主键已是哪几列」是「要不要重建表」的判据，故这个读数必须准。
+func primaryKeyColumns(ctx context.Context, q rowQuerier, table string) ([]string, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk`, table)
+	if err != nil {
+		return nil, fmt.Errorf("查 %s 的主键失败: %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("读 %s 的主键列失败: %w", table, err)
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
 // hasColumn 表里有没有这一列。
 //
 // 用 pragma_table_info（表值函数）而不是 PRAGMA table_info：
 // 后者要按行读，前者能直接当子查询用。
-func hasColumn(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+func hasColumn(ctx context.Context, q rowQuerier, table, column string) (bool, error) {
 	var n int
-	err := db.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("查 %s 的列失败: %w", table, err)

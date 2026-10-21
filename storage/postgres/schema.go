@@ -9,7 +9,7 @@ import (
 // schemaVersion 本后端的库形状版本号。
 //
 // 记在 meta 表的 schema_version 键里，迁移按版本号线性追加（见 migrate.go）。
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schema 是本后端的建表脚本。
 //
@@ -140,9 +140,22 @@ CREATE TABLE IF NOT EXISTS thread_active_entities (
 );
 CREATE INDEX IF NOT EXISTS active_seen ON thread_active_entities (namespace, thread_id, last_seen DESC);
 
+-- 实体页面：某个实体在某**归属视角**下的长文画像。
+--
+-- scope 是**逻辑主键的一部分**，不是过滤面：
+-- 同一实体在不同归属下各有一页，因为「这个对象在我的视角下是什么样」
+-- 与「在别人视角下是什么样」是两件事——事实卡已经按归属隔离了，
+-- 而页面是事实的摘要，摘要若不分视角，等于把别家的事实揉进一张
+-- 人人可见的画像里（那是内容泄漏，不是少取）。
+-- scope 为空 = 全局视角，那一页只汇总全局事实。
+--
+-- ⚠️ 这里**不建**依赖 scope 列的索引：建表脚本每次打开都跑，
+-- 而老库的表还没有这一列，脚本里那句建索引会当场失败，整个库都打不开。
+-- 索引归迁移管（见 migrate.go 的 v3）。
 CREATE TABLE IF NOT EXISTS entity_pages (
   namespace      TEXT NOT NULL,
   entity_id      TEXT NOT NULL,
+  scope          TEXT NOT NULL DEFAULT '',
   headline       TEXT NOT NULL DEFAULT '',
   body           TEXT NOT NULL DEFAULT '',
   atom_ids       TEXT NOT NULL DEFAULT '[]',
@@ -150,7 +163,7 @@ CREATE TABLE IF NOT EXISTS entity_pages (
   updated_at     TIMESTAMPTZ,
   last_regen_at  TIMESTAMPTZ,
   regen_failure  TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (namespace, entity_id)
+  PRIMARY KEY (namespace, entity_id, scope)
 );
 CREATE INDEX IF NOT EXISTS pages_dirty ON entity_pages (namespace, dirty);
 

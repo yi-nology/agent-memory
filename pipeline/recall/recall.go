@@ -25,6 +25,8 @@ package recall
 
 import (
 	"context"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -324,7 +326,7 @@ type Reader interface {
 	// 只在 ListAtoms 上过滤是不够的，检索路会绕过滤面直接取 TopK，
 	// 被别家的卡占掉配额（症状是「召回变少了」，看着像排序问题）。
 	SearchAtoms(ctx context.Context, ns store.Namespace, query string, f store.AtomFilter) ([]*types.AtomCard, error)
-	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string) (*types.EntityPage, error)
+	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope) (*types.EntityPage, error)
 	UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error
 	EvictActiveEntities(ctx context.Context, ns store.Namespace, threadID string, keep int) ([]types.ActiveEntity, error)
 }
@@ -443,6 +445,10 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 
 	if p.cache != nil {
 		if hit, ok := p.cache.get(p.cacheKey(req)); ok {
+			// 缓存命中也要推活跃实体栈：栈是会话状态，不是召回结果的一部分。
+			// 漏掉这一步的症状是「开了缓存之后代词消解变差」，
+			// 而原因藏在缓存那一行里，从结果上看不出来。
+			p.pushEntityIDs(ctx, req, hit.Entities)
 			return hit, nil
 		}
 	}
@@ -490,7 +496,31 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 
 // cacheKey 缓存键。
 //
-// **含** SessionID 与 ThreadID。这两样参与防回声与活跃实体栈，结果本就随会话变化：
+// # 键必须覆盖**每一个会改变结果的请求维度**
+//
+// 这是本仓的一条通用纪律：缓存键漏一个维度，那一维上「不同的两次请求」
+// 就会命中同一条缓存——而症状是**结果看起来完全正常**，只是内容串了。
+//
+// 本仓的请求维度共六个，少一个就串一路：
+//
+//	Namespace 记忆库
+//	SessionID 防回声：本会话的原始事件不进 prompt
+//	ThreadID  活跃实体栈
+//	Query     检索词
+//	Scope     读者归属 ← 漏了它就是**跨租户内容泄漏**
+//	Entities  宿主解析出的实体（补画像源；显式限定时还划定事实边界）
+//	Limit     条数上限
+//
+// ⚠️ 初版只键了前四个，漏了 Scope / Entities / Limit：
+// 同一会话同一线程问同一句话、但**归属不同**的两次请求会命中同一条缓存，
+// 于是第二次请求拿到了第一次（别的归属）的召回结果——
+// 那不是「缓存不准确」，是**把别家的记忆塞进了当前 prompt**。
+// 缓存默认关闭（CacheTTL=0）把风险压住了，但那是**配置在替代码兜底**，
+// 一旦有人开了缓存，泄漏立刻发生。故键先修对，再谈开不开缓存。
+//
+// # 为什么要含 SessionID 与 ThreadID
+//
+// 这两样参与防回声与活跃实体栈，结果本就随会话变化：
 // 不把它们算进键，第二个会话问同一个问题就会拿到第一个会话的召回结果——
 // 那等于把上一次会话提到过的内容原样搬进这一次，连同它已经被本轮说过的那部分。
 //
@@ -503,5 +533,25 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 // 危险，因为它读起来像是想清楚了。用例 TestCacheKeyIgnoresSession 钉住了行为，
 // 但那条用例的断言文案当时也跟着写反了，一并改了。
 func (p *Pipeline) cacheKey(req Request) string {
-	return string(req.Namespace) + "\x00" + req.SessionID + "\x00" + req.ThreadID + "\x00" + req.Query
+	var b strings.Builder
+	sep := func() { b.WriteByte(0) }
+	b.WriteString(string(req.Namespace))
+	sep()
+	b.WriteString(req.SessionID)
+	sep()
+	b.WriteString(req.ThreadID)
+	sep()
+	b.WriteString(req.Query)
+	sep()
+	b.WriteString(string(req.Scope))
+	sep()
+	// 实体集合**排序后**再进键：同一组实体换个书写顺序是同一次请求，
+	// 不排序的话键会随调用点的遍历顺序变，命中率凭空掉一截
+	//（而那会让人误以为「缓存好像不太行」，去查一个本来没问题的方向）。
+	ents := append([]string(nil), req.Entities...)
+	sort.Strings(ents)
+	b.WriteString(strings.Join(ents, "\x01"))
+	sep()
+	b.WriteString(strconv.Itoa(req.Limit))
+	return b.String()
 }

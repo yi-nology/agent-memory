@@ -23,11 +23,19 @@ func base() time.Time { return time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC) }
 // （store/store.go 里那条纪律的兑现）。这条纪律省下的字数量化在此。
 
 type fakeReader struct {
-	atoms  []*types.AtomCard
-	raws   []*types.RawEvent
+	atoms []*types.AtomCard
+	raws  []*types.RawEvent
+	// pages 键是 pageKey(scope, entityID)：页面按归属视角分页，
+	// 假存储必须**真的按 (归属, 实体) 取键**，
+	// 否则「取到别家画像」那条用例就验不到东西。
 	pages  map[string]*types.EntityPage
 	stack  []*types.ActiveEntity
 	evictK int
+}
+
+// pageKey 页面夹具的键。
+func pageKey(scope types.Scope, entityID string) string {
+	return string(scope) + "\x00" + entityID
 }
 
 func (f *fakeReader) ListAtoms(_ context.Context, _ store.Namespace, flt store.AtomFilter) ([]*types.AtomCard, error) {
@@ -107,8 +115,13 @@ func (f *fakeReader) SearchAtoms(_ context.Context, _ store.Namespace, query str
 	return out, nil
 }
 
-func (f *fakeReader) GetEntityPage(_ context.Context, _ store.Namespace, id string) (*types.EntityPage, error) {
-	if p, ok := f.pages[id]; ok {
+// GetEntityPage 按 (归属, 实体) 精确取键。
+//
+// 精确取键是刻意的：别的视角的页面**取不到**，
+// 否则「不该看到别家画像」那条用例会被假存储的宽松实现蒙对。
+func (f *fakeReader) GetEntityPage(_ context.Context, _ store.Namespace, id string,
+	scope types.Scope) (*types.EntityPage, error) {
+	if p, ok := f.pages[pageKey(scope, id)]; ok {
 		return p, nil
 	}
 	return nil, store.ErrNotFound
@@ -323,7 +336,7 @@ func TestDropsAreAttributableByReason(t *testing.T) {
 			"第 "+string(rune('A'+i/26))+"-"+string(rune('a'+i%26))+" 条很长的事实正文用来把预算吃满", types.ImportanceHigh))
 	}
 	f.pages = map[string]*types.EntityPage{
-		"e0": {EntityID: "e0", Headline: "这个实体的画像", UpdatedAt: base()},
+		pageKey("", "e0"): {EntityID: "e0", Scope: "", Headline: "这个实体的画像", UpdatedAt: base()},
 	}
 
 	cfg := recall.DefaultConfig()
@@ -370,7 +383,7 @@ func TestBucketsAreIndependent(t *testing.T) {
 			"第 "+string(rune('A'+i/26))+"-"+string(rune('a'+i%26))+" 条很长的事实正文用来把预算吃满", types.ImportanceHigh))
 	}
 	f.pages = map[string]*types.EntityPage{
-		"e1": {EntityID: "e1", Headline: "这个实体的画像", UpdatedAt: base()},
+		pageKey("", "e1"): {EntityID: "e1", Scope: "", Headline: "这个实体的画像", UpdatedAt: base()},
 	}
 
 	cfg := recall.DefaultConfig()
@@ -564,6 +577,137 @@ func TestCacheReturnsCopy(t *testing.T) {
 	if second.Snippets[0].Body == "被调用方改坏了" {
 		t.Fatal("缓存交出的是同一份对象：调用方一改，缓存即被污染")
 	}
+}
+
+// 缓存键必须含**归属**：同一会话、同一线程、同一查询词，
+// 但归属不同的两次请求，不许命中同一条缓存。
+//
+// 这条不是「缓存不准」的问题，是**跨租户内容泄漏**：
+// 乙组的请求拿到了甲组的召回结果，而那结果里全是甲组的事实。
+//
+// 默认 CacheTTL=0 把风险压住了，但那是配置在替代码兜底；
+// 一旦有人开缓存，泄漏立刻发生。故键必须先修对。
+func TestCacheKeyIsolatesScope(t *testing.T) {
+	f := &fakeReader{atoms: []*types.AtomCard{
+		atom("g1", "e1", "全局事实", types.ImportanceHigh),
+		scopedAtom("a1", "team-a", "甲组事实"),
+	}}
+	cfg := recall.DefaultConfig()
+	cfg.CacheTTL = time.Minute
+	p := newPipe(t, f, cfg)
+
+	base := recall.Request{Namespace: ns, Query: "事实", SessionID: "s1", ThreadID: "th1"}
+
+	first, err := p.Recall(context.Background(), withScope(base, "team-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasRef(first, "a1") {
+		t.Fatalf("甲组应看见本组事实，实得 %+v", first.Snippets)
+	}
+
+	// 乙组视角：其余请求维度全同，只有归属不同。
+	other, err := p.Recall(context.Background(), withScope(base, "team-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.FromCache {
+		t.Fatal("缓存键必须含归属：换个归属就命中上一个归属的结果")
+	}
+	if hasRef(other, "a1") {
+		t.Fatalf("乙组看见了甲组的事实——跨租户泄漏: %+v", other.Snippets)
+	}
+	if !hasRef(other, "g1") {
+		t.Fatalf("乙组应看见全局事实: %+v", other.Snippets)
+	}
+}
+
+// 缓存键必须含**实体集合**：实体变了，画像源就变了，结果也就变了。
+func TestCacheKeyIsolatesEntities(t *testing.T) {
+	f := &fakeReader{
+		atoms: []*types.AtomCard{atom("a1", "e1", "事实一", types.ImportanceHigh)},
+		pages: map[string]*types.EntityPage{
+			pageKey("", "e1"): {EntityID: "e1", Headline: "一号画像", UpdatedAt: base()},
+			pageKey("", "e2"): {EntityID: "e2", Headline: "二号画像", UpdatedAt: base()},
+		},
+	}
+	cfg := recall.DefaultConfig()
+	cfg.CacheTTL = time.Minute
+	cfg.Sources = []recall.Source{recall.SourceAtom, recall.SourcePageHeadline}
+	p := newPipe(t, f, cfg)
+
+	base := recall.Request{Namespace: ns, Query: "事实", SessionID: "s1", ThreadID: "th1"}
+	if _, err := p.Recall(context.Background(), withEntities(base, "e1")); err != nil {
+		t.Fatal(err)
+	}
+	other, err := p.Recall(context.Background(), withEntities(base, "e2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.FromCache {
+		t.Fatal("缓存键必须含实体集合：换个实体就命中上一个实体的结果")
+	}
+	if !strings.Contains(other.Render(), "二号画像") {
+		t.Fatalf("应取到二号实体的画像，实得 %s", other.Render())
+	}
+}
+
+// 缓存键必须含**条数上限**：上限变了结果条数就变了。
+func TestCacheKeyIsolatesLimit(t *testing.T) {
+	f := &fakeReader{atoms: []*types.AtomCard{
+		atom("a1", "e1", "事实一", types.ImportanceHigh),
+		atom("a2", "e2", "事实二", types.ImportanceHigh),
+	}}
+	cfg := recall.DefaultConfig()
+	cfg.CacheTTL = time.Minute
+	p := newPipe(t, f, cfg)
+
+	base := recall.Request{Namespace: ns, Query: "事实", SessionID: "s1", ThreadID: "th1"}
+	one, err := p.Recall(context.Background(), withLimit(base, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(one.Snippets) != 1 {
+		t.Fatalf("上限 1 应只回一条，实得 %d", len(one.Snippets))
+	}
+	two, err := p.Recall(context.Background(), withLimit(base, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if two.FromCache {
+		t.Fatal("缓存键必须含条数上限：换个上限就命中上一个上限的结果")
+	}
+	if len(two.Snippets) != 2 {
+		t.Fatalf("上限 2 应回两条，实得 %d", len(two.Snippets))
+	}
+}
+
+// withScope 复制请求并带上归属。
+func withScope(r recall.Request, scope types.Scope) recall.Request {
+	r.Scope = scope
+	return r
+}
+
+// withEntities 复制请求并带上实体集合。
+func withEntities(r recall.Request, ids ...string) recall.Request {
+	r.Entities = ids
+	return r
+}
+
+// withLimit 复制请求并带上条数上限。
+func withLimit(r recall.Request, limit int) recall.Request {
+	r.Limit = limit
+	return r
+}
+
+// hasRef 结果里有没有这一条。
+func hasRef(r *recall.Result, refID string) bool {
+	for _, s := range r.Snippets {
+		if s.RefID == refID {
+			return true
+		}
+	}
+	return false
 }
 
 // 缓存命中必须**带着那两张通用表**回来，且是**副本**。

@@ -363,17 +363,23 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			Namespace string `json:"namespace"`
 			// EntityID 非空时只重生成这一个实体；为空则重生成全部到期脏页面。
 			EntityID string `json:"entity_id"`
+			// Scope 归属视角（页面按视角分页，故这一栏决定重生成哪一页）。
+			//
+			// 空 = 全局视角。多租户的宿主必须显式带上：
+			// 漏传会去动全局页，而全局页是所有人都能读的那一张。
+			Scope string `json:"scope"`
 		}
 		if err := decodeParams(params, &p); err != nil {
 			return nil, err
 		}
+		scope := types.Scope(p.Scope)
 		if p.EntityID != "" {
-			if err := s.mgmt.Page.RegenerateOne(ctx, store.Namespace(p.Namespace), p.EntityID); err != nil {
+			if err := s.mgmt.Page.RegenerateOne(ctx, store.Namespace(p.Namespace), p.EntityID, scope); err != nil {
 				return nil, err
 			}
 			return map[string]any{"regenerated": 1, "failed": 0, "skipped": 0}, nil
 		}
-		res, err := s.mgmt.Page.RegenerateDirty(ctx, store.Namespace(p.Namespace))
+		res, err := s.mgmt.Page.RegenerateDirty(ctx, store.Namespace(p.Namespace), scope)
 		if err != nil {
 			return nil, err
 		}

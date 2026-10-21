@@ -12,10 +12,11 @@ import (
 	"github.com/yi-nology/agent-memory/types"
 )
 
-// 本文件钉住召回面的两条**范围与形态**契约：
+// 本文件钉住召回面的三条**范围与形态**契约：
 //
 //  1. 事实卡能不能被限定在宿主给的实体集合内；
-//  2. 宿主没有捕获面时，raw 源怎么处置。
+//  2. 宿主没有捕获面时，raw 源怎么处置；
+//  3. 画像能不能被限定在读者自己的归属视角内。
 //
 // 第 1 条的坑在于：`Request.Entities` 同时承载两种语义相反的用法
 // （「本轮提到的实体」用来补画像页 vs「会话锚点实体」用来划事实范围），
@@ -23,6 +24,71 @@ import (
 //
 // 第 2 条的坑在于：让没有捕获面的宿主实现 ListRaw，只能给一个
 // 「永远返回空集」的桩——那是契约洗白。
+//
+// 第 3 条的坑在于：画像是**事实的摘要**，摘要若不分视角，
+// 别家的事实就揉进了这一份，而画像是人读的一整段话，
+// 读者分不清哪句属于自己。
+
+// 画像按读者归属取：读者只看得见**自己那一视角**的画像。
+//
+// 别家的画像进了 prompt 就是内容泄漏——
+// 而且这类泄漏在结果里完全看不出来：画像就是一段正常的文字。
+func TestPageHeadlineIsScopedToReader(t *testing.T) {
+	const scopeA = types.Scope("team-a")
+	const scopeB = types.Scope("team-b")
+	f := &fakeReader{
+		atoms: []*types.AtomCard{atom("a1", "e1", "某条事实", types.ImportanceHigh)},
+		pages: map[string]*types.EntityPage{
+			pageKey(scopeA, "e1"): {EntityID: "e1", Scope: scopeA, Headline: "甲组的画像", UpdatedAt: base()},
+			pageKey(scopeB, "e1"): {EntityID: "e1", Scope: scopeB, Headline: "乙组的画像", UpdatedAt: base()},
+		},
+	}
+	cfg := recall.DefaultConfig()
+	cfg.Sources = []recall.Source{recall.SourceAtom, recall.SourcePageHeadline}
+	p := newPipe(t, f, cfg)
+
+	res, err := p.Recall(context.Background(), recall.Request{
+		Namespace: ns, Query: "事实", Entities: []string{"e1"}, Scope: scopeA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := res.Render()
+	if !strings.Contains(out, "甲组的画像") {
+		t.Fatalf("应取到本视角的画像，实得 %s", out)
+	}
+	if strings.Contains(out, "乙组的画像") {
+		t.Fatalf("别家视角的画像进了 prompt——内容泄漏: %s", out)
+	}
+}
+
+// 自己那一视角的画像还没生成时，退到**全局页**。
+//
+// 退到全局页是安全的方向：全局页只汇总全局事实，
+// 所以退过去是「少一点内容」，绝不是「别人的内容」。
+// 反过来（把别家那一页退给读者）就是泄漏。
+func TestPageHeadlineFallsBackToGlobalPage(t *testing.T) {
+	const scopeA = types.Scope("team-a")
+	f := &fakeReader{
+		atoms: []*types.AtomCard{atom("a1", "e1", "某条事实", types.ImportanceHigh)},
+		pages: map[string]*types.EntityPage{
+			pageKey("", "e1"): {EntityID: "e1", Scope: "", Headline: "全局的画像", UpdatedAt: base()},
+		},
+	}
+	cfg := recall.DefaultConfig()
+	cfg.Sources = []recall.Source{recall.SourceAtom, recall.SourcePageHeadline}
+	p := newPipe(t, f, cfg)
+
+	res, err := p.Recall(context.Background(), recall.Request{
+		Namespace: ns, Query: "事实", Entities: []string{"e1"}, Scope: scopeA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Render(), "全局的画像") {
+		t.Fatalf("本视角没有页面时应退到全局页，实得 %s", res.Render())
+	}
+}
 
 // 显式限定时，事实卡只取宿主给的那些实体。
 func TestRestrictAtomsToEntitiesScopesFacts(t *testing.T) {
@@ -114,8 +180,9 @@ func (n noRawReader) SearchAtoms(ctx context.Context, ns store.Namespace, q stri
 	return n.f.SearchAtoms(ctx, ns, q, flt)
 }
 
-func (n noRawReader) GetEntityPage(ctx context.Context, ns store.Namespace, id string) (*types.EntityPage, error) {
-	return n.f.GetEntityPage(ctx, ns, id)
+func (n noRawReader) GetEntityPage(ctx context.Context, ns store.Namespace, id string,
+	scope types.Scope) (*types.EntityPage, error) {
+	return n.f.GetEntityPage(ctx, ns, id, scope)
 }
 
 func (n noRawReader) UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error {

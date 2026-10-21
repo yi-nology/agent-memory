@@ -122,7 +122,7 @@ func TestPageRegenThroughBridge(t *testing.T) {
 	}
 	// 标脏时刻要**早于冷却期**：页面刚被标脏时不算「到期」——
 	// 冷却的用处是「宿主连续晋升十条事实时只生成一次页面」。
-	if err := st.MarkEntityPageDirty(ctx, store.Namespace("b"), "e1",
+	if err := st.MarkEntityPageDirty(ctx, store.Namespace("b"), "e1", "",
 		now.Add(-2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestPageRegenThroughBridge(t *testing.T) {
 	if got, _ := out["regenerated"].(float64); got != 1 {
 		t.Fatalf("应重生成 1 个页面，实得 %+v", out)
 	}
-	pg, err := st.GetEntityPage(ctx, store.Namespace("b"), "e1")
+	pg, err := st.GetEntityPage(ctx, store.Namespace("b"), "e1", "")
 	if err != nil {
 		t.Fatal(err)
 	}

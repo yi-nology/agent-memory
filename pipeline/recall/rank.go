@@ -133,13 +133,33 @@ func diversify(cands []*candidate, perEntityMax int) ([]*candidate, int) {
 	return kept, dropped
 }
 
+// sortByScore 按分数排序：**分数大的在前**。
+//
+// # 方向必须与 ports.Ranker 的契约一致
+//
+// 契约写得很死：「分数越大越靠前」（见 ports/rank.go）。
+// 而本函数初版写的是升序（`score < score`）——方向**反了**。
+//
+// # 为什么这个方向的错误特别贵
+//
+// 它不是「排序不好看」：排序之后紧接着是 diversify 与 allocate，
+// 而 allocate 是**按顺序逐条接收、装不下就丢弃**的。
+// 于是升序排出来的第一名恰恰是**最不相关**的那条：
+// 预算一紧，先被丢掉的是最该保留的事实，而留在 prompt 里的是最不相干的。
+//
+// 更糟的是它**看不出来**：内容一条不少，只是次序变了、丢的换了人。
+// 事实卡的顺序、条数看着都正常，只有「召回得准不准」变了——
+// 而那正是最容易被归因为「模型不行」的一类症状。
+//
+// 升序在别处是安全的（分数越低越靠前也行，只要契约写的是那样），
+// 这里不行：本仓的契约是「分数越大越靠前」，实现必须跟着契约走。
 func sortByScore(cands []*candidate) {
 	// 用标准库的稳定排序。手写插入排序在这里曾是「不引第三方包到核心」的
 	// 产物——而 sort 是**标准库**，那条理由本来就不成立。
 	//
 	// 稳定性必须保留：同分的片段之间的相对顺序是上游定的（存储层按重要度
 	// 排过），换成不稳定排序会在同分时悄悄换序，而那在结果里看不出来。
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score < cands[j].score })
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
 }
 
 var _ = types.ImportanceMed

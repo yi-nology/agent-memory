@@ -20,7 +20,7 @@
 package sqlite
 
 // schemaVersion 当前 schema 版本。新增迁移时 +1，并在 migrations 里追加一段。
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schema 建表语句。
 //
@@ -157,9 +157,19 @@ CREATE TABLE IF NOT EXISTS aliases (
 CREATE INDEX IF NOT EXISTS aliases_entity ON aliases (namespace, entity_id);
 
 -- 实体页面（派生物）：dirty 标脏、regen 落生成、failure 记失败原因。
+--
+-- scope 是**页面视角**，且是逻辑主键的一部分（不是过滤面）：
+-- 同一个实体在不同归属下各有一页，因为页面是事实的摘要——
+-- 摘要若不分视角，等于把别家的事实揉进一张全局画像里（内容泄漏），
+-- 而画像是人读的一整段话，读者分不清哪句属于自己。
+--
+-- ⚠️ 主键里多了一列，于是这一列的形状变更归迁移管（见 migrate.go）：
+-- 本文件的 DDL 每次打开都跑，而旧库的表还是两列主键——
+-- 主键改不了，只能重建表，而重建必须成段落在事务里。
 CREATE TABLE IF NOT EXISTS entity_pages (
   namespace    TEXT NOT NULL,
   entity_id    TEXT NOT NULL,
+  scope        TEXT NOT NULL DEFAULT '',
   headline     TEXT NOT NULL DEFAULT '',
   body         TEXT NOT NULL DEFAULT '',
   atom_ids     TEXT NOT NULL DEFAULT '[]',
@@ -167,7 +177,7 @@ CREATE TABLE IF NOT EXISTS entity_pages (
   updated_at   INTEGER NOT NULL,
   last_regen_at INTEGER,
   regen_failure TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (namespace, entity_id)
+  PRIMARY KEY (namespace, entity_id, scope)
 );
 CREATE INDEX IF NOT EXISTS entity_pages_dirty ON entity_pages (namespace, dirty, updated_at);
 

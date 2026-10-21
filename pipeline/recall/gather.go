@@ -106,14 +106,11 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 
 	if hasSource(p.cfg.Sources, SourcePageHeadline) && len(req.Entities) > 0 {
 		for _, id := range req.Entities {
-			page, err := p.store.GetEntityPage(ctx, req.Namespace, id)
+			page, err := p.pageOf(ctx, req, id)
 			if err != nil {
-				if errors.Is(err, store.ErrNotFound) {
-					continue // 实体还没有页面是常态（晋升先于首次生成），不是错
-				}
 				return nil, err
 			}
-			if page.Headline == "" {
+			if page == nil || page.Headline == "" {
 				continue
 			}
 			c, ok, err := p.snippet(ctx, SourcePageHeadline, id, id, "画像", page.Headline,
@@ -131,6 +128,53 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int) ([]*candi
 	}
 
 	return out, nil
+}
+
+// pageOf 取某个实体的画像（按读者的归属视角）。
+//
+// # 取本页，找不到退到全局页
+//
+// 读者有自己的归属时，先取他那一页；那一页还没生成过（晋升先于首次生成是常态），
+// 就退到全局页。
+//
+// 退到全局页是**安全**的方向：全局页只汇总全局事实，
+// 所以退过去是「少一点内容」，绝不是「别人的内容」。
+// 反过来（把别家那一页退给读者）就是内容泄漏。
+//
+// # 读者不隔离时（归属为空）只能拿到全局页
+//
+// 归属为空在本仓的过滤面里是「不隔离」（见 store.AtomFilter.Scope），
+// 而页面按视角分页：全局页只汇总全局事实。
+// 于是「不隔离的读者」拿到的是**全局事实的摘要**，不是全部事实的摘要。
+//
+// 这是刻意的取舍：让全局页收进所有事实，它就会成为一张所有人都能看的、
+// 揉进了别家事实的摘要——那是泄漏。少一段摘要只是少一点上下文，
+// 泄漏是内容层面的事故。两者不可比，故取保守的一侧。
+func (p *Pipeline) pageOf(ctx context.Context, req Request, entityID string) (*types.EntityPage, error) {
+	page, err := p.store.GetEntityPage(ctx, req.Namespace, entityID, req.Scope)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	if err == nil {
+		// 归属复查（纵深防御）：存储层是按 (实体, 视角) 精确取键的，
+		// 这里再确认一次可见性——画像是整段人读的文字，
+		// 混进别人的一段话比混进一条事实更难被读者分辨。
+		if !page.Scope.VisibleTo(req.Scope) {
+			return nil, nil
+		}
+		return page, nil
+	}
+	if req.Scope == "" {
+		return nil, nil // 本视角的页面不存在，且没有更上一级可退
+	}
+	global, err := p.store.GetEntityPage(ctx, req.Namespace, entityID, "")
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil // 实体还没有页面是常态（晋升先于首次生成），不是错
+		}
+		return nil, err
+	}
+	return global, nil
 }
 
 // collectAtoms 取事实卡候选：**查询命中 ∪ 高价值兜底**。
@@ -285,6 +329,24 @@ func (p *Pipeline) snippet(ctx context.Context, src Source, refID, entityID, rol
 // 推进发生在**重排之后、取用之前**——用的是排过序的前几条，
 // 而不是全量命中。否则一个实体只要沾边就会进栈，栈里全是弱相关对象。
 func (p *Pipeline) pushEntities(ctx context.Context, req Request, cands []*candidate) []string {
+	ids := make([]string, 0, len(cands)+len(req.Entities))
+	for _, c := range cands[:minInt(len(cands), 5)] {
+		if c.bucket == bucketAtom {
+			ids = append(ids, c.EntityID)
+		}
+	}
+	ids = append(ids, req.Entities...)
+	return p.pushEntityIDs(ctx, req, ids)
+}
+
+// pushEntityIDs 把一批实体推进活跃实体栈。
+//
+// 单独成方法，是为了让**缓存命中**那一条路也能推进栈：
+// 栈是**会话状态**，不是召回结果的一部分——
+// 命中缓存省掉的是「取数 + 排序」，没省掉「这一轮谈到了谁」。
+// 漏掉这一步的症状是：开了缓存之后代词消解变差（「那个」指不到东西），
+// 而原因藏在缓存那一行里，从召回结果上看不出来。
+func (p *Pipeline) pushEntityIDs(ctx context.Context, req Request, ids []string) []string {
 	if req.ThreadID == "" {
 		return nil
 	}
@@ -305,12 +367,7 @@ func (p *Pipeline) pushEntities(ctx context.Context, req Request, cands []*candi
 
 	// 名字留空：召回片段本身不携带实体名（那是另一张表的事），硬塞 RefID
 	// 会把「事实卡 ID」当成实体名存进栈里。存储层的空名按「沿用旧值」处理。
-	for _, c := range cands[:minInt(len(cands), 5)] {
-		if c.bucket == bucketAtom {
-			push(c.EntityID, "")
-		}
-	}
-	for _, id := range req.Entities {
+	for _, id := range ids {
 		push(id, "")
 	}
 

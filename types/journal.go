@@ -54,4 +54,11 @@ const (
 	JournalExport JournalKind = "export"
 	// JournalImport 记忆导入。
 	JournalImport JournalKind = "import"
+	// JournalPageDirty 实体画像标脏失败。
+	//
+	// 单独一类而不是并进 promote：那条 promote 记的是「事实已晋升」，
+	// 而标脏失败是**另一件事**（派生标记没落上，画像会停在旧版本）。
+	// 合成一条的话，看板上「晋升成功」与「画像已重算」就分不开了——
+	// 而后者没发生，症状只是画像内容过时，看着与正常一模一样。
+	JournalPageDirty JournalKind = "page-dirty"
 )

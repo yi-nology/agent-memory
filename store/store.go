@@ -215,18 +215,49 @@ type EntityStore interface {
 }
 
 // PageStore 实体页面存取。
+//
+// # 页面按「归属视角」分页
+//
+// 页面的逻辑主键是 (namespace, entity_id, scope)：同一实体在不同归属下各有一页。
+// 事实卡已经按归属隔离，页面是事实的摘要——摘要若不分视角，
+// 等于把别家的事实揉进一张所有人都能看的画像，而读者分不清哪句属于自己。
+//
+// 下面各方法里的 scope 是**键的一部分**（页面视角），不是过滤面：
+// 空 = 全局视角（这一页只汇总全局事实）。
+// 它与 AtomFilter.Scope 的空值语义（空=不隔离）刻意不同，理由见 types.EntityPage.Scope。
 type PageStore interface {
+	// UpsertEntityPage 写入页面。归属取 p.Scope（页面自带的视角）。
 	UpsertEntityPage(ctx context.Context, ns Namespace, p *types.EntityPage) error
-	GetEntityPage(ctx context.Context, ns Namespace, entityID string) (*types.EntityPage, error)
-	ListDirtyEntityPages(ctx context.Context, ns Namespace, limit int) ([]*types.EntityPage, error)
+	// GetEntityPage 取 (namespace, entity_id, scope) 这一页。
+	//
+	// **精确取键**：别的视角的页面取不到（取不到就是取不到，不回退）。
+	// 回退策略归召回层管——它知道读者是谁。
+	GetEntityPage(ctx context.Context, ns Namespace, entityID string, scope types.Scope) (*types.EntityPage, error)
+	// ListDirtyEntityPages 列出该视角下的脏页面。
+	ListDirtyEntityPages(ctx context.Context, ns Namespace, scope types.Scope, limit int) ([]*types.EntityPage, error)
 	// ListEntityPages 列出全部页面（导包要完整，不能只导脏的）。
+	//
+	// **跨视角全列**：导包要的是这个命名空间的全部记忆，
+	// 只导一个视角等于导出时把别家的画像悄悄丢了（而导入方看不出来）。
 	ListEntityPages(ctx context.Context, ns Namespace, limit int) ([]*types.EntityPage, error)
 	// MarkEntityPageDirty 标脏（晋升侧调用，不触发生成）。
-	MarkEntityPageDirty(ctx context.Context, ns Namespace, entityID string, when time.Time) error
+	//
+	// scope 是**这条事实的归属**：
+	//
+	//   - scope 非空 → 只标该视角那一页；
+	//   - scope 为空（全局事实）→ **该实体的所有视角都标脏**。
+	//
+	// 第二条的理由：全局事实出现在每个视角的画像里（它对谁都可见），
+	// 它一变，所有视角的摘要都过时了。只标全局那一页的话，
+	// 各归属的画像会停在旧版本，而看板上「页面存在且是旧的」
+	// 与「页面正常」长得一模一样。
+	MarkEntityPageDirty(ctx context.Context, ns Namespace, entityID string, scope types.Scope, when time.Time) error
 	// ApplyEntityPageRegen 生成成功：落正文、清脏、记录尝试时刻与清失败。
-	ApplyEntityPageRegen(ctx context.Context, ns Namespace, entityID string, p *types.EntityPage, at time.Time) error
+	ApplyEntityPageRegen(ctx context.Context, ns Namespace, entityID string, scope types.Scope,
+		p *types.EntityPage, at time.Time) error
 	// RecordEntityPageRegenFailure 生成失败：记原因、清脏、**保持脏标记**。
-	RecordEntityPageRegenFailure(ctx context.Context, ns Namespace, entityID, reason string, at time.Time) error
+	RecordEntityPageRegenFailure(ctx context.Context, ns Namespace, entityID string, scope types.Scope,
+		reason string, at time.Time) error
 }
 
 // EpisodeStore 情节与周期摘要存取。

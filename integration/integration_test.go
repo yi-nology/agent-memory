@@ -177,22 +177,33 @@ func TestMainMemoryLoop(t *testing.T) {
 		t.Fatalf("候选状态应落定为 promoted，实得 %q", got.Status)
 	}
 
-	// 5 页面重生成（要模型）：事实卡入库后页面被标脏，重生成后清脏。
+	// 5 页面重生成（要模型）：晋升时页面已被标脏，重生成后清脏。
+	//
+	// ⚠️ 这里**不再手工标脏**：标脏是写入侧该做的事（晋升 → 标脏 → 重生成），
+	// 手工标脏会让「接线有没有接上」这件事在用例里看不出来——
+	// 而它恰恰是最容易漏的一环（画像于是永远停在旧版本，
+	// 而宿主侧的 page.regen 只重生成脏页面，于是它安静地什么都不做）。
+	//
+	// 先断言晋升已经把该实体的页面标脏了：
+	pgDirty, err := s.GetEntityPage(ctx, ns, ent.ID, "")
+	if err != nil {
+		t.Fatalf("晋升后应自建脏页面: %v", err)
+	}
+	if !pgDirty.Dirty {
+		t.Fatal("晋升成事实后必须把该实体的画像标脏：事实变了摘要就该重算")
+	}
 	pg, err := page.New(s, llm, page.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkEntityPageDirty(ctx, ns, ent.ID, time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
-	pageres, err := pg.RegenerateDirty(ctx, ns)
+	pageres, err := pg.RegenerateDirty(ctx, ns, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if pageres.Regenerated == 0 {
 		t.Fatalf("脏页面应被重生成: %+v", pageres)
 	}
-	pgNow, err := s.GetEntityPage(ctx, ns, ent.ID)
+	pgNow, err := s.GetEntityPage(ctx, ns, ent.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,6 +359,86 @@ func TestMigrationPackageRoundTrip(t *testing.T) {
 	}
 	if back.Assertion != "磁盘长期偏小" {
 		t.Fatalf("往返后正文失真: %q", back.Assertion)
+	}
+}
+
+// TestScopedPromotionMarksItsOwnView 归属贯穿写入链：
+// 捕获时定的归属一路带到事实卡，画像也按那个归属分视角标脏。
+//
+// 这条链上任何一环把归属丢掉，后果都是**内容泄漏**：
+// 事实卡变成全局的（人人看得见），或画像变成全局的（一张所有人能读的摘要）。
+// 而这两种失效在数据上完全看不出来——事实卡就是一条说得通的事实，
+// 画像就是一段正常的文字。
+func TestScopedPromotionMarksItsOwnView(t *testing.T) {
+	const scope = types.Scope("team-a")
+	ctx := context.Background()
+	s := openFresh(t)
+	llm := fakeLLM{
+		extract: `[{"assertion":"机器甲的磁盘长期偏小","quote":"机器甲的磁盘长期偏小",` +
+			`"event_id":"ev1","type":"fact","subject_name":"机器甲",` +
+			`"importance":"high","confidence":"high"}]`,
+	}
+	svc, err := application.New(
+		application.Config{Namespace: ns, Host: "it"},
+		application.Deps{
+			Store: s, Redactor: ports.PatternRedactor{}, Bander: ports.MemoryBand{}, LLM: llm,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cap, err := svc.Capture(ctx, application.CaptureInput{
+		EventID: "ev1", Type: types.EventTurnEnd, Scope: scope,
+		Content: "机器甲的磁盘长期偏小，需要清理旧文件", SessionID: "s1", ThreadID: "t1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cands, err := svc.Extract(ctx, ns, "s1", []*types.RawEvent{cap.Event})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("应抽出 1 条候选，实得 %d 条", len(cands))
+	}
+	if cands[0].Scope != scope {
+		t.Fatalf("候选应继承捕获时的归属，实得 %q", cands[0].Scope)
+	}
+	if err := s.SaveCandidate(ctx, ns, cands[0]); err != nil {
+		t.Fatal(err)
+	}
+	res, err := entity.New(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent, err := res.Register(ctx, ns, "机器甲", types.EntityType("service"), "那台研发机", types.DecidedUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Promote(ctx, ns, cands[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	// 事实卡带着归属。
+	atoms, err := s.ListAtoms(ctx, ns, store.AtomFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atoms) != 1 || atoms[0].Scope != scope {
+		t.Fatalf("事实卡应带归属 %q: %+v", scope, atoms)
+	}
+	// 画像按**那一归属**标脏。
+	own, err := s.GetEntityPage(ctx, ns, ent.ID, scope)
+	if err != nil {
+		t.Fatalf("本归属的页面应被标脏自建: %v", err)
+	}
+	if !own.Dirty {
+		t.Fatal("本归属的页面应处于脏态")
+	}
+	// 全局页**不该**被建出来：带归属的事实不属于全局视角。
+	if _, err := s.GetEntityPage(ctx, ns, ent.ID, ""); err == nil {
+		t.Fatal("带归属的事实不该把全局页建出来：那是所有人能读的那一页")
 	}
 }
 

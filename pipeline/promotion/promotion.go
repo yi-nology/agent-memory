@@ -168,6 +168,13 @@ type Verdict struct {
 	Atom *types.AtomCard
 	// EntityID 归一后的实体。
 	EntityID string
+	// Actor 谁做的判定（规则 / 模型 / 人）。
+	//
+	// 刻意让结论**自带判定者**：调用方（装配面）要拿它给派生动作留痕
+	// （例如「事实已晋升但画像标脏失败」那条审计条目），
+	// 而判定者只存在于晋升面内部——不带给调用方的话，
+	// 调用方只能瞎猜一个署名，而审计条目里的署名是**要被人读的**。
+	Actor types.DecidedBy
 }
 
 // Promote 判定一条候选，**并在通过时落库**。
@@ -200,6 +207,11 @@ func (p *Promoter) Promote(ctx context.Context, ns store.Namespace, c *types.Can
 	})
 	if err != nil {
 		return nil, err
+	}
+	if v != nil {
+		// 判定者在这里统一盖章一次：内部十来个构造点不必各写一遍，
+		// 也不会漏掉某一处（漏一处就是审计条目少一个署名）。
+		v.Actor = p.cfg.Actor
 	}
 	return v, nil
 }

@@ -25,9 +25,9 @@ import (
 // 不注入打分器时，行为与打分器这个端口出现之前**逐条等价**
 // （那份等价性由 ports 包的用例钉住：TestLexicalRankerMatchesLegacyFormula）。
 
-// fixedRanker 给每条候选打固定的分数（按候选下标递减）。
+// fixedRanker 给每条候选打固定的分数。
 type fixedRanker struct {
-	// reverse true 时第一条排最后——用来验证「注入的打分器说了算」。
+	// reverse true 时**第一条排最后**——用来验证「注入的打分器说了算」。
 	reverse bool
 	// calls 收到过几次打分。
 	calls int
@@ -48,13 +48,42 @@ func (r *fixedRanker) Score(_ context.Context, query string, cands []ports.RankC
 	out := make([]float64, len(cands))
 	for i := range cands {
 		if r.reverse {
-			out[i] = float64(len(cands) - i)
+			// reverse：第一条拿**最低**分，于是它排到最后。
+			out[i] = float64(i + 1)
 			continue
 		}
-		out[i] = float64(i + 1)
+		// 默认：第一条拿最高分，于是它排在最前。
+		out[i] = float64(len(cands) - i)
 	}
 	return out, nil
 }
+
+// relevanceRanker 按「正文命中查询词」打分：命中的分高，不命中的分低。
+//
+// 它是**语义轨打分器的最小替身**：宿主接了自己的向量召回时，
+// 契约就是这样——分数大小决定次序，绝对值没有意义。
+type relevanceRanker struct{}
+
+func (relevanceRanker) Score(_ context.Context, query string, cands []ports.RankCandidate,
+	_ time.Time) ([]float64, error) {
+	out := make([]float64, len(cands))
+	for i, c := range cands {
+		if query != "" && strings.Contains(c.Body, query) {
+			out[i] = 1
+			continue
+		}
+		out[i] = 0
+	}
+	return out, nil
+}
+
+// fixedEstimator 每段都算同样多的 token：让「预算只装得下一条」这件事可复现。
+//
+// 用真实计量器的话，token 数取决于正文长度与包裹标签，
+// 预算边界就成了「差不多刚好」，而差不多刚好正是那种**偶发红**的来源。
+type fixedEstimator struct{ n int }
+
+func (e fixedEstimator) Estimate(context.Context, string) (int, error) { return e.n, nil }
 
 // badLenRanker 返回的分数条数与候选数不符。
 type badLenRanker struct{}
@@ -152,5 +181,80 @@ func TestRankerFailurePropagates(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "打分器坏了") {
 		t.Fatalf("错误信息要带原因: %v", err)
+	}
+}
+
+// ── 排序方向 ──
+
+// 分数大的必须在前。
+//
+// 这条是「排序方向写反」那条缺陷的钉子。
+//
+// # 为什么这条曾经是绿的
+//
+// 初版有两处**方向相反**的错，互相抵消了：
+//
+//   - 本文件里的 fixedRanker.reverse 分支给第一条**最高**分
+//     （与它自己注释里「第一条排最后」相反）；
+//   - 召回层的排序是**升序**（与 ports.Ranker 的契约「分数越大越靠前」相反）。
+//
+// 一处把第一条顶到前面，一处把它压到最后，于是「注入的打分器说了算」
+// 这条断言照样成立——**用例是绿的，实现是错的**。
+//
+// 只修排序不改这里，那条用例会红；只改这里不修排序，用例照样绿而实现照样错。
+// 两处必须一起改，且各自都要有自己的断言——
+// 故下面两条用例分别钉「次序」与「预算取舍」，
+// 它们不依赖 fixedRanker 的语义，故不受那次抵消影响。
+func TestHigherScoreComesFirst(t *testing.T) {
+	f := &fakeReader{atoms: []*types.AtomCard{
+		atom("a1", "e1", "内存占用偏高", types.ImportanceLow),
+		atom("a2", "e2", "磁盘长期偏小", types.ImportanceHigh),
+	}}
+	cfg := recall.DefaultConfig()
+	cfg.Ranker = relevanceRanker{}
+	p := newPipe(t, f, cfg)
+
+	res, err := p.Recall(context.Background(), recall.Request{Namespace: ns, Query: "磁盘"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Snippets) < 2 {
+		t.Fatalf("召回结果不足两条: %d", len(res.Snippets))
+	}
+	// 命中查询词的那条得分高，必须在前。
+	if res.Snippets[0].RefID != "a2" {
+		t.Fatalf("分数高的没排在前面，首条是 %s", res.Snippets[0].RefID)
+	}
+}
+
+// 预算装不下时，留下的必须是**更相关**的那条。
+//
+// 这条比次序那条更要命：排序错了只影响「谁在前」，
+// 而预算分配是**按次序逐条接收**的，于是排序一错，
+// 预算一紧就先把最该保留的事实丢掉——
+// 而症状只是「召回里少了几条」，看着像内容不够，不像是排序错了。
+func TestTightBudgetKeepsMostRelevant(t *testing.T) {
+	f := &fakeReader{atoms: []*types.AtomCard{
+		atom("a1", "e1", "内存占用偏高", types.ImportanceLow),
+		atom("a2", "e2", "磁盘长期偏小", types.ImportanceHigh),
+	}}
+	cfg := recall.DefaultConfig()
+	cfg.Ranker = relevanceRanker{}
+	// 事实桶配额 = int(15 × 0.7) = 10；每段固定 10 token ⇒ 只装得下一条。
+	cfg.TotalBudget = 15
+	p, err := recall.New(cfg, f, fixedEstimator{n: 10}, ports.MemoryBand{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := p.Recall(context.Background(), recall.Request{Namespace: ns, Query: "磁盘"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Snippets) != 1 {
+		t.Fatalf("预算只装得下一条，实得 %d 条", len(res.Snippets))
+	}
+	if res.Snippets[0].RefID != "a2" {
+		t.Fatalf("预算紧时装下的应是更相关的那条，实得 %s", res.Snippets[0].RefID)
 	}
 }
