@@ -124,8 +124,12 @@ importance` —— 同一设计的两个实现 ✓。本仓是**超集**（多 `
 - `store.AtomFilter` + `IDs`/`At` ✓。
 
 **v0.8.0**
-- `store.AtomStore` + **`SearchAtomsLoose`** ✗（**实现召回链的宿主都要加** ✓）；
-  `recall.Reader` 同样 + `SearchAtomsLoose` ✗；
+- ⚠️ **已于 2026-10-23 订正**（issue #12）：`store.AtomStore` + `SearchAtomsLoose`
+  与 `recall.Reader` + `SearchAtomsLoose` 这两条**要求撤回**——
+  宽松检索已移出契约面，落成**可选能力** `store.AtomLooseSearcher`
+  （运行时探测 + 降级）。宿主**不再需要**实现它；
+  已经实现了的**照旧能用**（方法还在，只是不在契约面里）。
+  ⇒ 下表的 B-2 一行按「**宿主可不做**」理解。
 - `store.AtomFilter` + `EventSince` ✓；`types.AtomCard` + `Kind` ✓；
 - `lifecycle` + `Expire`/`WithEventRetention` ✓；`recall.Config` + `EventWindow` ✓。
 

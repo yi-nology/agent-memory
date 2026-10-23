@@ -8,7 +8,7 @@ import (
 	"github.com/yi-nology/agent-memory/types"
 )
 
-// 本文件：事实卡的**宽松**词法检索（命中任一词就算，见 store.AtomStore.SearchAtomsLoose）。
+// 本文件：事实卡的**宽松**词法检索（命中任一词就算，见 store.AtomLooseSearcher）。
 //
 // # 为什么它要单独成文件
 //
@@ -24,6 +24,16 @@ import (
 // 故断言要同时钉住两件事：
 //   ① 宽松路确实更宽（命中任一词就算）；
 //   ② 放宽的是「词的匹配」，**不是「可见性」**——过滤条件一条也不许少。
+//
+// # 为什么走可选接口而不是 store.Store 的方法
+//
+// 宽松检索是**可选能力**（store.AtomLooseSearcher）——
+// 它不在已发布的 store.Store 里，故仓外实现 store.Store 的宿主
+// 不会因为上游加了这个能力而编译失败（见 store/optional.go 的演进规约）。
+//
+// 但**两个内置后端必须实现它**（它们是本仓的完整实现，不是「可选装配」）：
+// 缺了就响亮失败，而不是跳过断言——跳过的话这条断言在真库上根本不会跑，
+// 而「它一直是 skip 的」与「它一直是绿的」在看板上长得一模一样。
 
 // tAtomSearchLooseMatchesAnyWord 宽松路：命中任一词就算，且过滤条件一条不少。
 func tAtomSearchLooseMatchesAnyWord(t *testing.T, s store.Store) {
@@ -56,7 +66,14 @@ func tAtomSearchLooseMatchesAnyWord(t *testing.T, s store.Store) {
 
 	// 宽松路：命中任一词就算，故「只命中一个词」的那张也要进来；
 	// 但谁都不命中的那张**不该**进来（放宽的是「词」，不是「什么都能进」）。
-	loose, err := s.SearchAtomsLoose(bg(), nsA, "磁盘 内存", store.AtomFilter{ActiveOnly: true, Limit: 100})
+	//
+	// ⚠️ 能力缺失 ⇒ **响亮失败**（不 skip）：内置后端是完整实现，
+	// 它没实现宽松检索就是漏了，不是「装配时没选」。
+	looser, ok := store.LooseSearcher(s)
+	if !ok {
+		t.Fatalf("后端未实现宽松检索能力（store.AtomLooseSearcher）：内置后端必须实现它")
+	}
+	loose, err := looser.SearchAtomsLoose(bg(), nsA, "磁盘 内存", store.AtomFilter{ActiveOnly: true, Limit: 100})
 	if err != nil {
 		t.Fatalf("宽松检索失败: %v", err)
 	}
@@ -66,7 +83,7 @@ func tAtomSearchLooseMatchesAnyWord(t *testing.T, s store.Store) {
 
 	// 事件窗口在宽松路**同样生效**：太老的事件类事实该被挡掉。
 	// 漏掉它的失效形态是「泄漏」而不是「少取」——因为它挡的是别的事实。
-	windowed, err := s.SearchAtomsLoose(bg(), nsA, "磁盘 内存",
+	windowed, err := looser.SearchAtomsLoose(bg(), nsA, "磁盘 内存",
 		store.AtomFilter{ActiveOnly: true, EventSince: base, Limit: 100})
 	if err != nil {
 		t.Fatalf("带事件窗口的宽松检索失败: %v", err)

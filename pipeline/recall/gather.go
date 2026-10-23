@@ -304,7 +304,23 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 //
 // 与严格路同一套条件（进 SQL，与 TopK 同一次求值）——
 // 放宽的是**词的匹配方式**，不是**可见性**。
+//
+// # 宿主没实现宽松路时的降级
+//
+// 宽松路是**可选能力**（store.AtomLooseSearcher）。
+// 宿主没实现 ⇒ 这一路**整条不存在**，召回回落到严格路：
+// 多话题查询打不中（Recall@3 之后不再上升），但召回**照跑**。
+//
+// ⚠️ 降级不许静默：它必须**可观测**（Result.LooseSearchUnavailable + 指标），
+// 否则宿主的症状只是「多话题查询打不中」——看着像内容不够，
+// 而病因在「宿主没实现那个能力」上。
+//
+// 指标在 Recall 里记（不是这里）：口径是「**降级过的召回次数**」，
+// 而缓存命中的那次召回**也是**降级的（它端出来的就是降级结果）。
 func (p *Pipeline) collectLoose(ctx context.Context, req Request, limit int) ([]*types.AtomCard, error) {
+	if p.loose == nil {
+		return nil, nil
+	}
 	if strings.TrimSpace(req.Query) == "" {
 		return nil, nil
 	}
@@ -316,7 +332,7 @@ func (p *Pipeline) collectLoose(ctx context.Context, req Request, limit int) ([]
 	if scope != nil {
 		entityIDs = req.Entities
 	}
-	atoms, err := p.store.SearchAtomsLoose(ctx, req.Namespace, req.Query, store.AtomFilter{
+	atoms, err := p.loose.SearchAtomsLoose(ctx, req.Namespace, req.Query, store.AtomFilter{
 		Scope:        req.Scope,
 		EntityIDs:    entityIDs,
 		ActiveOnly:   true,

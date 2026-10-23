@@ -10,6 +10,17 @@
 //   - 「阶段只允许碰哪些表」在**类型上**可见，漏写一条越权调用即编译不过；
 //   - 新增后端只需补齐被用到的片段。
 //
+// ⚠️ **但「拆小」本身不解决演进**：拆开只是把一个大面换成几个小面，
+// 而**任何一个**被仓外实现的面，加一个方法仍然打红下游。
+// v0.8.0 给 AtomStore 加 SearchAtomsLoose 就是这么发生的（宿主仓当场编译失败）。
+// 故本包的接口分两类：
+//
+//   - **已发布的契约面**（本文件）：冻结，不许加方法；
+//   - **可选能力面**（optional.go）：新能力一律落这里，
+//     消费方运行时探测 + 明确写下来的降级路径。
+//
+// 详见 optional.go 的「契约演进规约」。
+//
 // # namespace 是显式参数
 //
 // 不做「构造 Store 时绑定一个 namespace」（那是上游的做法）：记忆库要多租户时，
@@ -209,29 +220,16 @@ type AtomStore interface {
 	// ActiveOnly 默认 false，故「退役事实仍可搜到」这条约定保持不变
 	// （追问「当初为什么这么判」要能搜到）。
 	SearchAtoms(ctx context.Context, ns Namespace, query string, f AtomFilter) ([]*types.AtomCard, error)
-	// SearchAtomsLoose **宽松**词法检索：命中**任一**词就算（OR 匹配）。
+	// ⚠️ **本接口已冻结**：不要再往这里加方法。
 	//
-	// # 为什么要有它
+	// 它是对外发布的接口（仓外的适配层会实现它），
+	// 而加一个方法 ⇒ 那些实现类**编译期直接红**（上游发 tag 的当天下游就得改）。
+	// 新能力走**可选接口**（见 optional.go）：独立小接口 + 运行时探测 + 降级路径。
 	//
-	// SearchAtoms 是**隐式 AND**（每个词都要在正文里出现）。
-	// 后果是「多话题查询」几乎打不中：「磁盘 内存 清理」里只要有一条事实
-	// 没有同时含这三个词，它就不在命中集里——而它对这条查询明明是相关的。
+	// 宽松词面检索曾在本接口里（v0.8.0 的 SearchAtomsLoose），
+	// 现已移出为 store.AtomLooseSearcher —— 移出即是对下游的**非破坏**修复：
+	// 原本实现了它的下游继续实现即可，不实现的也能编译。
 	//
-	// 基线数字把这件事量出来了（docs/EVAL_BASELINE.md）：
-	// Recall@3 之后**不再上升**（部分匹配的事实进不来）。
-	//
-	// # 为什么是**另一路**而不是把 AND 改成 OR
-	//
-	// 直接改成 OR：噪声一次性灌进候选池，而池内排序只能靠打分器救——
-	// 而打分器是词面重叠，于是「命中任一词」与「词面重叠高」高度相关，
-	// 噪声反而排前面。
-	//
-	// 另加一路再交给融合器（RRF）合并：完全匹配的那条在**严格路**里，
-	// 部分匹配的那些在**宽松路**里，两路名次由 RRF 合成——
-	// 严格命中在两路都出现（融合分最高）。
-	//
-	// 过滤条件与 SearchAtoms **完全一致**（归属、活跃、时序、TopK 同一次求值）。
-	SearchAtomsLoose(ctx context.Context, ns Namespace, query string, f AtomFilter) ([]*types.AtomCard, error)
 	// SupersedeAtom 软退役：被继任者推翻。旧卡保留可查。
 	SupersedeAtom(ctx context.Context, ns Namespace, id, supersededBy string) error
 	// DeprecateAtom 软退役：人工作废。

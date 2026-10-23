@@ -282,42 +282,15 @@ func TestCacheKeyIncludesResolvedPlan(t *testing.T) {
 
 // 宽松路：只共享**部分**词的事实要能进候选池。
 //
-// 严格路是隐式 AND ⇒ 「磁盘 内存 清理」里只有同时含三个词的事实才算命中，
-// 而一条只含「磁盘」的事实对这条查询明明是相关的。
-// 基线数字把这件事量出来了（docs/EVAL_BASELINE.md）：Recall@3 之后不再上升。
-func TestLoosePathAddsPartialMatches(t *testing.T) {
-	f := &fakeReader{atoms: []*types.AtomCard{
-		// 三个词全中（严格路命中）。
-		{ID: "a-all", EntityID: "e1", Assertion: "磁盘 内存 清理 都要做",
-			Importance: types.ImportanceHigh, OccurredAt: base(), CreatedAt: base(), UpdatedAt: base()},
-		// 只中一个词（严格路打不中，宽松路能进）。
-		{ID: "a-part", EntityID: "e2", Assertion: "磁盘 的容量不够了",
-			Importance: types.ImportanceHigh, OccurredAt: base(), CreatedAt: base(), UpdatedAt: base()},
-	}}
-	cfg := recall.DefaultConfig()
-	p := newPipe(t, f, cfg)
-
-	res, err := p.Recall(context.Background(), recall.Request{Namespace: ns, Query: "磁盘 内存 清理"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, s := range res.Snippets {
-		if s.RefID == "a-part" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("只共享部分词的事实该被宽松路捞进来: %+v", res.Snippets)
-	}
-	// 完全匹配的那条必须**排前面**（它在两路都出现，融合分最高）。
-	if len(res.Snippets) == 0 || res.Snippets[0].RefID != "a-all" {
-		t.Fatalf("完全匹配的那条该排在最前: %+v", res.Snippets)
-	}
-}
-
-// 事件窗口：过了窗口的**事件类**事实不进候选池；
-// 而**用户显式问了历史**时，窗口让位。
+// ⚠️ 这条用例已移到 loose_degrade_test.go，且**换了判别特征**。
+//
+// 原版用共享的 fakeReader——而它的 ListAtoms 把**全部**事实都返回
+// （那是「高价值兜底」那一路），于是「只共享部分词」那条从兜底路就进来了：
+// 把宽松路整个废掉（collectLoose 直接返回 nil），**原版照样绿**
+// （2026-10-23 变异验证实测）。
+//
+// ⇒ 原版验的不是宽松路，是兜底路。宽松路那条特性因此**一直没有真覆盖**。
+// 新版让兜底路只给严格命中的那些 ⇒ 那条事实**只能**从宽松路进来。
 func TestEventWindowFiltersOldEvents(t *testing.T) {
 	old := base().AddDate(0, 0, -60)
 	mk := func(id, text string, kind types.FactKind, at time.Time) *types.AtomCard {

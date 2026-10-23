@@ -106,22 +106,28 @@ func (p *Pipeline) Purge() int { return p.cache.purge() }
 //
 // ⚠️ **新增字段必须一并复制**：漏掉一个 map，缓存命中就会返回 nil
 // （「第一次有、第二次没了」——正好是这条注释说的那种难复现的形态）。
-// 故这里用「逐字段手抄」是刻意的：加字段时编译器会指出来，
+// 故这里用「逐字段手抄」是刻意的：抄一遍时新字段会**显眼地缺一块**，
 // 而「遍历反射复制」不会——它把漏抄变成静默。
+//
+// ⚠️ 但「显眼」不等于「编译器会拦」：Go 的结构体字面量**不要求**写全字段，
+// 漏抄一个字段编译照过（所以下面那句「加字段时编译器会指出来」是**错的**，
+// 已改）。真正的兜底是 TestCloneResultCopiesEveryField：
+// 它用反射逐字段比对「源」与「副本」，漏一个字段立刻红。
 func cloneResult(r *Result) *Result {
 	if r == nil {
 		return nil
 	}
 	cp := &Result{
-		Snippets:           append([]Snippet(nil), r.Snippets...),
-		Dropped:            r.Dropped,
-		DroppedByBudget:    r.DroppedByBudget,
-		DroppedByDiversity: r.DroppedByDiversity,
-		DroppedByDuplicate: r.DroppedByDuplicate,
-		Drops:              copyDropReasons(r.Drops),
-		Buckets:            copyBuckets(r.Buckets),
-		FromCache:          r.FromCache,
-		Entities:           append([]string(nil), r.Entities...),
+		Snippets:               append([]Snippet(nil), r.Snippets...),
+		Dropped:                r.Dropped,
+		DroppedByBudget:        r.DroppedByBudget,
+		DroppedByDiversity:     r.DroppedByDiversity,
+		DroppedByDuplicate:     r.DroppedByDuplicate,
+		Drops:                  copyDropReasons(r.Drops),
+		Buckets:                copyBuckets(r.Buckets),
+		FromCache:              r.FromCache,
+		Entities:               append([]string(nil), r.Entities...),
+		LooseSearchUnavailable: r.LooseSearchUnavailable,
 	}
 	return cp
 }

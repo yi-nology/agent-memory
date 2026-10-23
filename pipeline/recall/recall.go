@@ -36,102 +36,6 @@ import (
 	"github.com/yi-nology/agent-memory/types"
 )
 
-// Source 召回来源。
-type Source string
-
-const (
-	// SourceAtom 事实卡。召回的**主力**——它是判断过的稳定事实。
-	SourceAtom Source = "atom"
-	// SourceRaw 原始捕获事件。只作兜底：持久命中足够时就不该塞原始对话，
-	// 原始事件体量大、噪声高，进 prompt 的性价比远低于事实卡。
-	SourceRaw Source = "raw"
-	// SourcePageHeadline 实体页面的一句话画像。
-	//
-	// 只在宿主已解析出实体时才加：它是一个固定成本（每个实体一句），
-	// 而它换来的上下文收益只在话题确实锁定时才兑现。
-	SourcePageHeadline Source = "page_headline"
-)
-
-// Snippet 一段可注入的内容。
-type Snippet struct {
-	// Source 来源。
-	Source Source
-	// RefID 溯源标识（事实卡 ID / 事件 ID / 实体 ID）。
-	RefID string
-	// EntityID 归属实体（raw 可能为空）。
-	EntityID string
-	// Role 渲染角色（"记忆" / "历史" / "画像"）。
-	Role string
-	// Body 正文，**已经过 Bander 包裹**。
-	Body string
-	// Importance 重要度（raw 无此概念，取零值）。
-	Importance types.Importance
-	// OccurredAt 发生时刻（排序用）。
-	OccurredAt time.Time
-	// Tokens 该段占用的估算 token（进预算用）。
-	Tokens int
-}
-
-// Result 召回结果。
-type Result struct {
-	// Snippets 按优先级排序，可直接渲染。
-	Snippets []Snippet
-	// Dropped 被丢弃的总条数（预算 + 多样性两路之和）。
-	//
-	// 刻意暴露：装不下就是装不下，而「用户以为带上了记忆、实际被静默丢掉」
-	// 是最难被发现的失效。分两路给出，是因为处置不同——预算不足说明该调大
-	// TotalBudget 或改进提炼，多样性超限说明该调大 PerEntityMax。
-	Dropped int
-	// DroppedByBudget 预算装不下而丢弃的条数。
-	DroppedByBudget int
-	// DroppedByDiversity 单一实体超额而丢弃的条数。
-	DroppedByDiversity int
-	// DroppedByDuplicate 内容重复而丢弃的条数。
-	//
-	// 三路分开给是因为处置不同：重复说明提炼层在制造同一件事（改 extractor），
-	// 多样性说明实体偏斜（改 PerEntityMax 或改分桶），预算说明装不下（改总量）。
-	DroppedByDuplicate int
-	// Drops 按原因分路的丢弃计数（**通用面**）。
-	//
-	// 上面的三条具名字段是这张表在本仓召回里的**投影**（宿主读旧字段不破），
-	// 这张表才是可复用的那一面：宿主自造召回时用 ports.Budget 拿到同样形状的
-	// 计数，于是「为什么少了」在两边都能归因——
-	// 而分桶不足（DropQuota）与总量不足（DropBudget）必须分开：
-	// 前者该调分桶占比，后者该调总量，合成一个数就看不出是哪一种。
-	Drops map[ports.DropReason]int
-	// Buckets 各配额桶收到的条数（**通用面**）。
-	//
-	// 宿主能据此看到「这一轮事实桶收了几条、画像桶收了几条」，
-	// 而不必自己按 Role/Source 猜——画像桶恒为 0 是个值得发现的症状
-	//（画像被挤空会让页面重生成这个功能形同虚设）。
-	Buckets map[ports.BucketID]int
-	// FromCache 是否命中缓存。
-	FromCache bool
-	// Entities 本次推入活跃实体栈的实体（按栈顶在前）。
-	Entities []string
-}
-
-// Empty 结果是否为空。
-func (r *Result) Empty() bool { return r == nil || len(r.Snippets) == 0 }
-
-// Render 渲染成可注入的文本块。
-//
-// 空结果返回空串而不是一句「没有记忆」——后者会占预算且诱导模型去想记忆这件事。
-func (r *Result) Render() string {
-	if r.Empty() {
-		return ""
-	}
-	var b strings.Builder
-	for _, s := range r.Snippets {
-		b.WriteString("- [")
-		b.WriteString(s.Role)
-		b.WriteString("] ")
-		b.WriteString(s.Body)
-		b.WriteByte('\n')
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
 // Request 一次召回请求。
 type Request struct {
 	// Namespace 记忆库。
@@ -367,6 +271,9 @@ func (c Config) normalize() (Config, error) {
 // store/store.go 的包注释里写了这条纪律（「阶段只声明自己需要的子接口」），
 // 这里是对它自己的遵守。
 //
+// ⚠️ **它是冻结面**（仓外宿主会实现它）：加方法 = 隐式 breaking，
+// 新能力走可选能力面（见下面 SearchAtoms 那段与 store/optional.go）。
+//
 // 叫 Reader 而不是 Source：Source 已经是「召回来源」那个枚举了（atom/raw/
 // page_headline），而这里说的是「数据从哪读」，两个概念挨太近反而容易混谈。
 type Reader interface {
@@ -382,15 +289,18 @@ type Reader interface {
 	// 只在 ListAtoms 上过滤是不够的，检索路会绕过滤面直接取 TopK，
 	// 被别家的卡占掉配额（症状是「召回变少了」，看着像排序问题）。
 	SearchAtoms(ctx context.Context, ns store.Namespace, query string, f store.AtomFilter) ([]*types.AtomCard, error)
-	// SearchAtomsLoose 宽松词面检索（命中任一词）。
+	// ⚠️ **本接口已冻结**：不要往这里加方法。
 	//
-	// 严格路是**隐式 AND**：每个词都要在正文里出现。
-	// 于是「多话题查询」几乎打不中——基线数字把这件事量出来了
-	// （Recall@3 之后不再上升，部分匹配的事实进不来）。
+	// 它是宿主要实现的面（仓外适配层直接实现它），
+	// 加一个方法 ⇒ 下游**编译期直接红**（上游发 tag 的当天下游就得改）。
 	//
-	// 这一路与严格路**并列**（不是替代）：两路的名次交给融合器合成，
-	// 完全匹配的那条在两路都出现（融合分最高），部分匹配的那些从这一路进来。
-	SearchAtomsLoose(ctx context.Context, ns store.Namespace, query string, f store.AtomFilter) ([]*types.AtomCard, error)
+	// 宽松词面检索曾在本接口里（v0.8.0 的 SearchAtomsLoose），
+	// 现已移出为 **store.AtomLooseSearcher**（可选能力面）：
+	// 召回链在 New 里探测它有没有，没有就回落到严格路
+	// （降级路径见 gather.collectLoose，结果里看 Result.LooseSearchUnavailable）。
+	//
+	// 移出即是对下游的**非破坏**修复：原本实现了它的下游继续实现即可，
+	// 没实现的也能编译——两种宿主都不会被打红。
 	GetEntityPage(ctx context.Context, ns store.Namespace, entityID string, scope types.Scope) (*types.EntityPage, error)
 	UpsertActiveEntity(ctx context.Context, ns store.Namespace, a *types.ActiveEntity) error
 	// ListActiveEntities 读活跃实体栈（代词消解的来源）。
@@ -422,9 +332,14 @@ type RawReader interface {
 
 // Pipeline 召回流水线。
 type Pipeline struct {
-	cfg    Config
-	store  Reader
-	raw    RawReader // nil = 宿主没有捕获面
+	cfg   Config
+	store Reader
+	raw   RawReader // nil = 宿主没有捕获面
+	// loose 宽松词面检索能力（nil = 宿主没实现，召回回落到严格路）。
+	//
+	// 探测在 New 里做一次：能力不会中途长出来，而每次召回都断言一次
+	// 是白花的开销（还会在指标里灌重复的计数）。
+	loose  store.AtomLooseSearcher
 	est    ports.TokenEstimator
 	bander ports.Bander
 	cache  *cache
@@ -465,8 +380,16 @@ func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*
 		}
 		raw = r
 	}
+	// 宽松词面检索是**可选能力**：有就用，没有就回落到严格路。
+	//
+	// ⚠️ 这里**不报错**：宽松路是增强（多话题查询的召回率），不是前提。
+	// 报错等于把「可选」写成了「必需」——宿主装不起就崩。
+	// 但降级必须可观测：Result.LooseSearchUnavailable + 指标
+	// （否则症状只是「多话题查询打不中」，看着像内容不够）。
+	// 接线与降级见 loose.go。
+	loose := probeLooseSearcher(s)
 	p := &Pipeline{
-		cfg: norm, store: s, raw: raw, est: est, bander: bander,
+		cfg: norm, store: s, raw: raw, loose: loose, est: est, bander: bander,
 		now: func() time.Time { return time.Now().UTC() },
 	}
 	// 缓存用流水线自己的时钟：两处时间不一致时，「缓存过期」这条行为
@@ -534,6 +457,9 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 			// 而原因藏在缓存那一行里，从结果上看不出来。
 			p.pushEntityIDs(ctx, req, hit.Entities)
 			p.metrics().Incr(MetricCacheHit, 1)
+			// 缓存命中的那次召回**也是**降级的（端出来的就是降级结果），
+			// 故降级计数在这条路径上也要记——口径是「降级过的召回次数」。
+			p.markDegraded()
 			p.metrics().Observe(MetricRecallDuration, p.now().Sub(started))
 			return hit, nil
 		}
@@ -591,8 +517,11 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 		Dropped:            budget.DroppedTotal(),
 		Drops:              drops,
 		Buckets:            budget.Kept(),
+		// 能力缺失也要说清：降级不可见 ⇒ 宿主以为自己在用宽松路。
+		LooseSearchUnavailable: p.loose == nil,
 	}
 	p.observe(res, budget, p.now().Sub(started))
+	p.markDegraded()
 	if p.cache != nil {
 		p.cache.put(p.cacheKey(eff, plan), res)
 	}
@@ -693,6 +622,10 @@ const (
 	MetricEntitiesPushed = "recall.entities.pushed"
 	// MetricSemanticHits 语义路命中的条数。
 	MetricSemanticHits = "recall.semantic.hits"
+	// MetricLooseSearchUnavailable 宽松词面检索不可用（宿主没实现那个能力）的召回次数。
+	//
+	// 口径：每次**发生降级**的召回记一次（不是每次探测）。
+	MetricLooseSearchUnavailable = "recall.loose.unavailable"
 )
 
 // cacheKey 缓存键。

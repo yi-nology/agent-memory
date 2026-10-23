@@ -107,6 +107,7 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 | token 效率 / 问答口径 | `evaluation/qa.go` | 宿主的 `Answerer` / `Judge`（判分用模型归宿主） | 「已测」与「未测」必须能分开；效率的「命中」用**检索口径**（不用「上下文充分」当分子） |
 | 事实时效类别 | `types/atom.go`（`FactKind`） | 两个后端（`kind` 列 + 迁移）+ `lifecycle`（按龄退役）+ `store.AtomFilter.EventSince` | 零值落在**不淘汰**那一类；事件窗口与时间窗是**两个维度**（显式问历史时窗口让位） |
 | 宽松词面路 | `store/lexical.go`（`FTS5QueryAny`）+ `store.SearchAtomsLoose` | `pipeline/recall/hybrid.go`（三路 RRF 融合） | 放宽的是**词的匹配方式**，不是**可见性**；别把 AND 改成 OR（噪声会灌进池子） |
+| **给已发布的存储面加能力** | `store/optional.go`（可选能力面） | `pipeline/recall/gather.go`（探测 + 降级）+ `application/contract_test.go`（冻结清单） | 新能力**不许**加进 `store.AtomStore` / `recall.Reader` / `ports.*`——加方法 = 仓外实现者当天编译失败；走「独立小接口 + 运行时探测 + 降级路径」 |
 | MCP 入口 | `adapters/mcp/` | `application.Service` | 白名单四工具，无逃逸口 |
 | 生命周期 | `lifecycle/lifecycle.go` | — | 事实卡只软退役，不硬删 |
 | 迁移包格式 | `operations/portable/portable.go` | `oekit/pkg/pack` | 写面不换 pack：改了等于**改包格式**，已发布包导不回来 |
@@ -201,6 +202,35 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 
 `Run(args, stdout, stderr) int` 而不是 `main()` 是刻意的：**命令逻辑可被单测直接调用，
 不用起子进程**。写完记得补 `adapters/cli/cli_test.go` 风格的用例。
+
+### 3.5 给**已发布**的存储面加能力（不破坏仓外实现者）
+
+`store.*` / `recall.Reader` / `ports.*` 这些接口**仓外的宿主会自己实现**
+（宿主仓 bianque：`var _ store.AtomStore = (*Store)(nil)`）。
+在它们上面加方法 = **隐式 breaking**：上游发 tag 的当天，下游整个仓编译不过
+（v0.8.0 加 `SearchAtomsLoose` 就这么打红了宿主仓，issue #12）。
+
+⚠️ **「把大接口拆小」不解决这个问题**：拆开只是把一个大面换成几个小面，
+任何一个被仓外实现的面，加方法仍然打红下游。
+
+正确姿势（三条一起，缺一条就换一种失效形态）：
+
+```
+1. store/optional.go：落一个独立的小接口（可选能力面）
+2. 消费方运行时探测：store.LooseSearcher(x) → (能力, 有没有)
+3. 没有时走明确写下来的降级路径：少召回 + 可观测（不许静默）
+```
+
+判据：**这是「增强」还是「前提」？**
+- 增强（如宽松检索：多话题查询的召回率）⇒ 降级（少召回，报出来）。
+- 前提（如必需端口、捕获面）⇒ 缺了就**响亮失败**（装配期报错）。
+
+两者都**不许**把增强当前提（宿主装不起就崩）。
+
+改完跑 `go test ./application/` —— **契约冻结清单**在那里：
+已发布接口的方法集被钉死，改它 = 一次有意的破坏性变更
+（走大版本 + 发布说明点名「外部实现者需要改」）。
+新能力走可选接口 ⇒ 清单不用动。
 
 ---
 
@@ -307,6 +337,8 @@ git show --stat --name-status HEAD  # 提交后复核文件集合
 | 某实体的事实全丢了 | 实体合并时按 `ActiveOnly` 过滤了退役卡 | `store/store.go` ListAtomsByEntity 注释 |
 | 召回结果偏少但看不出原因 | 丢弃没分路 | `Result.Drops` / `ports.Budget` |
 | 多话题查询几乎打不中 | 词面路是**隐式 AND**（每个词都要在） | `store.FTS5QueryAny` + 宽松路（已在 v0.7.x 修，见 `docs/EVAL_BASELINE.md`） |
+| 多话题查询打不中（且宿主自己实现了存储） | 宽松检索是**可选能力**，宿主没实现 ⇒ 召回回落到严格路 | `recall.Result.LooseSearchUnavailable` + 指标 `recall.loose.unavailable` |
+| 升级上游当天，仓外实现者编译不过 | 新方法加进了**已发布**的接口（`store.AtomStore` 等） | `store/optional.go` 的契约演进规约 + `application/contract_test.go` 冻结清单 |
 | 一次查询给不出答一道多事实问题的上下文 | 上下文充分率低（**部分匹配的事实进不来**） | `docs/EVAL_BASELINE.md` 的充分率与修法 |
 | 画像桶恒为 0 | 画像参与了多样性裁剪被挤掉 | `TestBucketsAreIndependent` |
 | 改了依赖方向门禁就红 | 没先改 policy（policy 先行） | `architecture-policy.yaml` |

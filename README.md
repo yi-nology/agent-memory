@@ -15,7 +15,7 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
     └──episode extraction──→ Episode
 ```
 
-## 现在有什么（v0.8.0）
+## 现在有什么（v0.9.0）
 
 | 面 | 状态 | 位置 |
 |---|---|---|
@@ -51,11 +51,31 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
 > `application.Service.Search` 改成吃 `store.AtomFilter`。
 > 下游跟着改的清单见 issue #10 / #11 的回写与 tag 的发布说明。
 
+> **v0.9.0 含破坏性变更**（下游要改的清单，逐条列全）：
+>
+>   - **v0.8.0 那条要求撤回**：`store.AtomStore` 不再新增方法。
+>     宽松词面检索从 `store.AtomStore` 与 `recall.Reader` **移出**，
+>     落成**可选能力** `store.AtomLooseSearcher`：
+>     - 已经实现了 `SearchAtomsLoose` 的宿主：**不用改**（方法还在，只是不在契约面里）；
+>     - 还没实现的宿主：**也不用改**（不实现照样编译）——
+>       这正是 v0.8.0 打红仓外实现者的那一条（issue #12）；
+>     - 要改的只有**调用方**：`store.Store` / `recall.Reader` 上不再有这个方法，
+>       用之前先 `store.LooseSearcher(x)` 探测一下。
+>     召回链在缺这个能力时**回落到严格路**（多话题查询打不中），
+>     并在 `recall.Result.LooseSearchUnavailable` 与指标 `recall.loose.unavailable`
+>     上说清——降级不许静默。
+>   - 本仓自带的两个后端实现了它；`storage/parity` 的宽松路断言对它**响亮失败**
+>     （缺能力不 skip——skip 的断言不证明任何事）。
+>   - **对外发布的契约面从此冻结**：方法集钉在 `application/contract_test.go`，
+>     改它 = 一次有意的破坏性变更（要走大版本 + 发布说明点名）。
+>     新能力一律走可选接口（独立小接口 + 运行时探测 + 降级路径）。
+>
 > **v0.8.0 含破坏性变更**（下游要改的清单，逐条列全）：
 >
 >   - `store.AtomStore` 新增 `SearchAtomsLoose`（**宽松**词面检索：命中任一词）。
 >     实现召回链的宿主要跟着实现它；
 >     `recall.Reader` 也多了这个方法（自造召回器的宿主同样要加）。
+>     ⚠️ **这一条已在 v0.9.0 撤回**（见上）——它不再要求下游实现。
 >   - `store.AtomFilter` 新增 `EventSince`（事件类事实的默认召回窗口下界；
 >     零值=不限）。
 >   - `types.AtomCard` 新增 `Kind`（事实的时效类别：短期事件 / 有效期状态 / 长期经验；
@@ -179,6 +199,21 @@ RawEvent ──extraction──→ Candidate ──promotion──→ AtomCard �
     缺省下与注入前**逐条等价**（`ports` 包的用例把旧公式重写一遍当期望值钉住）。
     契约只有一条要紧的：分数与候选**一一对应且同序**，长度不符即报错
     ——错位不会崩，只会静默换序，而换序在结果里完全看不出来。
+
+12. **对外发布的契约面是冻结的；新能力走可选接口。**
+    `store.*` / `recall.Reader` / `ports.*` 这些接口**仓外的宿主会自己实现**
+    （宿主仓 bianque 就是 `var _ store.AtomStore = (*Store)(nil)`）。
+    在这样的接口上**加一个方法**，对实现者就是**隐式 breaking**：
+    上游发 tag 的当天，下游整个仓编译不过（v0.8.0 加 `SearchAtomsLoose` 就这么打红了宿主）。
+    > ⚠️ 「把大接口拆成小接口」**不解决**这个问题：拆开只是把一个大面换成几个小面，
+    > 任何一个被仓外实现的面，加方法仍然打红下游（issue #12 的原话）。
+    > 故本仓的做法是**三条一起**：
+    > ① 新能力落成**独立的小接口**（可选能力面）；
+    > ② 消费方**运行时探测**它有没有；
+    > ③ 没有时走**明确写下来的降级路径**（少召回，不报错，且**可观测**）。
+    > 契约面的方法集被 `application/contract_test.go` **钉死**——
+    > 改它是一次有意的破坏性变更，要走大版本并在发布说明里点名。
+    > 这不是「不许演进」，是把演进从「顺手加个方法」变成「一次显式决定」。
 
 ## 开发
 

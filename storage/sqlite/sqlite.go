@@ -63,6 +63,13 @@ type (
 
 var _ store.Store = (*Store)(nil)
 
+// var _ store.AtomLooseSearcher 编译期钉住「本后端实现了宽松词面检索」。
+//
+// 它是**可选能力**（不在 store.Store 里，故不实现也不会打红仓外的适配层），
+// 但**内置后端必须实现**：parity 的宽松路断言依赖它，
+// 缺了就该响亮失败而不是跳过断言。
+var _ store.AtomLooseSearcher = (*Store)(nil)
+
 // var _ ports.VectorIndex 编译期钉住「本后端直接实现向量索引端口」。
 //
 // 刻意**不写适配层**：存储层直接实现那个端口，装配面按类型断言取用，
