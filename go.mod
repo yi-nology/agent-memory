@@ -40,7 +40,7 @@ require (
 	github.com/lib/pq v1.10.9
 	github.com/oagentkit/guardx v0.8.2
 	github.com/oagentkit/textx v0.6.1
-	github.com/oekit/pkg v0.18.0
+	github.com/oekit/pkg v0.23.1
 	modernc.org/sqlite v1.40.1
 )
 

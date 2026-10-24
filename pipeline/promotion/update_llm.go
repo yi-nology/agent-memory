@@ -2,10 +2,11 @@ package promotion
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/oekit/pkg/jsonrepair"
 
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/types"
@@ -97,17 +98,17 @@ func UpdatePrompt(oldAssertion, newAssertion string) string {
 // 但「模型调用失败」（网络/超时）是另一回事 → 上抛。
 func classifyUpdate(out string) (relation, string, error) {
 	s := strings.TrimSpace(out)
-	s = stripFence(s)
-	if i := strings.Index(s, "{"); i >= 0 {
-		if j := strings.LastIndex(s, "}"); j > i {
-			s = s[i : j+1]
-		}
-	}
+	// 解析走 oekit/pkg/jsonrepair：围栏剥离 → 直解 → 语法级修复（尾逗号 /
+	// 全角冒号 / 未闭合括号）→ 散文里抽对象只有一份实现。
+	//
+	// 此前是手搓的「剥围栏 + 取首个 { 到末个 } + json.Unmarshal」：模型输出
+	// 里多一句散文、多个尾逗号、全角冒号就整段作废——而失败按上面的约定
+	// 会变成「全送人工」，于是人审队列被格式噪声灌满，却没人看得出真问题在哪。
 	var obj struct {
 		Relation string `json:"relation"`
 		Reason   string `json:"reason"`
 	}
-	if err := json.Unmarshal([]byte(s), &obj); err != nil {
+	if err := jsonrepair.Unmarshal(s, &obj); err != nil {
 		return relationConflict, "", fmt.Errorf("判定结果解析失败: %w", err)
 	}
 	switch relation(strings.ToLower(strings.TrimSpace(obj.Relation))) {
@@ -124,25 +125,6 @@ func classifyUpdate(out string) (relation, string, error) {
 	default:
 		return relationConflict, obj.Reason, nil
 	}
-}
-
-// stripFence 剥掉模型输出可能带的 ``` 围栏。
-//
-// 被要求输出 JSON 时，模型经常连着围栏一起给；
-// 不剥的后果是**每次判定都失败**，而失败按上面的约定会变成「全送人工」——
-// 于是人审队列被格式噪声灌满，而没人看得出真问题在哪。
-func stripFence(s string) string {
-	if !strings.HasPrefix(s, "```") {
-		return s
-	}
-	s = strings.TrimPrefix(s, "```")
-	if i := strings.Index(s, "\n"); i >= 0 {
-		s = s[i+1:]
-	}
-	if i := strings.LastIndex(s, "```"); i >= 0 {
-		s = s[:i]
-	}
-	return strings.TrimSpace(s)
 }
 
 // askModel 调模型问关系。

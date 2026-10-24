@@ -1,13 +1,15 @@
 package recall
 
 import (
-	"sync"
+	"context"
 	"time"
+
+	"github.com/oekit/pkg/cache"
 
 	"github.com/yi-nology/agent-memory/ports"
 )
 
-// cache 召回结果 TTL 缓存。
+// 召回结果 TTL 缓存。
 //
 // # 为什么值得有
 //
@@ -19,85 +21,53 @@ import (
 //
 // Config.CacheTTL = 0 即关闭。理由：缓存引入的是**陈旧面**——记忆刚写进去，
 // 同一问题在 TTL 内仍会拿到旧答案。写入路径要能立刻失效，见 CacheTTL 字段注释。
-type cache struct {
-	ttl time.Duration
-	// now 时钟。刻意注入而不是直接 time.Now()：
-	// 流水线自己有可注入的时钟（p.now），缓存却用真实时间，
-	// 于是「缓存过期」这条行为在测试里不可控——
-	// 而它恰好是召回面最容易出「第二次问同一问题才显现」的那类问题。
-	now func() time.Time
-	mu  sync.Mutex
-	m   map[string]entry
-}
+//
+// # 实现：缓存本体委派 oekit/pkg/cache
+//
+// TTL 判定、过期条目的惰性删除、显式清扫与读命中拷贝都只有一份实现，
+// 不在本包再手写一遍 map+TTL。
+//
+// 本包保留的是**领域判断**：结果副本的逐字段深拷贝（cloneResult）——
+// 那是本仓对 Result 结构的纪律（新增字段必须一并复制），不是通用缓存语义，
+// 换成通用深拷贝会把这个纪律弄丢。
+//
+// 语义与旧的手搓实现逐条对齐：
+//   - TTL 从**写入**时起算，读命中不续期；
+//   - 过期判定与旧实现同口径（now.After(expiresAt)）；
+//   - 读命中返回副本、**写入时也存副本**（调用方改写返回值不污染缓存里那份）；
+//   - 过期条目由读路径惰性删除 + 调用方显式 Purge 清扫——**不起后台协程**
+//     （本仓纪律：不引入宿主看不见的常驻件）。
 
-type entry struct {
-	res       *Result
-	expiresAt time.Time
-}
-
-func newCache(ttl time.Duration, now func() time.Time) *cache {
+// newRecallCache 构造召回缓存。ttl<=0 返回 nil = 缓存关闭（调用点判 nil 即禁用）。
+//
+// now 时钟刻意注入而不是直接 time.Now()：流水线自己有可注入的时钟（p.now），
+// 缓存却用真实时间，于是「缓存过期」这条行为在测试里不可控——
+// 而它恰好是召回面最容易出「第二次问同一问题才显现」的那类问题。
+func newRecallCache(ttl time.Duration, now func() time.Time) *cache.LocalCache[Result] {
 	if ttl <= 0 {
-		return nil // nil 接收者的方法全部安全，这是 Go 的惯用法
+		return nil
 	}
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &cache{ttl: ttl, now: now, m: make(map[string]entry)}
-}
-
-func (c *cache) get(key string) (*Result, bool) {
-	if c == nil {
-		return nil, false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.m[key]
-	if !ok {
-		return nil, false
-	}
-	if c.now().After(e.expiresAt) {
-		delete(c.m, key)
-		return nil, false
-	}
-	hit := cloneResult(e.res)
-	hit.FromCache = true // 命中这件事必须对调用方可见，否则无法观测缓存是否生效
-	return hit, true
-}
-
-func (c *cache) put(key string, res *Result) {
-	if c == nil || res == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.m[key] = entry{res: cloneResult(res), expiresAt: c.now().Add(c.ttl)}
-}
-
-// purge 清过期项。
-//
-// 单独导出是因为**没有它，缓存就是内存泄漏**：每次命中后 put 会覆盖同一个键，
-// 但不同查询会不断新增键，只增不减。规模不大时它只是缓慢增长，
-// 到了「长期运行 + 查询发散」就是真的涨。
-func (c *cache) purge() int {
-	if c == nil {
-		return 0
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := c.now()
-	n := 0
-	for k, e := range c.m {
-		if now.After(e.expiresAt) {
-			delete(c.m, k)
-			n++
-		}
-	}
-	return n
+	return cache.NewLocalCache(cache.LocalConfig[Result]{
+		TTL: ttl,
+		Now: now,
+		// 不起后台清扫协程：过期条目由惰性删除 + 调用方显式 Purge 回收。
+		NoBackgroundSweep: true,
+		// 读命中返回副本（cloneResult 是本仓的逐字段深拷贝纪律）。
+		CloneOnRead: cloneResult,
+	})
 }
 
 // Purge 清过期项。召回层在每次调用前调一次即可，不必再引一个后台 goroutine
 // （本仓的纪律是「不引入宿主看不见的常驻件」）。
-func (p *Pipeline) Purge() int { return p.cache.purge() }
+func (p *Pipeline) Purge() int {
+	if p.cache == nil {
+		return 0
+	}
+	return p.cache.Sweep(context.Background())
+}
 
 // cloneResult 复制一份结果再交出去。
 //

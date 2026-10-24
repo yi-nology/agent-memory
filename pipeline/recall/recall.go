@@ -30,6 +30,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oekit/pkg/cache"
+
 	"github.com/yi-nology/agent-memory/pipeline/query"
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
@@ -342,7 +344,7 @@ type Pipeline struct {
 	loose  store.AtomLooseSearcher
 	est    ports.TokenEstimator
 	bander ports.Bander
-	cache  *cache
+	cache  *cache.LocalCache[Result]
 	now    func() time.Time
 }
 
@@ -394,7 +396,7 @@ func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*
 	}
 	// 缓存用流水线自己的时钟：两处时间不一致时，「缓存过期」这条行为
 	// 就没法在测试里复现。
-	p.cache = newCache(norm.CacheTTL, p.now)
+	p.cache = newRecallCache(norm.CacheTTL, p.now)
 	return p, nil
 }
 
@@ -451,7 +453,10 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 	eff, plan := p.analyze(ctx, req)
 
 	if p.cache != nil {
-		if hit, ok := p.cache.get(p.cacheKey(eff, plan)); ok {
+		if hit, ok, _ := p.cache.GetEx(ctx, p.cacheKey(eff, plan)); ok && hit != nil {
+			// 命中这件事必须对调用方可见，否则无法观测缓存是否生效。
+			// GetEx 返回的是 CloneOnRead 副本，改它不污染缓存里那份。
+			hit.FromCache = true
 			// 缓存命中也要推活跃实体栈：栈是会话状态，不是召回结果的一部分。
 			// 漏掉这一步的症状是「开了缓存之后代词消解变差」，
 			// 而原因藏在缓存那一行里，从结果上看不出来。
@@ -523,7 +528,9 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 	p.observe(res, budget, p.now().Sub(started))
 	p.markDegraded()
 	if p.cache != nil {
-		p.cache.put(p.cacheKey(eff, plan), res)
+		// 写入时也存副本：调用方随后改写 res 不得污染缓存里那份
+		// （旧实现是 put 时手工拷贝一份）。
+		_ = p.cache.Set(ctx, p.cacheKey(eff, plan), cloneResult(res))
 	}
 	return res, nil
 }
