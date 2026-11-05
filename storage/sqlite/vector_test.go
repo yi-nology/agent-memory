@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/yi-nology/agent-memory/ports"
@@ -227,5 +228,29 @@ func TestVectorDimensionMismatchSentinel(t *testing.T) {
 	// 写入侧的同一判据：同一命名空间不许混维度。
 	if err := s.Upsert(context.Background(), "ns", "v2", "", []float32{1, 2}); !errors.Is(err, ports.ErrDimensionMismatch) {
 		t.Fatalf("混维度写入必须判 ports.ErrDimensionMismatch，实得 %v", err)
+	}
+}
+
+// TestCheckVecDimGuidance 拒绝文案带操作指引：换 embedding 模型的标准动作
+// （清该命名空间的 atom_vectors）必须出现在错误文本里——argus 实测整个链路
+// 没有任何提示指向这个动作，宿主只能读源码悟。
+func TestCheckVecDimGuidance(t *testing.T) {
+	s, err := OpenMemory("dim-guide")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+	if err := s.Upsert(ctx, "ns", "v1", "", []float32{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Upsert(ctx, "ns", "v2", "", []float32{1, 2, 3, 4})
+	if !errors.Is(err, ports.ErrDimensionMismatch) {
+		t.Fatalf("哨兵判定不得破坏，实得 %v", err)
+	}
+	for _, want := range []string{"dim=3", "dim=4", "atom_vectors", "派生物"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("指引文案缺 %q：%v", want, err)
+		}
 	}
 }
