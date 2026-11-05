@@ -282,10 +282,11 @@ type VectorSemanticReader struct {
 
 // Search 检索最像的若干条。
 //
-// # 归属过滤不在这一层
+// # 归属过滤在 Index 层（接口契约，见 VectorIndex.Search）
 //
-// 这一层只管「像不像」；归属与时序的过滤在召回链的**取回事实卡**那一步做
-// （那一步是真过滤，在存储层）。代价是本路的取数要过取（见 DefaultSemanticOverFetch）。
+// 本层把 scope 原样透传给索引，由索引在候选池里过滤——索引返回的已经
+// 只剩「同归属 + 全局」。本路的取数要过取（见 DefaultSemanticOverFetch），
+// 但过取**不是**为归属：它补的是失效事实占掉的槽位（索引没有时间维度）。
 func (r VectorSemanticReader) Search(ctx context.Context, namespace, query, scope string,
 	limit int) ([]SemanticHit, error) {
 	if r.Embedder == nil || r.Index == nil {
@@ -300,7 +301,8 @@ func (r VectorSemanticReader) Search(ctx context.Context, namespace, query, scop
 		return nil, err
 	}
 	// 过取只为了补上**失效事实**占掉的槽位（索引里没有时间维度，
-	// 退役事实的向量可能还在）——归属已经在索引里过滤掉了，不该过取。
+	// 退役事实的向量可能还在）。归属过滤在索引层（上面的契约），
+	// 这里不为它过取。
 	over := r.OverFetch
 	if over <= 0 {
 		over = DefaultSemanticOverFetch

@@ -130,8 +130,15 @@ type Judge interface {
 
 // QAMetrics 问答口径的指标。
 type QAMetrics struct {
-	// Cases 参与评分的问答用例数。
+	// Cases 参与评分的问答用例数：**不含** Skipped——与检索口径
+	// （metrics.go）同一条规则，skipped 不进任何分母。全量请加
+	// Cases + Skipped。
 	Cases int
+	// Skipped 被跳过的用例数（无 SupportIDs 标注，无从判充分性）。
+	// 它**不进** Cases，也不进任何比率的分母；列出来是因为
+	// skipped 占比一漂移，同分母下的两次评测就不可比——
+	// 藏起来的数字没法看趋势。
+	Skipped int
 	// Sufficient 上下文充分率：该答所需的事实**都在**上下文里的用例比例。
 	//
 	// 这是**确定性**判据（不依赖模型）：支撑事实缺一条就不足。
@@ -226,6 +233,7 @@ func RunQA(ctx context.Context, ds QADataset, r Retriever, opts QAOptions) (*QAR
 	var (
 		totalTokens int
 		sufficient  int
+		skippedCnt  int
 		answered    int
 		answeredCnt int
 		measured    bool
@@ -291,7 +299,9 @@ func RunQA(ctx context.Context, ds QADataset, r Retriever, opts QAOptions) (*QAR
 			}
 		} else {
 			// 没有支撑标注 → 无从判充分性：跳过这条用例，不进分母。
+			// 计数单列（见 QAMetrics.Skipped）——不进分母 ≠ 不存在。
 			res.Skipped = true
+			skippedCnt++
 		}
 
 		// 答对率：上下文充分 + 配了回答器与判分器才测。
@@ -317,11 +327,18 @@ func RunQA(ctx context.Context, ds QADataset, r Retriever, opts QAOptions) (*QAR
 		perCase = append(perCase, res)
 	}
 
+	// 分母只计**参与评分**的用例（与 metrics.go 检索口径同一条规则：
+	// skipped 不进任何分母）。Skipped 的用例数单列在 QAMetrics.Skipped——
+	// 藏起来的数字没法看趋势，列出来的数字不污染比率。
+	scoredCases := len(ds.Cases) - skippedCnt
 	m := QAMetrics{
-		Cases:            len(ds.Cases),
-		Sufficient:       ratio(sufficient, len(ds.Cases)),
+		Cases:            scoredCases,
+		Skipped:          skippedCnt,
+		Sufficient:       ratio(sufficient, maxInt(scoredCases, 1)),
 		AnsweredMeasured: measured,
-		AvgTokens:        float64(totalTokens) / float64(maxInt(len(ds.Cases), 1)),
+		// token 分母保持**全量**：skipped 的用例也跑了检索（那是真实开销），
+		// 分母少算它就是把每用例平均花销报高了。
+		AvgTokens: float64(totalTokens) / float64(maxInt(len(ds.Cases), 1)),
 	}
 	if measured {
 		m.Answered = float64(answered) / float64(answeredCnt)

@@ -190,3 +190,98 @@ func asConflict(err error, out **entity.ConflictError) bool {
 	}
 	return ok
 }
+
+// flakyStore 在第 N 次 SaveAtom 前注入一次失败——模拟 Merge 中途失败。
+type flakyStore struct {
+	fakeStore
+	failBefore int
+	calls      int
+}
+
+func (f *flakyStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.AtomCard) error {
+	f.calls++
+	if f.calls == f.failBefore {
+		return context.DeadlineExceeded // 中途失败形状
+	}
+	return f.fakeStore.SaveAtom(ctx, ns, a)
+}
+
+// TestMergeIdempotentConvergence 中途失败后重跑同一条 Merge 必须收敛：
+// 已迁的卡不在 from 侧列表里（不会二次搬）；from 的脏计数被退役清 0 抹平。
+// 这是 Merge doc「非原子但可安全重跑」承诺的钉子——宿主的中途失败处置
+// 就是「重跑」，这条不成立 doc 就是假的。
+func TestMergeIdempotentConvergence(t *testing.T) {
+	// 第一轮：3 张卡，第 2 张迁移时失败。
+	f := &flakyStore{fakeStore: *newFake(), failBefore: 2}
+	r, err := entity.New(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	to, err := r.Register(ctx2(), ns, "机器甲", "机器", "", types.DecidedUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, err := r.Register(ctx2(), ns, "机器乙", "机器", "", types.DecidedUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = to
+	var cards []*types.AtomCard
+	for _, id := range []string{"a1", "a2", "a3"} {
+		cards = append(cards, &types.AtomCard{
+			ID: id, EntityID: from.ID, CandidateID: "c" + id, RawEventIDs: []string{"ev" + id},
+			Assertion: "断言" + id, VerbatimQuote: "「断言" + id + "」",
+			QuoteEventID: "ev" + id, Importance: types.ImportanceLow, Confidence: types.ConfidenceHigh,
+			CreatedAt: now(), UpdatedAt: now(),
+		})
+	}
+	f.atoms = cards
+
+	_, err = r.Merge(ctx2(), ns, to.ID, from.ID)
+	if err == nil {
+		t.Fatal("注入的失败应让第一轮 Merge 失败")
+	}
+	// 模拟真实「落库失败」语义：失败的那张（a2）在库里仍是旧值。
+	// （fake 与卡共享指针，Merge 先改入参再落库，失败时对象已被原地改——
+	// 真存储是值语义，库里不会跟着改；这里手工恢复旧值对齐真实形态。）
+	for _, a := range f.atoms {
+		if a.ID == "a2" {
+			a.EntityID = from.ID
+		}
+	}
+	// 此时库是部分迁移态：a1 已迁、a2/a3 还在 from。清掉注入。
+	f.failBefore = -1
+	f.calls = 0
+
+	res, err := r.Merge(ctx2(), ns, to.ID, from.ID)
+	if err != nil {
+		t.Fatalf("重跑应收敛而不是二次失败: %v", err)
+	}
+	if res.MovedAtoms != 2 {
+		t.Fatalf("重跑只应搬剩余的 2 张（不是 3 张——已迁的不重复搬），实得 %d", res.MovedAtoms)
+	}
+	// 全部卡最终都归 to。
+	for _, id := range []string{"a1", "a2", "a3"} {
+		var got *types.AtomCard
+		for _, a := range f.atoms {
+			if a.ID == id {
+				got = a
+			}
+		}
+		if got == nil || got.EntityID != to.ID {
+			t.Fatalf("卡 %s 应已归 to", id)
+		}
+	}
+	// from 退役：计数清 0（中途失败的 Bump 差量被终态抹平）。
+	if f.ents[from.ID].AtomCount != 0 {
+		t.Fatalf("from 退役后计数应为 0（脏差量被终态抹平），实得 %d", f.ents[from.ID].AtomCount)
+	}
+	// 第二次重跑（已收敛态）：幂等空操作。
+	res2, err := r.Merge(ctx2(), ns, to.ID, from.ID)
+	if err != nil {
+		t.Fatalf("收敛后再跑应无错: %v", err)
+	}
+	if res2.MovedAtoms != 0 || res2.MovedAliases != 0 {
+		t.Fatalf("收敛后重跑应是空操作，实得 atoms=%d aliases=%d", res2.MovedAtoms, res2.MovedAliases)
+	}
+}
