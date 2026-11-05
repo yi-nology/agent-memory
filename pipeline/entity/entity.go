@@ -162,6 +162,22 @@ type MergeResult struct {
 // 内核只做机械迁移：事实卡改归属、别名改指向、计数相加、from 退役。
 //
 // 退役而非删除：被并进来的实体曾是真的，删掉它就无从查证「当初为什么分成两个」。
+//
+// # ⚠️ 原子性：多步写、**非原子**，但失败**可安全重跑**（幂等收敛）
+//
+// Store 契约不含事务（entity.Store 是窄接口，事务是存储面能力），故本函数
+// 是多步写：迁卡 → 迁别名 → 双向计数 → from 退役。任一步失败即返回错误，
+// 此时库处于**部分迁移**状态——读取侧看不出（没有「迁移中」标记）。
+//
+// 重跑是安全的，收敛靠两个不变量（TestMergeIdempotentConvergence 钉着）：
+//
+//  1. 每一步迁的都只是「from 侧**当前还剩**的」——已迁走的卡/别名不在
+//     ListAtomsByEntity(from) / ListAliases(from) 的结果里，重跑不会二次搬；
+//  2. from 的计数误差被终态抹平——中途失败的 Bump 差量可能让 from 计数
+//     短暂为脏，但最后一步退役把 from 计数清 0，脏数不复存在。
+//
+// 宿主侧的中途失败处置因此只有一句：**重跑同一条 Merge**。
+// 需要严格原子的宿主应在自己的存储适配层包事务（Store 实现方自行提供）。
 func (r *Resolver) Merge(ctx context.Context, ns store.Namespace, toID, fromID string) (*MergeResult, error) {
 	if toID == fromID {
 		return nil, errors.New("entity: 合并双方不能相同")

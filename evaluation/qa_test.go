@@ -264,3 +264,41 @@ func TestSyntheticQASharesCorpus(t *testing.T) {
 		}
 	}
 }
+
+// TestQASkippedCasesOutOfDenominator skipped 用例不进任何分母（与检索口径
+// metrics.go 同一条规则）：此前 Cases/Sufficient 分母都是全量，skipped 占比
+// 一漂移，同分母的两次评测就不可比——同名字段两套分母的病在这钉住。
+func TestQASkippedCasesOutOfDenominator(t *testing.T) {
+	ds := QADataset{Name: "qa", Cases: []QACase{
+		{ // 参与：有支撑标注。
+			Case:       Case{ID: "c1", Query: "q", Relevant: []string{"a1"}},
+			Question:   "问句",
+			Answer:     "答案",
+			SupportIDs: []string{"a1"},
+		},
+		{ // 跳过：没有支撑标注，无从判充分性。
+			Case:     Case{ID: "c2", Query: "q2", Relevant: []string{"a2"}},
+			Question: "问句二",
+			Answer:   "答案二",
+		},
+	}}
+	r := &qaRetriever{ids: []string{"a1"}}
+	res, err := RunQA(context.Background(), ds, r, QAOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Metrics.Cases != 1 {
+		t.Fatalf("Cases 应只计参与评分的用例（1），实得 %d", res.Metrics.Cases)
+	}
+	if res.Metrics.Skipped != 1 {
+		t.Fatalf("Skipped 应单列（1），实得 %d", res.Metrics.Skipped)
+	}
+	// c1 充分（a1 召回了）⇒ 充分率 1；分母若还是全量 2 就会得 0.5。
+	if res.Metrics.Sufficient != 1 {
+		t.Fatalf("充分率分母应只计参与用例（应为 1），实得 %v", res.Metrics.Sufficient)
+	}
+	// 明细仍是全量：跳过的那条可见（列出来 ≠ 不存在）。
+	if len(res.PerCase) != 2 || !res.PerCase[1].Skipped {
+		t.Fatalf("PerCase 应保留跳过用例的明细: %+v", res.PerCase)
+	}
+}
