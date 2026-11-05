@@ -19,6 +19,11 @@
 // 记在 meta 表的 schema_version 键里，迁移按版本号线性追加。
 package sqlite
 
+import (
+	"fmt"
+	"strings"
+)
+
 // schemaVersion 当前 schema 版本。新增迁移时 +1，并在 migrations 里追加一段。
 //
 // 7 = 事实卡的生效区间与版本号（v4）+ 关系边表（v5）+ 向量索引表（v6）
@@ -136,7 +141,7 @@ CREATE INDEX IF NOT EXISTS raw_events_session ON raw_events (namespace, session_
 CREATE INDEX IF NOT EXISTS raw_events_thread  ON raw_events (namespace, thread_id, ts DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS raw_fts USING fts5(
-  namespace UNINDEXED, event_id UNINDEXED, body, tokenize='unicode61'
+  namespace UNINDEXED, event_id UNINDEXED, body, tokenize='{{FTS_TOKENIZE}}'
 );
 
 -- 提炼候选：可丢弃的中间态。signature 是重复检测的键（见 types.AtomCard.Signature）。
@@ -171,7 +176,7 @@ CREATE INDEX IF NOT EXISTS candidates_status ON candidates (namespace, status, c
 CREATE INDEX IF NOT EXISTS candidates_sig    ON candidates (namespace, signature);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS candidate_fts USING fts5(
-  namespace UNINDEXED, candidate_id UNINDEXED, body, tokenize='unicode61'
+  namespace UNINDEXED, candidate_id UNINDEXED, body, tokenize='{{FTS_TOKENIZE}}'
 );
 
 -- 事实卡：长期记忆的真源。superseded_by 与 deprecated_at 至多其一非空。
@@ -236,7 +241,7 @@ CREATE INDEX IF NOT EXISTS atoms_live        ON atoms (namespace, superseded_by,
 CREATE INDEX IF NOT EXISTS atoms_sig         ON atoms (namespace, signature);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS atom_fts USING fts5(
-  namespace UNINDEXED, atom_id UNINDEXED, body, tokenize='unicode61'
+  namespace UNINDEXED, atom_id UNINDEXED, body, tokenize='{{FTS_TOKENIZE}}'
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -347,3 +352,32 @@ CREATE TABLE IF NOT EXISTS journal (
 CREATE INDEX IF NOT EXISTS journal_at      ON journal (namespace, at DESC);
 CREATE INDEX IF NOT EXISTS journal_subject ON journal (namespace, subject, at DESC);
 `
+
+// DefaultFTSTokenize FTS5 分词器缺省值。
+//
+// unicode61 按 Unicode 空白/标点切词元——**中文连续文本没有空格分界，
+// 整段落成一个词元**，中文宿主的词面召回（FTS）轨实际失效（查询词元与
+// 正文整段词元对不上）。中文内容为主的库应设 trigram（FTS5 内置，CJK
+// 子串匹配有效；代价是索引体积更大、3 字符以下的 query 不命中）。
+const DefaultFTSTokenize = "unicode61"
+
+// ftsTokenizers 是 tokenize 的**白名单**：tokenize 要拼进 DDL，
+// 非白名单值一律拒绝（防注入——它不是参数，是语句的一段）。
+// 需要更多分词器时在此显式追加并写明取舍。
+var ftsTokenizers = map[string]bool{
+	"unicode61": true,
+	"trigram":   true,
+}
+
+// schemaWithTokenize 把 {{FTS_TOKENIZE}} 占位符替换成校验过的分词器。
+// 未知值报错而不是透传：坏值在打开库时就响亮失败，
+// 不留「建出来的虚表分词器不是宿主想要的那一个」这种静默错配。
+func schemaWithTokenize(tokenize string) (string, error) {
+	if tokenize == "" {
+		tokenize = DefaultFTSTokenize
+	}
+	if !ftsTokenizers[tokenize] {
+		return "", fmt.Errorf("sqlite: 不支持的 FTS5 分词器 %q（白名单: unicode61, trigram）", tokenize)
+	}
+	return strings.ReplaceAll(schema, "{{FTS_TOKENIZE}}", tokenize), nil
+}

@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/yi-nology/agent-memory/ports"
@@ -90,6 +91,57 @@ func (s *Service) unindexVector(ctx context.Context, ns store.Namespace, id stri
 		return
 	}
 	_ = s.vecIdx.Delete(ctx, string(ns), id)
+}
+
+// Reindex 给存量事实补算向量（幂等，按事实卡 ID 覆盖写）。
+//
+// # 为什么要有 Go API
+//
+// 向量是**写路径**产生的：晋升成事实时顺手写一条。于是**存量**事实
+// （写路径接上之前入库的）没有向量——语义召回一条都捞不到它们，
+// 症状是「语义轨像是没生效」。补算能力原先只在 CLI 适配层（memory reindex），
+// 宿主想程序化执行（换模型后重建、迁移后补算）只能 shell 调 CLI 或手写循环。
+//
+// # 与 Capture 写路径同源
+//
+// Embedder 与索引都取 Service 自身装配（Deps.Embedder / Deps.VectorIndex），
+// CLI 与宿主共用这一份实现——维度与向量空间**天然一致**，
+// 从根上堵死「CLI 用哈希嵌入、宿主写路径用真 embedding，两种向量混进
+// 同一命名空间」的错配。
+//
+// # 返回
+//
+// 返回补算条数。向量写失败不静默：任一条失败立即带错返回
+// （补算是调用方显式发起的重建动作，需要知道它没跑完），
+// 已写入的不回滚——索引是派生物，重跑即收敛（幂等）。
+// Embedder 未装配 ⇒ ports.ErrNoEmbedder；索引未装配 ⇒ ports.ErrNoIndex。
+// limit <= 0 = 不限量。
+func (s *Service) Reindex(ctx context.Context, ns store.Namespace, limit int) (int, error) {
+	if s.embedder == nil {
+		return 0, ports.ErrNoEmbedder
+	}
+	if s.vecIdx == nil {
+		return 0, ports.ErrNoIndex
+	}
+	atoms, err := s.store.ListAtoms(ctx, ns, store.AtomFilter{Limit: limit})
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, a := range atoms {
+		if a == nil {
+			continue
+		}
+		vec, err := s.embedder.Embed(ctx, a.Assertion)
+		if err != nil {
+			return n, fmt.Errorf("reindex: 向量化失败（id=%s）: %w", a.ID, err)
+		}
+		if err := s.vecIdx.Upsert(ctx, string(ns), a.ID, string(a.Scope), vec); err != nil {
+			return n, fmt.Errorf("reindex: 写向量失败（id=%s）: %w", a.ID, err)
+		}
+		n++
+	}
+	return n, nil
 }
 
 // noteVectorFailure 记一次向量同步失败。

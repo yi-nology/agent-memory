@@ -95,12 +95,52 @@ func newStore(db *sql.DB) *Store {
 	return s
 }
 
+// Option 打开参数。
+//
+// 变参而不改签名：现有调用方（CLI、各宿主）零改动。
+type Option func(*openOpts)
+
+// openOpts Open 的可选项集。
+type openOpts struct {
+	ftsTokenize string
+}
+
+// WithFTSTokenize 指定 FTS5 虚表（raw_fts / candidate_fts / atom_fts）的
+// 分词器，白名单校验（见 schemaWithTokenize）。缺省 DefaultFTSTokenize
+// （unicode61）。
+//
+// # 中文宿主必读
+//
+// unicode61 按 Unicode 空白/标点切词元，**中文连续文本整段落成一个词元**，
+// 词面召回（FTS）轨对中文实际失效。中文内容为主的库用：
+//
+//	sqlite.OpenFile(path, sqlite.WithFTSTokenize("trigram"))
+//
+// trigram 的取舍：CJK 子串匹配有效；索引体积更大；**3 字符以下的 query
+// 不命中**（trigram 至少要 3 个字符才能构成一个词元）。
+//
+// ⚠️ 换分词器**不会**影响已存在的虚表（CREATE VIRTUAL TABLE IF NOT EXISTS
+// 是空操作）。存量库要迁移：停写 → DROP 三张 *_fts 虚表 → 重开库（按新
+// 分词器重建）→ 重灌（raw_events / candidates / atoms 的正文重插或按
+// 各自的回填路径补）——FTS 索引是派生物，真源表不丢。
+func WithFTSTokenize(tokenize string) Option {
+	return func(o *openOpts) { o.ftsTokenize = tokenize }
+}
+
 // Open 按 DSN 打开。
 //
 // 默认参数是本仓能跑起来的最小集：busy_timeout 让并发写等锁而不是立刻报
 // SQLITE_BUSY；foreign_keys 打开（本仓的引用关系靠应用层维护，但打开它能让
 // 「引用了不存在的实体」这种写错在测试里立刻暴露）。
-func Open(dsn string) (*Store, error) {
+func Open(dsn string, opts ...Option) (*Store, error) {
+	var o openOpts
+	for _, fn := range opts {
+		fn(&o)
+	}
+	ddl, err := schemaWithTokenize(o.ftsTokenize)
+	if err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开 sqlite 失败: %w", err)
@@ -113,7 +153,7 @@ func Open(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("打开外键失败: %w", err)
 	}
-	if err := ensureSchema(context.Background(), db); err != nil {
+	if err := ensureSchema(context.Background(), db, ddl); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -121,8 +161,8 @@ func Open(dsn string) (*Store, error) {
 }
 
 // OpenFile 打开磁盘库（父目录须已存在）。
-func OpenFile(path string) (*Store, error) {
-	return Open("file:" + path + "?_pragma=journal_mode(WAL)")
+func OpenFile(path string, opts ...Option) (*Store, error) {
+	return Open("file:"+path+"?_pragma=journal_mode(WAL)", opts...)
 }
 
 // OpenMemory 打开内存库，供测试与临时库使用。
@@ -130,8 +170,8 @@ func OpenFile(path string) (*Store, error) {
 // 用 shared-cache 的具名内存库并**把连接池压到 1**：`:memory:` 的库随连接生灭，
 // 连接池一旦放开就可能拿到一个空库，于是「表不存在」这种错误只在并发下偶发。
 // 压到 1 是把那个偶发变成确定——测试要的是确定。
-func OpenMemory(name string) (*Store, error) {
-	s, err := Open("file:" + name + "?mode=memory&cache=shared")
+func OpenMemory(name string, opts ...Option) (*Store, error) {
+	s, err := Open("file:"+name+"?mode=memory&cache=shared", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -146,8 +186,8 @@ func OpenMemory(name string) (*Store, error) {
 //
 // schema_version 记在全局行（namespace=”）上：它描述的是**库**的形状，
 // 不是某个记忆库的内容，故不按 namespace 分行。
-func ensureSchema(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, schema); err != nil {
+func ensureSchema(ctx context.Context, db *sql.DB, ddl string) error {
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("建表失败: %w", err)
 	}
 	cur, err := schemaVersionOf(ctx, db)

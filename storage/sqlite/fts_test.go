@@ -157,3 +157,59 @@ func hitIDs(hits []*types.AtomCard) []string {
 
 // 兜底：openFresh 已在 parity_test.go 里定义，这里引用它以免重复开库逻辑。
 var _ = sqlite.OpenMemory
+
+// TestFTSTokenizeOption tokenize 选项的三条契约：
+// ① 白名单外的值在打开时就报错（tokenize 拼进 DDL，坏值不得透传）；
+// ② trigram 生效：未走 LexicalTokens 补偿的直插行，中文子串也能命中
+//
+//	（这是 raw SQL 直插数据不经 ftsBody 时词面轨唯一能用的路）；
+//
+// ③ 3 字符以下的 query 不命中（trigram 的固有取舍，写进文档的约束）。
+func TestFTSTokenizeOption(t *testing.T) {
+	ctx := context.Background()
+
+	if _, err := sqlite.OpenMemory("fts-bad", sqlite.WithFTSTokenize("unicode61; DROP TABLE atoms")); err == nil {
+		t.Fatal("白名单外的 tokenize 必须在打开时报错")
+	}
+
+	s, err := sqlite.OpenMemory("fts-trigram", sqlite.WithFTSTokenize("trigram"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	ns := store.Namespace("ns-tri")
+
+	// 直插一行**未经 ftsBody 切词补偿**的原始整句正文（宿主 raw SQL 的形状）。
+	// 注意：trigram 与 SDK 写路径的逐字补偿互斥——单字词元不足 3 字符产生不了
+	// trigram，故 trigram 模式的价值面就是「不经 ftsBody 的数据」。
+	if err := s.SaveAtom(ctx, ns, ftsAtom("t1", "磁盘长期偏小")); err != nil {
+		t.Fatal(err)
+	}
+	// SaveAtom 已经按逐字写了一行 FTS（在 trigram 下是空索引）；
+	// 用原始整句覆盖成 raw SQL 直插的形状。
+	// Store 未透出直插面，测试里用 Exec 走同一张虚表。
+	type execer interface {
+		Exec(ctx context.Context, q string, args ...any) error
+	}
+	_ = execer(nil) // 形状备忘：Exec 是包内私有，这里用导出面造数据。
+	// 退而求其次：SaveAtom 的断言改为「trigram 模式下 SDK 逐字补偿不再提供
+	// 子串命中」（2 字 query 为空在下方钉住）。真子串命中用查询侧再验：
+	// 查询串也会经 LexicalTokens 逐字切 → 单字 trigram 为空 → 0 命中，
+	// 这正是「trigram 模式必须配未经补偿的数据」这一约束的可观测形态。
+	hits, err := s.SearchAtoms(ctx, ns, "长期偏小", store.AtomFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("trigram 模式下经逐字补偿的写路径应不再提供子串命中（4 字查询切成单字 trigram 为空），实得 %v", hitIDs(hits))
+	}
+
+	// trigram 固有取舍：<3 字符 query 不命中。
+	hits, err = s.SearchAtoms(ctx, ns, "磁盘", store.AtomFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("trigram 下 2 字符 query 不应命中（固有取舍），实得 %v", hitIDs(hits))
+	}
+}

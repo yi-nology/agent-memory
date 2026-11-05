@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -643,6 +644,12 @@ func (s *vectorStore) Upsert(ctx context.Context, namespace, id, scope string, v
 //
 // 维度不一致时报 ports.ErrDimensionMismatch 而不是各算各的：
 // 静默「比不出来」的失效形态是「语义召回永远空」，而调用方看不出是维度错了。
+//
+// 拒绝路径**带操作指引**：这个错是**预期防护**而非故障（换 embedding 模型
+// 后必然出现一次），但宿主侧症状（写向量索引失败 + 语义召回全空）看起来
+// 像坏了。文案把「清 atom_vectors」这个标准恢复动作直接给出来——
+// 索引是派生物（事实卡是真源），清了可安全重建；
+// 没有这行指引，宿主只能读源码悟（argus 实测踩过）。
 func (s *vectorStore) checkVecDim(ctx context.Context, namespace string, dim int) error {
 	rows, err := s.query(ctx, `SELECT DISTINCT dim FROM atom_vectors WHERE namespace = ?`, namespace)
 	if err != nil {
@@ -655,7 +662,12 @@ func (s *vectorStore) checkVecDim(ctx context.Context, namespace string, dim int
 			return err
 		}
 		if d != dim {
-			return ports.ErrDimensionMismatch
+			return fmt.Errorf("%w：命名空间 %q 已存在 dim=%d 的向量，与本次 dim=%d 不一致。"+
+				"这是预期防护（同命名空间混两种维度没法比余弦），不是故障。"+
+				"换 embedding 模型的标准动作：确认旧向量不再需要后，"+
+				"清空该命名空间的向量索引（DELETE FROM atom_vectors WHERE namespace = '%s'；"+
+				"索引是派生物、事实卡是真源，可安全重建），再用新模型重建向量",
+				ports.ErrDimensionMismatch, namespace, d, dim, namespace)
 		}
 	}
 	return rows.Err()

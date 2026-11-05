@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -325,4 +326,96 @@ func TestVectorTrackIsOptional(t *testing.T) {
 		}
 	}
 	_ = store.Namespace("")
+}
+
+// TestReindexRebuildsVectorsForStockAtoms 存量事实补算的端到端：
+// 直接入库的事实（不经晋升 → 没进向量索引）经 Reindex 补上，
+// 且幂等（跑第二遍结果一致）。
+func TestReindexRebuildsVectorsForStockAtoms(t *testing.T) {
+	ctx := context.Background()
+	s := openFresh(t)
+	ix := ports.NewMemIndex()
+	svc, err := application.New(
+		application.Config{Namespace: ns, Host: "it"},
+		application.Deps{
+			Store: s, Redactor: ports.PatternRedactor{}, Bander: ports.MemoryBand{},
+			Embedder: synonymEmbedder{}, VectorIndex: ix,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 存量事实：直接入库（写路径没接上之前的那批 → 索引里没有它）。
+	card := &types.AtomCard{
+		ID: "atom-stock", EntityID: "e1", CandidateID: "c1", RawEventIDs: []string{"ev1"},
+		Assertion: "机器甲的存储空间不足", VerbatimQuote: "「机器甲的存储空间不足」",
+		QuoteEventID: "ev1", Importance: types.ImportanceLow, Confidence: types.ConfidenceHigh,
+		CreatedAt: time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC),
+	}
+	if err := s.SaveAtom(ctx, ns, card); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := ix.Search(ctx, string(ns), "", []float32{1, 0, 0}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("入库时索引应为空，实得 %d 条", len(hits))
+	}
+
+	// 补算 → 计数 1 → 索引里有它。
+	n, err := svc.Reindex(ctx, ns, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("应补算 1 条，实得 %d", n)
+	}
+	hits, err = ix.Search(ctx, string(ns), "", []float32{1, 0, 0}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].ID != "atom-stock" {
+		t.Fatalf("补算后应命中 atom-stock，实得 %+v", hits)
+	}
+
+	// 幂等：再跑一遍，计数与索引形态不变。
+	n, err = svc.Reindex(ctx, ns, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("第二遍也应补算 1 条（覆盖写），实得 %d", n)
+	}
+}
+
+// TestReindexRequiresEmbedderAndIndex 未装配向量面时 Reindex 显式失败：
+// 缺 Embedder → ErrNoEmbedder；缺索引 → ErrNoIndex。
+func TestReindexRequiresEmbedderAndIndex(t *testing.T) {
+	ctx := context.Background()
+
+	mk := func(embedder ports.Embedder, ix ports.VectorIndex) *application.Service {
+		t.Helper()
+		s := openFresh(t)
+		svc, err := application.New(
+			application.Config{Namespace: ns, Host: "it"},
+			application.Deps{
+				Store: s, Redactor: ports.PatternRedactor{}, Bander: ports.MemoryBand{},
+				Embedder: embedder, VectorIndex: ix,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return svc
+	}
+
+	if _, err := mk(nil, ports.NewMemIndex()).Reindex(ctx, ns, 0); !errors.Is(err, ports.ErrNoEmbedder) {
+		t.Fatalf("缺 Embedder 应报 ErrNoEmbedder，实得 %v", err)
+	}
+	// 「缺索引」分支在 sqlite 后端测不出来：New 会对 nil VectorIndex 自动
+	// 类型断言存储自身（sqlite.Store 实现 ports.VectorIndex）。该分支由
+	// 使用无索引后端的宿主命中，属装配面契约，此处不强造后端。
 }
