@@ -110,11 +110,16 @@ func (s *pageStore) GetEntityPage(ctx context.Context, ns store.Namespace, entit
 // ListDirtyEntityPages 列出该视角下的脏页面。
 //
 // scope 是精确视角：全局视角（空）只列全局那一页，不列各归属的页面。
+//
+// 排序带**全序兜底键**（updated_at ASC, entity_id ASC, scope ASC），与 SQLite
+// 侧逐字一致：本查询带 LIMIT 且被重算循环消费，同一时刻标脏的页面并列时
+// 没有兜底键的话，每轮选到的「前 N 个脏页」不确定 ⇒ 一部分脏页长时间
+// 轮不到（饿死），而 dirty 标志看起来一切正常。
 func (s *pageStore) ListDirtyEntityPages(ctx context.Context, ns store.Namespace, scope types.Scope,
 	limit int) ([]*types.EntityPage, error) {
 	rows, err := s.query(ctx,
 		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = $1 AND scope = $2 AND dirty
-		 ORDER BY updated_at ASC LIMIT $3`, nsOf(ns), string(scope), limitOf(limit, 50))
+		 ORDER BY updated_at ASC, entity_id ASC, scope ASC LIMIT $3`, nsOf(ns), string(scope), limitOf(limit, 50))
 	if err != nil {
 		return nil, err
 	}

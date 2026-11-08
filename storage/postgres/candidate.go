@@ -128,7 +128,12 @@ func (s *candidateStore) ListCandidates(ctx context.Context, ns store.Namespace,
 		args = append(args, f.Session)
 	}
 	q := `SELECT ` + candidateCols + ` FROM candidates WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY created_at DESC LIMIT $` + fmt.Sprint(len(args)+1)
+		// 末尾的 id DESC 是**并列时的全序兜底键**，与 SQLite 侧逐字一致
+		// （storage/sqlite/candidate.go 同处的注释）：只按 created_at 排的话，
+		// 同一时刻建的候选先后不定 ⇒ 带 LIMIT 的两次查询可返回不同的前 N 条
+		// （翻页重行/漏行），导出的包也逐次不同。导入/迁移路径用固定 base
+		// 时间戳写行时全部并列，这条兜底不是理论需求。
+		` ORDER BY created_at DESC, id DESC LIMIT $` + fmt.Sprint(len(args)+1)
 	args = append(args, limitOf(f.Limit, 50))
 
 	rows, err := s.query(ctx, q, args...)
