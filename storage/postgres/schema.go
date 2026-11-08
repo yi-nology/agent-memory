@@ -334,24 +334,67 @@ CREATE TABLE IF NOT EXISTS meta (
 //
 // schema_version 记在全局行（namespace=”）上：它描述的是**库**的形状，
 // 不是某个记忆库的内容，故不按 namespace 分行。
+//
+// # 为什么整段在一个事务里，且先拿 pg_advisory_xact_lock
+//
+// 多个进程并发 Open 同一份库是**设计内场景**（服务 + CLI 工具）。
+// 之前的实现逐条 autocommit：两个进程同时读到 schema_version=旧值，
+// 各自跑迁移——migrateV3 的「删旧主键再加新主键」不是 IF NOT EXISTS 形态，
+// 后到者会撞「constraint does not exist」→ Open 失败启动不了；
+// schema_version 的读-比-写同样无防护（双写同一版本）。
+// 处置是两层：
+//
+//   - **pg_advisory_xact_lock**（事务级咨询锁）：并发开库在锁上串行，
+//     后到者拿到锁后才读版本——读到先到者已提交的新版本，迁移整段跳过；
+//     事务结束（含回滚、连接断开）自动释放，无需手工解锁，
+//     进程崩溃也不会把锁永远留在库上。
+//   - **单事务**：建表、迁移、版本写同生共死，中途失败不留半迁移形状
+//     （PG 的 DDL 事务性让这成为可能）。
+//
+// 全部语句跑在**单条连接**（conn.BeginTx）上：事务与锁都是会话/事务级形态，
+// 连接池一换连接就散了。
 func ensureSchema(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("建表失败: %w", err)
-	}
-	cur, err := schemaVersionOf(ctx, db)
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("取 schema 初始化连接失败: %w", err)
 	}
-	for _, m := range migrations {
-		if m.version <= cur {
-			continue
+	defer func() { _ = conn.Close() }()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开 schema 初始化事务失败: %w", err)
+	}
+	if err := func() error {
+		// 锁必须在任何 schema 读之前拿：锁等的是「别的进程正在做的初始化」，
+		// 等到之后的所有读（schema_version、主键形状）才能看到它的结果。
+		if _, err := tx.ExecContext(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext('agent-memory-schema'))`); err != nil {
+			return fmt.Errorf("取 schema 初始化锁失败: %w", err)
 		}
-		if err := m.apply(ctx, db); err != nil {
-			return fmt.Errorf("迁移到 schema v%d 失败: %w", m.version, err)
+		if _, err := tx.ExecContext(ctx, schema); err != nil {
+			return fmt.Errorf("建表失败: %w", err)
 		}
-		if err := setSchemaVersion(ctx, db, m.version); err != nil {
+		cur, err := schemaVersionOf(ctx, tx)
+		if err != nil {
 			return err
 		}
+		for _, m := range migrations {
+			if m.version <= cur {
+				continue
+			}
+			if err := m.apply(ctx, tx); err != nil {
+				return fmt.Errorf("迁移到 schema v%d 失败: %w", m.version, err)
+			}
+			if err := setSchemaVersion(ctx, tx, m.version); err != nil {
+				return err
+			}
+		}
+		return setSchemaVersion(ctx, tx, schemaVersion)
+	}(); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
-	return setSchemaVersion(ctx, db, schemaVersion)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交 schema 初始化事务失败: %w", err)
+	}
+	return nil
 }

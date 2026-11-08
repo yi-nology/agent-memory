@@ -52,22 +52,33 @@ func (s *candidateStore) SaveCandidate(ctx context.Context, ns store.Namespace, 
 	if err := c.Valid(); err != nil {
 		return err
 	}
-	if _, err := s.exec(ctx, `INSERT INTO candidates
-		(namespace, id, raw_event_ids, candidate_type, status, title, assertion,
-		 verbatim_quote, quote_event_id, subject_name, subject_entity_type, target_entity_id,
-		 confidence, importance, recommended_action, promotion_reason, extractor_version,
-		 session_id, scope, created_at, decided_at, decided_by, payload, signature)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		nsOf(ns), c.ID, stringsJSON(c.RawEventIDs), string(c.Type), string(c.Status), c.Title,
-		c.Assertion, c.VerbatimQuote, c.QuoteEventID, c.SubjectName, string(c.SubjectEntityType),
-		c.TargetEntityID, string(c.Confidence), string(c.Importance), string(c.RecommendedAction),
-		c.PromotionReason, c.ExtractorVersion, c.SessionID, string(c.Scope), ts(c.CreatedAt),
-		tsPtr(c.DecidedAt), string(c.DecidedBy), mapJSON(c.Payload), candidateSignature(c),
-	); err != nil {
-		return err
-	}
-	return s.indexUpsert(ctx, "candidate_fts", nsOf(ns), c.ID,
-		ftsBody(c.Title, c.Assertion, c.SubjectName))
+	// 行 + FTS 索引必须**同一个事务**落库（理由见 atom.go 的 SaveAtom 同处注释）。
+	return s.Transaction(ctx, func(ctx context.Context, tx store.Store) error {
+		tsStore, ok := tx.(*Store)
+		if !ok {
+			return fmt.Errorf("事务内拿到的不是本后端实现，候选无法落库: %T", tx)
+		}
+		if _, err := tsStore.exec(ctx, `INSERT INTO candidates
+			(namespace, id, raw_event_ids, candidate_type, status, title, assertion,
+			 verbatim_quote, quote_event_id, subject_name, subject_entity_type, target_entity_id,
+			 confidence, importance, recommended_action, promotion_reason, extractor_version,
+			 session_id, scope, created_at, decided_at, decided_by, payload, signature)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			nsOf(ns), c.ID, stringsJSON(c.RawEventIDs), string(c.Type), string(c.Status), c.Title,
+			c.Assertion, c.VerbatimQuote, c.QuoteEventID, c.SubjectName, string(c.SubjectEntityType),
+			c.TargetEntityID, string(c.Confidence), string(c.Importance), string(c.RecommendedAction),
+			c.PromotionReason, c.ExtractorVersion, c.SessionID, string(c.Scope), ts(c.CreatedAt),
+			tsPtr(c.DecidedAt), string(c.DecidedBy), mapJSON(c.Payload), candidateSignature(c),
+		); err != nil {
+			return err
+		}
+		return tsStore.indexUpsert(ctx, "candidate_fts", nsOf(ns), c.ID, candidateFTSBody(c))
+	})
+}
+
+// candidateFTSBody 候选的 FTS 索引正文（写路与重建路共用，理由见 atomFTSBody）。
+func candidateFTSBody(c *types.Candidate) string {
+	return ftsBody(c.Title, c.Assertion, c.SubjectName)
 }
 
 func (s *candidateStore) GetCandidate(ctx context.Context, ns store.Namespace, id string) (*types.Candidate, error) {

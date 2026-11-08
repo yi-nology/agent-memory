@@ -101,3 +101,40 @@ func LooseSearcher(v any) (AtomLooseSearcher, bool) {
 	ls, ok := v.(AtomLooseSearcher)
 	return ls, ok
 }
+
+// FTSIndexRebuilder 词面索引重建（backfill）能力。
+//
+// # 它是什么
+//
+// 词面索引（SQLite 后端的 FTS 虚表）是**派生物**：真源是 raw_events /
+// candidates / atoms 三张表。行与索引在同一个事务里落库
+// （见 storage/sqlite 各 Save 的实现），但历史存量可能已经失配——
+// 事务化修复之前写下的行（行在而索引不在 ⇒ 永久静默漏命中）、
+// 或拷贝/手工动过的库留下的幽灵索引行（搜得到但取不到）。
+// RebuildFTSIndex 从真源**全量重建**，两种失配形态一次修平。
+//
+// # 为什么是可选能力
+//
+// 只有「索引与行分两处存」的后端才可能有失配：PG 的词元向量与正文
+// 同一行落库，没有独立索引可失配，故不实现这一面——缺了不算实现不全。
+//
+// # 消费方式
+//
+// 运行时探测（FTSRebuilder），没有该能力就明确报「后端不支持」，
+// 不许静默假装重建成功。它是**维护动作**（全量扫真源表，库大时是重操作），
+// 走 CLI 的 rebuild-fts 或宿主自己的库管理口，不挂在召回热路径上。
+type FTSIndexRebuilder interface {
+	// RebuildFTSIndex 从真源表全量重建词面索引，返回重建的索引条数。
+	//
+	// 整段必须在一个事务里：重建中途失败不得留下半新半旧的索引。
+	RebuildFTSIndex(ctx context.Context) (int64, error)
+}
+
+// FTSRebuilder 探测一个实现有没有词面索引重建能力（语义同 LooseSearcher）。
+//
+// 返回 ok=false 时调用方**必须**走「后端不支持」的明确报错，
+// 不许当它不存在地继续。
+func FTSRebuilder(v any) (FTSIndexRebuilder, bool) {
+	rb, ok := v.(FTSIndexRebuilder)
+	return rb, ok
+}

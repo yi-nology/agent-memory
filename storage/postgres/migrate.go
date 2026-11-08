@@ -33,7 +33,7 @@ type migration struct {
 	// version 迁移完成后的 schema 版本号。
 	version int
 	// apply 执行迁移。必须幂等。
-	apply func(ctx context.Context, db *sql.DB) error
+	apply func(ctx context.Context, q querier) error
 }
 
 // migrations 按版本号线性追加。
@@ -72,19 +72,19 @@ var migrations = []migration{
 // 建表脚本每次打开都跑，而旧库的表还没有 kind 列——脚本里那句
 // `CREATE INDEX ... ON atoms (namespace, kind, occurred_at)` 会当场失败，
 // 整个库都打不开了。故索引在这一段里建（IF NOT EXISTS，重复跑安全）。
-func migrateV7AtomKind(ctx context.Context, db *sql.DB) error {
+func migrateV7AtomKind(ctx context.Context, q querier) error {
 	// DEFAULT '' 是必须的：老库里已有的行也得有值。
 	//
 	// 默认值取空串（= 默认 = 长期经验）而不是 'event'：
 	// 零值必须落在**不淘汰**的那一侧——既有事实卡没有这个维度，
 	// 升级不该让它们开始被淘汰（见 types.FactKind 的说明）。
-	if _, err := db.ExecContext(ctx,
+	if _, err := q.ExecContext(ctx,
 		`ALTER TABLE atoms ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT ''`); err != nil {
 		return fmt.Errorf("加事实卡时效类别列失败: %w", err)
 	}
 	// 索引（namespace, kind, occurred_at）：事件窗口的判据是
 	// 「类别是事件 且 发生时刻在窗口内」，两列都在索引的前缀里。
-	if _, err := db.ExecContext(ctx,
+	if _, err := q.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS atoms_kind ON atoms (namespace, kind, occurred_at)`); err != nil {
 		return fmt.Errorf("建事实卡类别索引失败: %w", err)
 	}
@@ -118,13 +118,13 @@ func migrateV7AtomKind(ctx context.Context, db *sql.DB) error {
 // 生效判据是 COALESCE(...) 的**表达式**（显式生效点，没有就退回发生时刻），
 // 普通索引吃不上；而过滤前先按 (namespace, entity_id) / (namespace, scope)
 // 收窄候选集，那两个索引已经在了。
-func migrateV4AtomTemporal(ctx context.Context, db *sql.DB) error {
+func migrateV4AtomTemporal(ctx context.Context, q querier) error {
 	for _, stmt := range []string{
 		`ALTER TABLE atoms ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ`,
 		`ALTER TABLE atoms ADD COLUMN IF NOT EXISTS valid_to TIMESTAMPTZ`,
 		`ALTER TABLE atoms ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1`,
 	} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("加事实卡生效区间列失败（%s）: %w", stmt, err)
 		}
 	}
@@ -145,8 +145,8 @@ func migrateV4AtomTemporal(ctx context.Context, db *sql.DB) error {
 // DDL 与索引都用 IF NOT EXISTS（DDL 与建表脚本共用同一份，见 schema.go）：
 // 同一段迁移可能被跑第二遍（版本号被手工改过、被老版本覆盖过、
 // 库从别处拷来），而迁移跑第二遍而失败的话**库就打不开了**。
-func migrateV5EntityEdges(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, entityEdgesDDL); err != nil {
+func migrateV5EntityEdges(ctx context.Context, q querier) error {
+	if _, err := q.ExecContext(ctx, entityEdgesDDL); err != nil {
 		return fmt.Errorf("建关系边表失败: %w", err)
 	}
 	return nil
@@ -166,11 +166,11 @@ func migrateV5EntityEdges(ctx context.Context, db *sql.DB) error {
 // 版本号那一行可能被手工改过、被老版本覆盖过，或者库是从别处拷来的，
 // 于是同一段迁移可能被跑第二遍——而迁移跑第二遍而失败的话
 // **库就打不开了**，而那正是「升级一下记忆库」这种日常操作最不该出的事。
-func migrateV6AtomVectors(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, atomVectorsDDL); err != nil {
+func migrateV6AtomVectors(ctx context.Context, q querier) error {
+	if _, err := q.ExecContext(ctx, atomVectorsDDL); err != nil {
 		return fmt.Errorf("建向量索引表失败: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, atomVectorsIndexDDL); err != nil {
+	if _, err := q.ExecContext(ctx, atomVectorsIndexDDL); err != nil {
 		return fmt.Errorf("建向量归属索引失败: %w", err)
 	}
 	return nil
@@ -182,10 +182,10 @@ func migrateV6AtomVectors(ctx context.Context, db *sql.DB) error {
 // 事件是来路、候选是中途站、事实卡是归宿。
 //
 // 幂等做法：ADD COLUMN IF NOT EXISTS + CREATE INDEX IF NOT EXISTS。
-func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
+func migrateV2AtomScope(ctx context.Context, q querier) error {
 	for _, t := range []string{"atoms", "raw_events", "candidates"} {
 		// DEFAULT '' 是必须的：老库里已有的行也得有值。
-		if _, err := db.ExecContext(ctx,
+		if _, err := q.ExecContext(ctx,
 			`ALTER TABLE `+t+` ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("加 %s.scope 列失败: %w", t, err)
 		}
@@ -196,7 +196,7 @@ func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS atoms_scope ON atoms (namespace, scope)`,
 		`CREATE INDEX IF NOT EXISTS raw_events_scope ON raw_events (namespace, scope)`,
 	} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("建归属索引失败（%s）: %w", stmt, err)
 		}
 	}
@@ -223,24 +223,21 @@ func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
 // 同一段迁移可能被跑第二遍（版本号被手工改过、被老版本覆盖过、
 // 库从别处拷来）。判据是「当前主键的列里有没有 scope」：
 // 有 → 已经扩过了，什么都不做。
-func migrateV3EntityPageScope(ctx context.Context, db *sql.DB) error {
-	// 迁移在事务里跑：PG 的 DDL 是事务性的，中途失败整段回滚。
-	// 半改的表（列加了、主键没换）正是「库打不开」的形状。
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("开迁移事务失败: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+func migrateV3EntityPageScope(ctx context.Context, q querier) error {
+	// ensureSchema 已把整段初始化（建表 + 迁移 + 记版本）包在**一个事务**里
+	// （见 schema.go 的 ensureSchema 注释）：PG 的 DDL 是事务性的，中途失败
+	// 整段回滚，半改的表（列加了、主键没换）不会出现。本段直接在那个事务里
+	// 跑，不再自己开事务。
 
 	// 步骤一：加列。DEFAULT '' 是必须的——老库里已有的行也得有值，
 	// 而那些行是全局视角的页面（scope 为空）。
-	if _, err := tx.ExecContext(ctx,
+	if _, err := q.ExecContext(ctx,
 		`ALTER TABLE entity_pages ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT ''`); err != nil {
 		return fmt.Errorf("加 entity_pages.scope 列失败: %w", err)
 	}
 
 	// 步骤二：主键从 (namespace, entity_id) 扩成 (namespace, entity_id, scope)。
-	pkName, pkCols, err := primaryKeyOf(ctx, tx, "entity_pages")
+	pkName, pkCols, err := primaryKeyOf(ctx, q, "entity_pages")
 	if err != nil {
 		return err
 	}
@@ -248,11 +245,11 @@ func migrateV3EntityPageScope(ctx context.Context, db *sql.DB) error {
 	case pkName == "":
 		// 表上没有主键：老脚本建表时一定带主键，故这是异常形状。
 		// 补一个三列的；名字撞了就换一个（撞名会让 ADD CONSTRAINT 失败）。
-		name, err := freeConstraintName(ctx, tx, "entity_pages", "entity_pages_pkey")
+		name, err := freeConstraintName(ctx, q, "entity_pages", "entity_pages_pkey")
 		if err != nil {
 			return err
 		}
-		if err := addScopePrimaryKey(ctx, tx, name); err != nil {
+		if err := addScopePrimaryKey(ctx, q, name); err != nil {
 			return err
 		}
 	case containsColumn(pkCols, "scope"):
@@ -261,25 +258,25 @@ func migrateV3EntityPageScope(ctx context.Context, db *sql.DB) error {
 	default:
 		// 旧主键删掉再加新的。删的是刚查出来的名字（不写死），
 		// 加回去也用同一个名字：形状与新建的库一致。
-		if _, err := tx.ExecContext(ctx,
+		if _, err := q.ExecContext(ctx,
 			`ALTER TABLE entity_pages DROP CONSTRAINT `+quoteIdent(pkName)); err != nil {
 			return fmt.Errorf("删 entity_pages 旧主键失败: %w", err)
 		}
-		if err := addScopePrimaryKey(ctx, tx, pkName); err != nil {
+		if err := addScopePrimaryKey(ctx, q, pkName); err != nil {
 			return err
 		}
 	}
 
 	// 步骤三：索引归迁移管。建表脚本每次打开都跑，而老库的表
 	// 在跑完这段迁移之前还没有 scope 列——脚本里带 scope 的索引会当场失败。
-	if _, err := tx.ExecContext(ctx,
+	if _, err := q.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS pages_scope_dirty ON entity_pages (namespace, scope, dirty)`); err != nil {
 		return fmt.Errorf("建页面归属索引失败: %w", err)
 	}
-	return tx.Commit()
+	return nil
 }
 
-// querier 能查库的最小面：*sql.DB 与 *sql.Tx 都满足它。
+// querier 能查库的最小面：*sql.DB、*sql.Tx 与 *sql.Conn 都满足它。
 //
 // 用它而不是直接收 *sql.Tx，是为了让迁移逻辑与用例能共用同一段
 // 「查主键形状」的代码——两处各写一份目录查询，那两份迟早漂移。
@@ -389,9 +386,9 @@ func quoteIdent(s string) string {
 //
 // 版本号**读不出来**（不是数字）时同样当 0：宁可多跑一遍幂等迁移，
 // 也不要因为一个脏值就跳过迁移——跳过迁移的代价是「新代码按新形状读旧库」。
-func schemaVersionOf(ctx context.Context, db *sql.DB) (int, error) {
+func schemaVersionOf(ctx context.Context, q querier) (int, error) {
 	var v string
-	err := db.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT value FROM meta WHERE namespace = '' AND key = 'schema_version'`).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
@@ -407,8 +404,8 @@ func schemaVersionOf(ctx context.Context, db *sql.DB) (int, error) {
 }
 
 // setSchemaVersion 写库形状版本号。
-func setSchemaVersion(ctx context.Context, db *sql.DB, v int) error {
-	if _, err := db.ExecContext(ctx,
+func setSchemaVersion(ctx context.Context, q querier, v int) error {
+	if _, err := q.ExecContext(ctx,
 		`INSERT INTO meta (namespace, key, value) VALUES ('', 'schema_version', $1)
 		 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value`,
 		strconv.Itoa(v)); err != nil {
