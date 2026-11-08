@@ -269,6 +269,10 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 		return cmdExpire(ctx, opt, stdout, stderr, time.Duration(*eventDays)*24*time.Hour)
 	case "vacuum":
 		return cmdVacuum(ctx, opt, stdout, stderr)
+	case "rebuild-fts":
+		// 词面索引重建：行与索引历史失配的存量库，唯一能一次修平的路
+		//（「明明记过却搜不到」的修复口）。
+		return cmdRebuildFTS(ctx, opt, stdout, stderr)
 	case "entity":
 		switch sub {
 		case "list":
@@ -316,6 +320,7 @@ func usage(w io.Writer) {
   memory retention                       退役证据全来自运行期错误的事实
   memory expire [--days N]                按龄退役事件类事实（缺省 30 天）
   memory vacuum                          物理整理（后端专属）
+  memory rebuild-fts                     重建词面索引（后端专属；行在而搜不到时用）
   memory entity list [--limit N]         列出实体
   memory entity merge --to ID --from ID  合并两个实体
   memory entity alias --entity ID --alias A [--entity-type T]

@@ -195,6 +195,12 @@ type AtomStore interface {
 	// 故卡上带着非空向量时**必须报错**——
 	// 静默丢掉的话，宿主的症状是「相似度检索永远空」，
 	// 而它与「存错了地方」毫无相似之处。
+	//
+	// **退役态只许单向置位**：卡一旦退役（SupersededBy 非空或 DeprecatedAt
+	// 已设），后续 SaveAtom——包括拿退役**前**读视图回写的陈旧写者——
+	// 不得把 SupersededBy / DeprecatedAt / ValidTo 改回活跃形态；
+	// 取代链一经写下也不得被后到的取代者改写。改归属（实体合并）等
+	// 其余字段的更新不受影响。
 	SaveAtom(ctx context.Context, ns Namespace, a *types.AtomCard) error
 	GetAtom(ctx context.Context, ns Namespace, id string) (*types.AtomCard, error)
 	ListAtoms(ctx context.Context, ns Namespace, f AtomFilter) ([]*types.AtomCard, error)

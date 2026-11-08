@@ -35,7 +35,18 @@ type migration struct {
 	// version 迁移完成后的 schema 版本号。
 	version int
 	// apply 执行迁移。必须幂等。
-	apply func(ctx context.Context, db *sql.DB) error
+	apply func(ctx context.Context, q schemaConn) error
+}
+
+// schemaConn schema 初始化能在上面跑的东西：*sql.DB、*sql.Tx 与 *sql.Conn
+// 都满足它。
+//
+// ensureSchema 在**单条连接**上开 BEGIN IMMEDIATE 跑初始化（防多进程并发
+// 开库竞态，见 sqlite.go 的 ensureSchema 注释），故迁移拿到的是 *sql.Conn
+// ——收接口而不是收 *sql.DB，迁移与事务/连接的形状解耦。
+type schemaConn interface {
+	rowQuerier
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
 // migrations 按版本号线性追加。
@@ -64,13 +75,13 @@ var migrations = []migration{
 // 中间那一站没存归属，于是这一组的事实就变成了全局的（**泄漏**）。
 //
 // 幂等做法：先查列在不在，不在才 ALTER；索引用 IF NOT EXISTS。
-func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
+func migrateV2AtomScope(ctx context.Context, q schemaConn) error {
 	for _, t := range []struct{ table, column string }{
 		{"atoms", "scope"},
 		{"raw_events", "scope"},
 		{"candidates", "scope"},
 	} {
-		has, err := hasColumn(ctx, db, t.table, t.column)
+		has, err := hasColumn(ctx, q, t.table, t.column)
 		if err != nil {
 			return err
 		}
@@ -79,7 +90,7 @@ func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
 		}
 		// DEFAULT '' 是必须的：老库里已有的行也得有值，
 		// 而 NOT NULL 没有默认值的加列在有数据的表上会直接失败。
-		if _, err := db.ExecContext(ctx,
+		if _, err := q.ExecContext(ctx,
 			`ALTER TABLE `+t.table+` ADD COLUMN scope TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("加 %s.scope 列失败: %w", t.table, err)
 		}
@@ -89,7 +100,7 @@ func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS atoms_scope ON atoms (namespace, scope)`,
 		`CREATE INDEX IF NOT EXISTS raw_events_scope ON raw_events (namespace, scope)`,
 	} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("建归属索引失败（%s）: %w", stmt, err)
 		}
 	}
@@ -123,13 +134,13 @@ func migrateV2AtomScope(ctx context.Context, db *sql.DB) error {
 // 生效判据是 COALESCE(...) 的**表达式**（显式生效点，没有就退回发生时刻），
 // 普通索引吃不上；而过滤前先按 (namespace, entity_id) / (namespace, scope)
 // 收窄候选集，那两个索引已经在了。
-func migrateV4AtomTemporal(ctx context.Context, db *sql.DB) error {
+func migrateV4AtomTemporal(ctx context.Context, q schemaConn) error {
 	for _, c := range []struct{ column, ddl string }{
 		{"valid_from", `ALTER TABLE atoms ADD COLUMN valid_from INTEGER NOT NULL DEFAULT 0`},
 		{"valid_to", `ALTER TABLE atoms ADD COLUMN valid_to INTEGER`},
 		{"version", `ALTER TABLE atoms ADD COLUMN version INTEGER NOT NULL DEFAULT 1`},
 	} {
-		has, err := hasColumn(ctx, db, "atoms", c.column)
+		has, err := hasColumn(ctx, q, "atoms", c.column)
 		if err != nil {
 			return err
 		}
@@ -138,7 +149,7 @@ func migrateV4AtomTemporal(ctx context.Context, db *sql.DB) error {
 		}
 		// DEFAULT 0 是必须的：老库里已有的行也得有值，
 		// 而 NOT NULL 没有默认值的加列在有数据的表上会直接失败。
-		if _, err := db.ExecContext(ctx, c.ddl); err != nil {
+		if _, err := q.ExecContext(ctx, c.ddl); err != nil {
 			return fmt.Errorf("加 atoms.%s 列失败: %w", c.column, err)
 		}
 	}
@@ -159,8 +170,8 @@ func migrateV4AtomTemporal(ctx context.Context, db *sql.DB) error {
 // DDL 与索引都用 IF NOT EXISTS（DDL 与建表脚本共用同一份，见 schema.go）：
 // 同一段迁移可能被跑第二遍（版本号被手工改过、被老版本覆盖过、
 // 库从别处拷来），而迁移跑第二遍而失败的话**库就打不开了**。
-func migrateV5EntityEdges(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, entityEdgesDDL); err != nil {
+func migrateV5EntityEdges(ctx context.Context, q schemaConn) error {
+	if _, err := q.ExecContext(ctx, entityEdgesDDL); err != nil {
 		return fmt.Errorf("建关系边表失败: %w", err)
 	}
 	return nil
@@ -184,17 +195,17 @@ func migrateV5EntityEdges(ctx context.Context, db *sql.DB) error {
 // 索引单独建（IF NOT EXISTS）：「表在而索引不在」是可能发生的形状
 // （迁移被手工改过版本号），而缺索引的后果是「归属过滤退化成全表扫描」——
 // 症状只是慢，没人会去查。
-func migrateV6AtomVectors(ctx context.Context, db *sql.DB) error {
-	exists, err := tableExists(ctx, db, "atom_vectors")
+func migrateV6AtomVectors(ctx context.Context, q schemaConn) error {
+	exists, err := tableExists(ctx, q, "atom_vectors")
 	if err != nil {
 		return err
 	}
 	if !exists {
-		if _, err := db.ExecContext(ctx, atomVectorsDDL); err != nil {
+		if _, err := q.ExecContext(ctx, atomVectorsDDL); err != nil {
 			return fmt.Errorf("建向量索引表失败: %w", err)
 		}
 	}
-	if _, err := db.ExecContext(ctx, atomVectorsIndexDDL); err != nil {
+	if _, err := q.ExecContext(ctx, atomVectorsIndexDDL); err != nil {
 		return fmt.Errorf("建向量归属索引失败: %w", err)
 	}
 	return nil
@@ -224,8 +235,8 @@ func migrateV6AtomVectors(ctx context.Context, db *sql.DB) error {
 // 建表脚本每次打开都跑，而旧库的表还没有 kind 列——脚本里那句
 // `CREATE INDEX ... ON atoms (namespace, kind, occurred_at)` 会当场失败，
 // 整个库都打不开了。故索引在这一段里建（IF NOT EXISTS，重复跑安全）。
-func migrateV7AtomKind(ctx context.Context, db *sql.DB) error {
-	has, err := hasColumn(ctx, db, "atoms", "kind")
+func migrateV7AtomKind(ctx context.Context, q schemaConn) error {
+	has, err := hasColumn(ctx, q, "atoms", "kind")
 	if err != nil {
 		return err
 	}
@@ -236,14 +247,14 @@ func migrateV7AtomKind(ctx context.Context, db *sql.DB) error {
 		// 默认值取空串（= 默认 = 长期经验）而不是 'event'：
 		// 零值必须落在**不淘汰**的那一侧——既有事实卡没有这个维度，
 		// 升级不该让它们开始被淘汰（见 types.FactKind 的说明）。
-		if _, err := db.ExecContext(ctx,
+		if _, err := q.ExecContext(ctx,
 			`ALTER TABLE atoms ADD COLUMN kind TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("加 atoms.kind 列失败: %w", err)
 		}
 	}
 	// 索引（namespace, kind, occurred_at）：事件窗口的判据是
 	// 「类别是事件 且 发生时刻在窗口内」，两列都在索引的前缀里。
-	if _, err := db.ExecContext(ctx,
+	if _, err := q.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS atoms_kind ON atoms (namespace, kind, occurred_at)`); err != nil {
 		return fmt.Errorf("建事实卡类别索引失败: %w", err)
 	}
@@ -320,7 +331,9 @@ CREATE TABLE entity_pages_new (
 // 重建是「建新表 → 搬数据 → 删旧表 → 改名」四步。中间失败会留下半张表
 // （旧表没了、新表还没改名），而那正是「库打不开了」——
 // 迁移失败的后果不该是库报废，只能是「升级没成功，库还是原来那个形状」。
-// 故这两步放在同一个事务里：任何一步出错都整体回滚。
+// ensureSchema 已把整段初始化包在**一个写事务**里（见 sqlite.go 的
+// ensureSchema 注释），本段直接在那个事务里跑——这里不再自己开事务
+// （SQLite 不支持嵌套 BEGIN，而在外层事务里再开一个只会各写各的）。
 //
 // # 幂等
 //
@@ -329,35 +342,29 @@ CREATE TABLE entity_pages_new (
 // 故两处都要自己判「要不要做」：
 //   - 加列前查列在不在（hasColumn）；
 //   - 重建前读主键列，已是新形状就跳过（primaryKeyColumns）。
-func migrateV3EntityPageScope(ctx context.Context, db *sql.DB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("开迁移事务失败: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
+func migrateV3EntityPageScope(ctx context.Context, q schemaConn) error {
 	// 步骤一：加归属列。
-	has, err := hasColumn(ctx, tx, "entity_pages", "scope")
+	has, err := hasColumn(ctx, q, "entity_pages", "scope")
 	if err != nil {
 		return err
 	}
 	if !has {
 		// DEFAULT '' 是必须的：老库里已有的行也得有值，
 		// 而 NOT NULL 没有默认值的加列在有数据的表上会直接失败。
-		if _, err := tx.ExecContext(ctx,
+		if _, err := q.ExecContext(ctx,
 			`ALTER TABLE entity_pages ADD COLUMN scope TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("加 entity_pages.scope 列失败: %w", err)
 		}
 	}
 
 	// 步骤二：主键扩列（重建表）。
-	pk, err := primaryKeyColumns(ctx, tx, "entity_pages")
+	pk, err := primaryKeyColumns(ctx, q, "entity_pages")
 	if err != nil {
 		return err
 	}
 	if len(pk) == 0 {
 		// 表不存在（建表脚本保证它在，但别赌）：没什么可迁的。
-		return tx.Commit()
+		return nil
 	}
 	if !slices.Equal(pk, entityPagePK) {
 		for _, stmt := range []string{
@@ -373,13 +380,10 @@ func migrateV3EntityPageScope(ctx context.Context, db *sql.DB) error {
 			// 所以它能一直留在建表脚本里（新库老库都建得出来）。
 			`CREATE INDEX IF NOT EXISTS entity_pages_dirty ON entity_pages (namespace, dirty, updated_at)`,
 		} {
-			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			if _, err := q.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("重建 entity_pages 失败（%s）: %w", stmt, err)
 			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("提交迁移事务失败: %w", err)
 	}
 	return nil
 }
@@ -427,9 +431,9 @@ func hasColumn(ctx context.Context, q rowQuerier, table, column string) (bool, e
 //
 // 版本号**读不出来**（不是数字）时同样当 0：宁可多跑一遍幂等迁移，
 // 也不要因为一个脏值就跳过迁移——跳过迁移的代价是「新代码按新形状读旧库」。
-func schemaVersionOf(ctx context.Context, db *sql.DB) (int, error) {
+func schemaVersionOf(ctx context.Context, q schemaConn) (int, error) {
 	var v string
-	err := db.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT value FROM meta WHERE namespace = '' AND key = 'schema_version'`).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
@@ -445,8 +449,8 @@ func schemaVersionOf(ctx context.Context, db *sql.DB) (int, error) {
 }
 
 // setSchemaVersion 写库形状版本号。
-func setSchemaVersion(ctx context.Context, db *sql.DB, v int) error {
-	if _, err := db.ExecContext(ctx,
+func setSchemaVersion(ctx context.Context, q schemaConn, v int) error {
+	if _, err := q.ExecContext(ctx,
 		`INSERT INTO meta (namespace, key, value) VALUES ('', 'schema_version', ?)
 		 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value`,
 		strconv.Itoa(v)); err != nil {

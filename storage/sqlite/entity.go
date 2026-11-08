@@ -312,14 +312,40 @@ func (s *entityStore) EvictActiveEntities(ctx context.Context, ns store.Namespac
 	}
 	out := make([]types.ActiveEntity, 0, len(victims))
 	for _, v := range victims {
-		if _, err := s.exec(ctx,
-			`DELETE FROM thread_active_entities WHERE namespace = ? AND thread_id = ? AND entity_id = ?`,
-			nsOf(ns), threadID, v.EntityID); err != nil {
+		deleted, err := s.deleteUnpinnedActiveEntity(ctx, ns, threadID, v.EntityID)
+		if err != nil {
 			return out, err
+		}
+		if !deleted {
+			// 被并发钉住的行没删成：不算被淘汰，也不上报——
+			// 上报一个实际还在栈里的实体，调用方会把「那个」指错人。
+			continue
 		}
 		out = append(out, *v)
 	}
 	return out, nil
+}
+
+// deleteUnpinnedActiveEntity 条件删除一条活跃实体：**DELETE 时复核 pinned**。
+//
+// SELECT 排除 pinned、DELETE 却不复核的话，两步之间并发的 UpsertActiveEntity
+// 把该实体置为 pinned（用户刚确认过的对象），DELETE 照删——「那个」立刻指错
+// 人。条件删除把复核与删除放进**同一条语句**：DELETE 求值时已 pinned 的行不动。
+// 返回是否真的删了（SELECT 与 DELETE 之间被并发钉住时为 false）。
+func (s *entityStore) deleteUnpinnedActiveEntity(ctx context.Context, ns store.Namespace,
+	threadID, entityID string) (bool, error) {
+	res, err := s.exec(ctx,
+		`DELETE FROM thread_active_entities
+		 WHERE namespace = ? AND thread_id = ? AND entity_id = ? AND pinned = 0`,
+		nsOf(ns), threadID, entityID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func boolToInt(b bool) int {

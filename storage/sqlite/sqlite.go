@@ -161,8 +161,14 @@ func Open(dsn string, opts ...Option) (*Store, error) {
 }
 
 // OpenFile 打开磁盘库（父目录须已存在）。
+//
+// DSN 里把 busy_timeout 放在 journal_mode **前面**：连接初始化时两条 pragma
+// 按序执行，先设好 busy_timeout，随后 journal_mode（WAL 转换要短暂独占）
+// 撞上别的连接/进程的写锁时会**等锁**而不是立刻报 SQLITE_BUSY——
+// 多进程并发开库（#24 的场景）里，这条顺序就是「Open 失败」与「Open 等一下」
+// 的分界线。
 func OpenFile(path string, opts ...Option) (*Store, error) {
-	return Open("file:"+path+"?_pragma=journal_mode(WAL)", opts...)
+	return Open("file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)", opts...)
 }
 
 // OpenMemory 打开内存库，供测试与临时库使用。
@@ -186,26 +192,68 @@ func OpenMemory(name string, opts ...Option) (*Store, error) {
 //
 // schema_version 记在全局行（namespace=”）上：它描述的是**库**的形状，
 // 不是某个记忆库的内容，故不按 namespace 分行。
+//
+// # 为什么整段在 BEGIN IMMEDIATE 里、且必须在单条连接上
+//
+// WAL 模式下多进程同开一份库是**设计内场景**（服务 + CLI 工具）。
+// 之前的实现是「读版本 → 判迁移 → ALTER → 写版本」逐条 autocommit：
+// 两个进程同时开库，都读到 hasColumn=false，后者的 ALTER 撞
+// duplicate column name → Open 失败启动不了；schema_version 的读-比-写
+// 同样无防护（双写同一版本）。BEGIN IMMEDIATE 把**写锁**提到最前面：
+//
+//   - 后到的进程在 BEGIN IMMEDIATE 上等锁（busy_timeout 内），
+//     等到之后才读版本——读到的是先到者已提交的新版本，迁移整段跳过；
+//   - 版本号写与迁移同事务，中途失败一起回滚，不留半迁移形状。
+//
+// 所以三条纪律缺一不可：**单条连接**（BEGIN/COMMIT 只对同一条连接生效，
+// 连接池一换连接事务就散了）、**先拿写锁再读版本**（否则 check-then-ALTER
+// 的竞态原样回来）、**提交失败按错报**（不留隐式事务悬挂）。
 func ensureSchema(ctx context.Context, db *sql.DB, ddl string) error {
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("建表失败: %w", err)
-	}
-	cur, err := schemaVersionOf(ctx, db)
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("取 schema 初始化连接失败: %w", err)
 	}
-	for _, m := range migrations {
-		if m.version <= cur {
-			continue
+	defer func() { _ = conn.Close() }()
+
+	// busy_timeout 是**每条连接**的 pragma：Open 里那句只落在碰巧拿到的
+	// 那条连接上，本连接必须自己设——没有它，BEGIN IMMEDIATE 撞锁就
+	// 立刻报 SQLITE_BUSY 而不是等锁，竞态防护等于没做。
+	if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout = 5000`); err != nil {
+		return fmt.Errorf("设置 busy_timeout 失败: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("开 schema 初始化事务失败: %w", err)
+	}
+	if err := func() error {
+		if _, err := conn.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("建表失败: %w", err)
 		}
-		if err := m.apply(ctx, db); err != nil {
-			return fmt.Errorf("迁移到 schema v%d 失败: %w", m.version, err)
-		}
-		if err := setSchemaVersion(ctx, db, m.version); err != nil {
+		cur, err := schemaVersionOf(ctx, conn)
+		if err != nil {
 			return err
 		}
+		for _, m := range migrations {
+			if m.version <= cur {
+				continue
+			}
+			if err := m.apply(ctx, conn); err != nil {
+				return fmt.Errorf("迁移到 schema v%d 失败: %w", m.version, err)
+			}
+			if err := setSchemaVersion(ctx, conn, m.version); err != nil {
+				return err
+			}
+		}
+		return setSchemaVersion(ctx, conn, schemaVersion)
+	}(); err != nil {
+		// 回滚用不依赖调用方 ctx 的上下文：ctx 已取消时也要把事务收掉，
+		// 否则写锁挂到连接归还为止，别的进程全在等。
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
+		return err
 	}
-	return setSchemaVersion(ctx, db, schemaVersion)
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return fmt.Errorf("提交 schema 初始化事务失败: %w", err)
+	}
+	return nil
 }
 
 // Vacuum 物理整理（VACUUM）。
@@ -510,7 +558,10 @@ func refCol(table string) string {
 // indexUpsert 覆盖一条 FTS 索引。
 //
 // 先删后插而不是 UPSERT：FTS5 虚表没有主键约束，UPSERT 需要显式 rowid，
-// 而这些表建的时候没给。删+插在同事务里是原子的，效果与 UPSERT 相同。
+// 而这些表建的时候没给。两条语句经由 exec 路由——调用方在事务里（s.tx 非空）
+// 时它们就在同事务里执行，效果与 UPSERT 相同且原子；autocommit 路径上
+// **不**原子，故所有「行 + 索引」的写入方（SaveAtom / SaveRaw / SaveCandidate）
+// 都必须自己包 Transaction——这正是事务化后的现状。
 func (s *Store) indexUpsert(ctx context.Context, table, namespace, ref, body string) error {
 	if _, err := s.exec(ctx,
 		`DELETE FROM `+table+` WHERE namespace = ? AND `+refCol(table)+` = ?`,

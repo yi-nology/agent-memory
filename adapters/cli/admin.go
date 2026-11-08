@@ -238,3 +238,33 @@ func cmdEpisodeList(ctx context.Context, opt Options, stdout, stderr io.Writer,
 	fmt.Fprintf(stderr, "共 %d 条情节\n", len(eps))
 	return 0
 }
+
+// cmdRebuildFTS 重建词面索引（后端专属能力）。
+//
+// 行与索引在同一事务里落库后，新写入不会再失配；但事务化之前写下的存量行、
+// 或被手工动过的库可能已经失配（「行在而搜不到」／「搜得到而取不到」）——
+// 增量写修不了存量，只有从真源全量重建一条路。
+//
+// 探测走 store.FTSRebuilder（可选能力面）：后端没有独立索引（如 PG 的词元
+// 向量与正文同行）就没有这个能力，明确报「不支持」，不静默假装成功。
+func cmdRebuildFTS(ctx context.Context, opt Options, stdout, stderr io.Writer) int {
+	_, st, err := open(ctx, opt)
+	if err != nil {
+		fmt.Fprintln(stderr, "打开失败:", err)
+		return 1
+	}
+	defer func() { _ = st.Close() }()
+
+	rb, ok := store.FTSRebuilder(st)
+	if !ok {
+		fmt.Fprintln(stderr, "当前后端不支持词面索引重建（该后端没有独立于真源表的索引）")
+		return 1
+	}
+	n, err := rb.RebuildFTSIndex(ctx)
+	if err != nil {
+		fmt.Fprintln(stderr, "重建词面索引失败:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "已重建词面索引 %d 条\n", n)
+	return 0
+}

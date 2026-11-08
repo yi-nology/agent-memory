@@ -41,7 +41,9 @@ type timeMatcher struct {
 	// name 这条规则叫什么（用例里用来指认）。
 	name string
 	// resolve 解析成时间窗。groups 是正则的子匹配（groups[0] 是整段）。
-	resolve func(groups []string, now time.Time) types.TimeWindow
+	// weekStart 是周起点（Analyzer 的配置）：周级窗口的左右两端都靠它，
+	// 与 now 同类——是解析的入参，不是包级常量。
+	resolve func(groups []string, now time.Time, weekStart time.Weekday) types.TimeWindow
 	// dayLevel 这条规则给出的是「天级」窗口（可被时段词再收窄）。
 	dayLevel bool
 }
@@ -53,7 +55,7 @@ type timeMatcher struct {
 var timeMatchers = []timeMatcher{
 	{
 		name: "最近N天", re: regexp.MustCompile(`(最近|近|过去)\s*([0-9一二三四五六七八九十两]+)\s*天`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			n, ok := parseCount(g[2])
 			if !ok || n <= 0 {
 				return types.TimeWindow{}
@@ -68,7 +70,7 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "N天前", re: regexp.MustCompile(`([0-9一二三四五六七八九十两]+)\s*天前`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			n, ok := parseCount(g[1])
 			if !ok || n <= 0 {
 				return types.TimeWindow{}
@@ -80,28 +82,28 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "上周", re: regexp.MustCompile(`(上|上个|上一个)\s*(周|星期|礼拜)`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
-			start := timex.BeginningOfWeek(now, time.Monday)
+		resolve: func(g []string, now time.Time, weekStart time.Weekday) types.TimeWindow {
+			start := timex.BeginningOfWeek(now, weekStart)
 			return types.TimeWindow{From: start.AddDate(0, 0, -7), To: start}
 		},
 	},
 	{
 		name: "本周", re: regexp.MustCompile(`(这|本|这个|这一)\s*(周|星期|礼拜)`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
-			start := timex.BeginningOfWeek(now, time.Monday)
+		resolve: func(g []string, now time.Time, weekStart time.Weekday) types.TimeWindow {
+			start := timex.BeginningOfWeek(now, weekStart)
 			return types.TimeWindow{From: start, To: start.AddDate(0, 0, 7)}
 		},
 	},
 	{
 		name: "下周", re: regexp.MustCompile(`(下|下个|下一个)\s*(周|星期|礼拜)`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
-			start := timex.BeginningOfWeek(now, time.Monday)
+		resolve: func(g []string, now time.Time, weekStart time.Weekday) types.TimeWindow {
+			start := timex.BeginningOfWeek(now, weekStart)
 			return types.TimeWindow{From: start.AddDate(0, 0, 7), To: start.AddDate(0, 0, 14)}
 		},
 	},
 	{
 		name: "上个月", re: regexp.MustCompile(`(上|上个|上一个)\s*月`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			return types.TimeWindow{
 				From: timex.BeginningOfMonth(now.AddDate(0, -1, 0)),
 				To:   timex.BeginningOfMonth(now),
@@ -110,21 +112,21 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "本月", re: regexp.MustCompile(`(这|本|这个|当)\s*月`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			start := timex.BeginningOfMonth(now)
 			return types.TimeWindow{From: start, To: start.AddDate(0, 1, 0)}
 		},
 	},
 	{
 		name: "下个月", re: regexp.MustCompile(`(下|下个|下一个)\s*月`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			start := timex.BeginningOfMonth(now.AddDate(0, 1, 0))
 			return types.TimeWindow{From: start, To: start.AddDate(0, 1, 0)}
 		},
 	},
 	{
 		name: "去年", re: regexp.MustCompile(`(去|上)\s*年`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			return types.TimeWindow{
 				From: timex.BeginningOfYear(now.AddDate(-1, 0, 0)),
 				To:   timex.BeginningOfYear(now),
@@ -133,14 +135,14 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "今年", re: regexp.MustCompile(`(今年|本年|这个年|今|本)\s*年`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			start := timex.BeginningOfYear(now)
 			return types.TimeWindow{From: start, To: start.AddDate(1, 0, 0)}
 		},
 	},
 	{
 		name: "前天", re: regexp.MustCompile(`前天`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			day := timex.BeginningOfDay(now).AddDate(0, 0, -2)
 			return types.TimeWindow{From: day, To: day.AddDate(0, 0, 1)}
 		},
@@ -148,7 +150,7 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "昨天", re: regexp.MustCompile(`(昨天|昨日|昨儿|昨)`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			day := timex.BeginningOfDay(now).AddDate(0, 0, -1)
 			return types.TimeWindow{From: day, To: day.AddDate(0, 0, 1)}
 		},
@@ -156,7 +158,7 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "今天", re: regexp.MustCompile(`(今天|今日|今儿|今)`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			day := timex.BeginningOfDay(now)
 			return types.TimeWindow{From: day, To: day.AddDate(0, 0, 1)}
 		},
@@ -164,7 +166,7 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "明天", re: regexp.MustCompile(`(明天|明日|明儿|明)`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			day := timex.BeginningOfDay(now).AddDate(0, 0, 1)
 			return types.TimeWindow{From: day, To: day.AddDate(0, 0, 1)}
 		},
@@ -172,7 +174,7 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "具体日期", re: regexp.MustCompile(`([0-9]{4})\s*[-/年]\s*([0-9]{1,2})\s*[-/月]\s*([0-9]{1,2})\s*日?`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			y, err1 := strconv.Atoi(g[1])
 			m, err2 := strconv.Atoi(g[2])
 			d, err3 := strconv.Atoi(g[3])
@@ -186,7 +188,7 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "月日", re: regexp.MustCompile(`([0-9]{1,2})\s*月\s*([0-9]{1,2})\s*日`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			m, err1 := strconv.Atoi(g[1])
 			d, err2 := strconv.Atoi(g[2])
 			if err1 != nil || err2 != nil {
@@ -199,7 +201,7 @@ var timeMatchers = []timeMatcher{
 	},
 	{
 		name: "某月", re: regexp.MustCompile(`([0-9]{1,2})\s*月`),
-		resolve: func(g []string, now time.Time) types.TimeWindow {
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			m, err := strconv.Atoi(g[1])
 			if err != nil || m < 1 || m > 12 {
 				return types.TimeWindow{}
@@ -219,7 +221,7 @@ func (a *Analyzer) parseTimeWindow(q string, now time.Time) (types.TimeWindow, s
 		if groups == nil {
 			continue
 		}
-		win := m.resolve(groups, now)
+		win := m.resolve(groups, now, a.weekStart)
 		if win.Empty() {
 			continue
 		}
@@ -281,7 +283,10 @@ func narrowByDayPart(q string, win types.TimeWindow) types.TimeWindow {
 
 // parseCount 解析数字（阿拉伯数字与中文数字）。
 //
-// 支持到 99 —— 再大就没有实际意义了（没有谁会问「最近 300 天前」）。
+// 阿拉伯数字任意位数都认（「3」「12」「23」）；中文数字支持到
+// 「二十三」这一档（「十」「十二」「二十」「二十三」）——
+// 相对时间的量词很少超过它，更大的中文数列不硬凑：
+// 解析不出就返回 (0, false)，窗口零值 = 不约束（见包注释的纪律 2）。
 func parseCount(s string) (int, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -293,11 +298,15 @@ func parseCount(s string) (int, bool) {
 	digits := map[rune]int{'零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
 		'五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
 	r := []rune(s)
-	if n, ok := digits[r[0]]; ok {
-		if len(r) == 1 {
-			return n, true
-		}
-		return 0, false
+	// 单字早退，多字交给下面的组合规则。
+	//
+	// 之前的写法是「首字是数字且**多字**就 return 0, false」——它把「二十」
+	// 「二十三」也一并拦下了（首字『二』正是数字），底下两条组合分支永远
+	// 走不到：用户说「最近二十天」，时间窗抽不出来（零值=不约束 ⇒ 全量召回），
+	// 时间词还留在词面里稀释匹配——两头都输，且没有任何报错。
+	// 「二三」这类无意义组合在末尾统一 return 0, false。
+	if n, ok := digits[r[0]]; ok && len(r) == 1 {
+		return n, true
 	}
 	// 「十」「十二」「二十」「二十三」。
 	if r[0] == '十' {

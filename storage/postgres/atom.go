@@ -87,6 +87,30 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 	body := ftsBody(a.Assertion, a.VerbatimQuote, strings.Join(a.SearchTerms, " "))
 	// upsert 而不是纯 INSERT：事实卡会被更新——晋升并入时补证据、
 	// 退役时改状态、合并时迁移归属。
+	//
+	// # 退役态只许单向置位（retirement one-way）
+	//
+	// superseded_by / deprecated_at / valid_to 三列是**退役态**，CASE 保护：
+	// 库里的卡已经退役（被推翻或人工作废）时，再次 SaveAtom **不得改动这三列**。
+	// 没有这层保护的两个真实失效（PG 与 SQLite 同病）：
+	//
+	//  1. 陈旧写者复活退役卡：写者拿退役前的读视图整卡回写
+	//     （superseded_by 为空串、valid_to 为零值），已退役的事实重新变成活跃；
+	//  2. 并发取代互相抹链：两个晋升器并发取代同一张旧卡，PG READ COMMITTED
+	//     下后提交者把 superseded_by 写回自己的值，先提交者的取代链被静默抹掉
+	//     （两张并存后继卡）。
+	//
+	// 退役只能**经由** SaveAtom 置位（晋升路径就是「读出旧卡 → 改退役态 →
+	// 整卡回写」），故不能简单地「已退役就整行拒绝更新」——实体合并要把
+	// 已退役的卡迁到新归属（pipeline/entity），只许挡退役态这三列。
+	//
+	// # created_at 不在更新列表里（与 SQLite 侧对齐）
+	//
+	// 之前 PG 侧有 `created_at = excluded.created_at`，SQLite 侧保留原值——
+	// 同一张卡在两个后端取到不同的 created_at，而 FindAtomBySignature 的
+	// ORDER BY created_at DESC 靠它选「最新卡」：同一批记忆换个部署形态，
+	// 签名去重命中的卡会变，违背「召回结果不该变」的 parity 承诺。
+	// created_at 是卡片**首次**落库的时刻，陈旧回写不挪动它。
 	_, err := s.exec(ctx, `INSERT INTO atoms
 		(namespace, id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,
 		 quote_event_id, search_terms, occurred_at, confidence, importance,
@@ -101,11 +125,16 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 			verbatim_quote = excluded.verbatim_quote, quote_event_id = excluded.quote_event_id,
 			search_terms = excluded.search_terms, occurred_at = excluded.occurred_at,
 			confidence = excluded.confidence, importance = excluded.importance,
-			created_at = excluded.created_at, updated_at = excluded.updated_at,
-			superseded_by = excluded.superseded_by, deprecated_at = excluded.deprecated_at,
-			provenance = excluded.provenance, signature = excluded.signature,
+			updated_at = excluded.updated_at, provenance = excluded.provenance,
+			signature = excluded.signature,
 			body = excluded.body, body_tsv = excluded.body_tsv,
-			valid_from = excluded.valid_from, valid_to = excluded.valid_to,
+			valid_from = excluded.valid_from,
+			valid_to = CASE WHEN atoms.superseded_by <> '' OR atoms.deprecated_at IS NOT NULL
+			                THEN atoms.valid_to ELSE excluded.valid_to END,
+			superseded_by = CASE WHEN atoms.superseded_by <> '' OR atoms.deprecated_at IS NOT NULL
+			                     THEN atoms.superseded_by ELSE excluded.superseded_by END,
+			deprecated_at = CASE WHEN atoms.superseded_by <> '' OR atoms.deprecated_at IS NOT NULL
+			                     THEN atoms.deprecated_at ELSE excluded.deprecated_at END,
 			version = excluded.version,
 			kind = excluded.kind`,
 		nsOf(ns), a.ID, a.EntityID, string(a.Scope), a.CandidateID, stringsJSON(a.RawEventIDs),

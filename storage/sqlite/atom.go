@@ -84,12 +84,39 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 	if now.IsZero() {
 		now = a.CreatedAt
 	}
-	// **upsert 而不是纯 INSERT**：事实卡会被更新——晋升并入时补证据、
-	// 退役时改状态、合并时迁移归属。这些都是「改既有卡」而不是「新增一张」。
-	// 用纯 INSERT 的话，第二步就撞唯一键——
-	// 而这个 bug 潜伏了很久：它只在「真的发生并入」时才暴露，
-	// 第一次撞上它的是生命周期层的合并用例。
-	if _, err := s.exec(ctx, `INSERT INTO atoms
+	// 行 + FTS 索引必须**同一个事务**落库：这是三个独立 autocommit 的话，
+	// 行 INSERT 之后、索引 DELETE/INSERT 之间任何一步进程崩溃或连接断开，
+	// 真源表与索引就永久失配（行在而搜不到，静默漏命中）。
+	// 已在事务里（嵌套调用）时 Transaction 复用外层事务，不会重复 BEGIN。
+	// 用回调收到的那份 store，不用外层 s（理由见 raw.go 的 SaveRawBatch 注释）。
+	return s.Transaction(ctx, func(ctx context.Context, tx store.Store) error {
+		tsStore, ok := tx.(*Store)
+		if !ok {
+			return fmt.Errorf("事务内拿到的不是本后端实现，事实卡无法落库: %T", tx)
+		}
+		// **upsert 而不是纯 INSERT**：事实卡会被更新——晋升并入时补证据、
+		// 退役时改状态、合并时迁移归属。这些都是「改既有卡」而不是「新增一张」。
+		// 用纯 INSERT 的话，第二步就撞唯一键——
+		// 而这个 bug 潜伏了很久：它只在「真的发生并入」时才暴露，
+		// 第一次撞上它的是生命周期层的合并用例。
+		//
+		// # 退役态只许单向置位（retirement one-way）
+		//
+		// superseded_by / deprecated_at / valid_to 三列是**退役态**，CASE 保护：
+		// 库里的卡已经退役（被推翻或人工作废）时，再次 SaveAtom **不得改动这三列**。
+		// 没有这层保护的两个真实失效（PG 与 SQLite 同病）：
+		//
+		//  1. 陈旧写者复活退役卡：写者拿退役前的读视图整卡回写
+		//     （superseded_by 为空串、valid_to 为零值），已退役的事实重新变成活跃；
+		//  2. 并发取代互相抹链：两个晋升器并发取代同一张旧卡，后提交者把
+		//     superseded_by 写回自己的值，先提交者的取代链被静默抹掉。
+		//
+		// 退役只能**经由** SaveAtom 置位（晋升路径就是「读出旧卡 → 改退役态 →
+		// 整卡回写」），故不能简单地「已退役就整行拒绝更新」——实体合并要把
+		// 已退役的卡迁到新归属（pipeline/entity），只许挡退役态这三列。
+		// created_at 不在更新列表里：它是卡片**首次**落库的时刻，
+		// 陈旧回写不挪动它（与 SQLite 侧同款语义，FindAtomBySignature 靠它取最新卡）。
+		if _, err := tsStore.exec(ctx, `INSERT INTO atoms
 		(namespace, id, entity_id, scope, candidate_id, raw_event_ids, assertion, verbatim_quote,
 		 quote_event_id, search_terms, occurred_at, confidence, importance,
 		 created_at, updated_at, superseded_by, deprecated_at, provenance, signature,
@@ -102,24 +129,38 @@ func (s *atomStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.A
 			verbatim_quote = excluded.verbatim_quote, quote_event_id = excluded.quote_event_id,
 			search_terms = excluded.search_terms, occurred_at = excluded.occurred_at,
 			confidence = excluded.confidence, importance = excluded.importance,
-			updated_at = excluded.updated_at, superseded_by = excluded.superseded_by,
-			deprecated_at = excluded.deprecated_at, provenance = excluded.provenance,
+			updated_at = excluded.updated_at, provenance = excluded.provenance,
 			signature = excluded.signature,
-			valid_from = excluded.valid_from, valid_to = excluded.valid_to,
+			valid_from = excluded.valid_from,
+			valid_to = CASE WHEN atoms.superseded_by <> '' OR atoms.deprecated_at IS NOT NULL
+			                THEN atoms.valid_to ELSE excluded.valid_to END,
+			superseded_by = CASE WHEN atoms.superseded_by <> '' OR atoms.deprecated_at IS NOT NULL
+			                     THEN atoms.superseded_by ELSE excluded.superseded_by END,
+			deprecated_at = CASE WHEN atoms.superseded_by <> '' OR atoms.deprecated_at IS NOT NULL
+			                     THEN atoms.deprecated_at ELSE excluded.deprecated_at END,
 			version = excluded.version,
 			kind = excluded.kind`,
-		nsOf(ns), a.ID, a.EntityID, string(a.Scope), a.CandidateID, stringsJSON(a.RawEventIDs),
-		a.Assertion, a.VerbatimQuote, a.QuoteEventID, stringsJSON(a.SearchTerms), ts(a.OccurredAt),
-		string(a.Confidence), string(a.Importance), ts(a.CreatedAt), ts(now),
-		a.SupersededBy, tsPtr(a.DeprecatedAt),
-		provenanceJSON(provenanceOf(a.Provenance)), a.Signature(),
-		ts(a.ValidFrom), tsPtr(a.ValidTo), a.VersionOrOne(),
-		string(a.Kind),
-	); err != nil {
-		return err
-	}
-	return s.indexUpsert(ctx, "atom_fts", nsOf(ns), a.ID,
-		ftsBody(a.Assertion, a.VerbatimQuote, strings.Join(a.SearchTerms, " ")))
+			nsOf(ns), a.ID, a.EntityID, string(a.Scope), a.CandidateID, stringsJSON(a.RawEventIDs),
+			a.Assertion, a.VerbatimQuote, a.QuoteEventID, stringsJSON(a.SearchTerms), ts(a.OccurredAt),
+			string(a.Confidence), string(a.Importance), ts(a.CreatedAt), ts(now),
+			a.SupersededBy, tsPtr(a.DeprecatedAt),
+			provenanceJSON(provenanceOf(a.Provenance)), a.Signature(),
+			ts(a.ValidFrom), tsPtr(a.ValidTo), a.VersionOrOne(),
+			string(a.Kind),
+		); err != nil {
+			return err
+		}
+		return tsStore.indexUpsert(ctx, "atom_fts", nsOf(ns), a.ID, atomFTSBody(a))
+	})
+}
+
+// atomFTSBody 事实卡的 FTS 索引正文。
+//
+// 增量写路（SaveAtom）与重建路（RebuildFTSIndex）共用同一份拼法：
+// 两处各写一遍的话，重建出来的索引与增量写出的索引切词口径分叉
+// ——而那种分叉在数据上完全看不出来，症状只是「重建之后命中率变了」。
+func atomFTSBody(a *types.AtomCard) string {
+	return ftsBody(a.Assertion, a.VerbatimQuote, strings.Join(a.SearchTerms, " "))
 }
 
 func (s *atomStore) GetAtom(ctx context.Context, ns store.Namespace, id string) (*types.AtomCard, error) {

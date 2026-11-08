@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/yi-nology/agent-memory/store"
@@ -74,16 +75,31 @@ func (s *rawStore) SaveRaw(ctx context.Context, ns store.Namespace, ev *types.Ra
 	if err := ev.Valid(); err != nil {
 		return err
 	}
-	if _, err := s.exec(ctx, `INSERT INTO raw_events
-		(namespace, id, host, session_id, thread_id, user, scope, ts, type, content, payload, provenance)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		nsOf(ns), ev.ID, ev.Host, ev.SessionID, ev.ThreadID, ev.User, string(ev.Scope),
-		ts(ev.Timestamp), string(ev.Type), ev.Content, mapJSON(ev.Payload),
-		provenanceJSON(provenanceOf(ev.Provenance)),
-	); err != nil {
-		return err
-	}
-	return s.indexUpsert(ctx, "raw_fts", nsOf(ns), ev.ID, ftsBody(ev.Content, ev.User))
+	// 行 + FTS 索引必须**同一个事务**落库：三个独立 autocommit 的话，
+	// 行 INSERT 后、索引 DELETE/INSERT 之间任何一步崩溃或断连，
+	// 真源表与索引就永久失配（行在而搜不到，静默漏命中）。
+	// 已在事务里（嵌套调用，如 SaveRawBatch）时 Transaction 复用外层事务。
+	return s.Transaction(ctx, func(ctx context.Context, tx store.Store) error {
+		tsStore, ok := tx.(*Store)
+		if !ok {
+			return fmt.Errorf("事务内拿到的不是本后端实现，事件无法落库: %T", tx)
+		}
+		if _, err := tsStore.exec(ctx, `INSERT INTO raw_events
+			(namespace, id, host, session_id, thread_id, user, scope, ts, type, content, payload, provenance)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			nsOf(ns), ev.ID, ev.Host, ev.SessionID, ev.ThreadID, ev.User, string(ev.Scope),
+			ts(ev.Timestamp), string(ev.Type), ev.Content, mapJSON(ev.Payload),
+			provenanceJSON(provenanceOf(ev.Provenance)),
+		); err != nil {
+			return err
+		}
+		return tsStore.indexUpsert(ctx, "raw_fts", nsOf(ns), ev.ID, rawFTSBody(ev))
+	})
+}
+
+// rawFTSBody 事件的 FTS 索引正文（写路与重建路共用，理由见 atomFTSBody）。
+func rawFTSBody(ev *types.RawEvent) string {
+	return ftsBody(ev.Content, ev.User)
 }
 
 func (s *rawStore) SaveRawBatch(ctx context.Context, ns store.Namespace, evs []*types.RawEvent) error {
@@ -196,27 +212,41 @@ func (s *rawStore) SearchRaw(ctx context.Context, ns store.Namespace, scope type
 }
 
 func (s *rawStore) DeleteRawBefore(ctx context.Context, ns store.Namespace, before time.Time) (int, error) {
-	res, err := s.exec(ctx, `DELETE FROM raw_events WHERE namespace = ? AND ts < ?`,
-		nsOf(ns), ts(before))
+	// 行删除与孤儿索引清理**同一个事务**：两段 autocommit 之间崩溃的话，
+	// 索引会留下指向已删事件的幽灵行（「搜得到但取不到」）。
+	var deleted int
+	err := s.Transaction(ctx, func(ctx context.Context, tx store.Store) error {
+		tsStore, ok := tx.(*Store)
+		if !ok {
+			return fmt.Errorf("事务内拿到的不是本后端实现，事件无法清理: %T", tx)
+		}
+		res, err := tsStore.exec(ctx, `DELETE FROM raw_events WHERE namespace = ? AND ts < ?`,
+			nsOf(ns), ts(before))
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		// 索引是内容派生物：漏清会留下「搜得到但取不到」的幽灵结果，
+		// 而那种不一致在排查时极难看出方向。
+		//
+		// 按「孤儿」清而不是按同一时间窗清：后者的条件一旦与上面的 DELETE 有任何
+		// 细微差异（例如 ts 精度、时区归一），索引就会留下指向已删事件的残行——
+		// 而那种 bug 表现为「搜到了但打开是空的」，不报任何错。
+		if _, err := tsStore.exec(ctx, `DELETE FROM raw_fts WHERE namespace = ?
+			AND event_id NOT IN (SELECT id FROM raw_events WHERE namespace = ?)`,
+			nsOf(ns), nsOf(ns)); err != nil {
+			return err
+		}
+		deleted = int(n)
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	// 索引是内容派生物：漏清会留下「搜得到但取不到」的幽灵结果，
-	// 而那种不一致在排查时极难看出方向。
-	//
-	// 按「孤儿」清而不是按同一时间窗清：后者的条件一旦与上面的 DELETE 有任何
-	// 细微差异（例如 ts 精度、时区归一），索引就会留下指向已删事件的残行——
-	// 而那种 bug 表现为「搜到了但打开是空的」，不报任何错。
-	if _, err := s.exec(ctx, `DELETE FROM raw_fts WHERE namespace = ?
-		AND event_id NOT IN (SELECT id FROM raw_events WHERE namespace = ?)`,
-		nsOf(ns), nsOf(ns)); err != nil {
-		return int(n), err
-	}
-	return int(n), nil
+	return deleted, nil
 }
 
 func (s *rawStore) rawByIDsOrdered(ctx context.Context, ns store.Namespace, ids []string) ([]*types.RawEvent, error) {

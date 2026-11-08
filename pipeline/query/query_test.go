@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -214,5 +215,93 @@ func TestTermsExcludeTimeFragments(t *testing.T) {
 				t.Fatalf("时间词被截断了（%q → %+v）: %q", q, plan.Terms, term)
 			}
 		}
+	}
+}
+
+// ── 中文数字与周起点（第三轮 issue 清零）──
+
+// 中文数字与阿拉伯数字必须解析出**同一个**窗口。
+//
+// 钉的缺陷：parseCount 的单字分支对多字输入提前 return 0, false，
+// 「二十」「二十三」两条组合分支永远走不到——「最近二十天」抽不出窗口
+// （零值=不约束 ⇒ 时间过滤整体失效，召回退化成全量），
+// 时间词还留在词面里继续稀释匹配。两头都输，且没有任何报错。
+func TestParseChineseCountMatchesArabic(t *testing.T) {
+	for _, tc := range []struct{ arabic, chinese string }{
+		{"3", "三"}, {"12", "十二"}, {"20", "二十"}, {"23", "二十三"},
+	} {
+		pa := newAnalyzer().Analyze(context.Background(), Input{Query: "最近" + tc.arabic + "天的事"})
+		pc := newAnalyzer().Analyze(context.Background(), Input{Query: "最近" + tc.chinese + "天的事"})
+		if pa.Time.Empty() || pc.Time.Empty() {
+			t.Fatalf("%q/%q 应解析出窗口: 阿拉伯=%+v 中文=%+v", tc.arabic, tc.chinese, pa.Time, pc.Time)
+		}
+		if !pa.Time.From.Equal(pc.Time.From) || !pa.Time.To.Equal(pc.Time.To) {
+			t.Fatalf("%q 与 %q 的窗口应逐字相同: %+v vs %+v", tc.arabic, tc.chinese, pa.Time, pc.Time)
+		}
+		// 时间词必须被整段消费，不许留在词面里。
+		for _, term := range pc.Terms {
+			if strings.Contains(term, tc.chinese) {
+				t.Fatalf("时间词 %q 不该留在词面里: %+v", tc.chinese, pc.Terms)
+			}
+		}
+	}
+}
+
+// 「二十天前」同样要出窗（parseCount 的另一条消费路）。
+func TestParseTwentyDaysAgo(t *testing.T) {
+	a := newAnalyzer()
+	plan := a.Analyze(context.Background(), Input{Query: "二十天前那次改动"})
+	want := types.TimeWindow{From: at(t, 2026, 10, 1, 0), To: at(t, 2026, 10, 2, 0)}
+	if !plan.Time.From.Equal(want.From) || !plan.Time.To.Equal(want.To) {
+		t.Fatalf("时间窗不对: %+v", plan.Time)
+	}
+}
+
+// 负对照：无意义的中文数字组合仍须拒绝（宁可零值不约束，也不猜错）。
+func TestParseCountRejectsMalformedChinese(t *testing.T) {
+	for _, s := range []string{"二三", "十十", "二十十"} {
+		if n, ok := parseCount(s); ok {
+			t.Fatalf("parseCount(%q) 应拒绝，实得 (%d, true)", s, n)
+		}
+	}
+}
+
+// 周起点可配：WeekStart=Sunday 时三条周规则的窗口两端都应落在周日，
+// 且与默认（周一）**不同**。
+//
+// 钉的缺陷：Config.WeekStart 曾是只被赋值、从不被读的死配置——三条周规则
+// 写死 time.Monday，宿主配成周日照样得到周一窗口，且没有任何报错。
+// 「配了但没生效」比「没这个配置」更坏：调用方会以为行为已按本地习惯对齐。
+//
+// 字段因此做成指针：time.Weekday 的零值恰好是周日（0），
+// 值类型区分不了「没配」与「配成周日」——那正是当年静默落回周一的根源。
+func TestWeekStartSundayChangesWeekWindows(t *testing.T) {
+	sunday := time.Sunday
+	monday := newAnalyzer()
+	sundayCfg := New(Config{Now: base, Loc: tz, WeekStart: &sunday})
+	for _, q := range []string{"上周的事", "本周的事", "下周的事"} {
+		wm := monday.Analyze(context.Background(), Input{Query: q}).Time
+		ws := sundayCfg.Analyze(context.Background(), Input{Query: q}).Time
+		if wm.Empty() || ws.Empty() {
+			t.Fatalf("%q 应解析出窗口: 周一=%+v 周日=%+v", q, wm, ws)
+		}
+		if ws.From.Weekday() != time.Sunday || ws.To.Weekday() != time.Sunday {
+			t.Fatalf("WeekStart=Sunday 时 %q 的窗口两端都应落在周日: %+v", q, ws)
+		}
+		if wm.From.Equal(ws.From) && wm.To.Equal(ws.To) {
+			t.Fatalf("WeekStart=Sunday 的 %q 窗口与周一配置逐字相同（配置没生效）: %+v", q, ws)
+		}
+	}
+}
+
+// 周日起点的具体窗口（手写期望值，不调被测代码算）：
+// 2026-10-21 是周三，上个周日是 2026-10-11。
+func TestWeekStartSundayLastWeekWindow(t *testing.T) {
+	sunday := time.Sunday
+	a := New(Config{Now: base, Loc: tz, WeekStart: &sunday})
+	plan := a.Analyze(context.Background(), Input{Query: "上周的事"})
+	want := types.TimeWindow{From: at(t, 2026, 10, 11, 0), To: at(t, 2026, 10, 18, 0)}
+	if !plan.Time.From.Equal(want.From) || !plan.Time.To.Equal(want.To) {
+		t.Fatalf("时间窗不对: %+v", plan.Time)
 	}
 }
