@@ -36,9 +36,10 @@ import (
 type Analyzer struct {
 	now func() time.Time
 	loc *time.Location
-	// weekStart 一周从哪天开始（零值=周一）。
+	// weekStart 一周从哪天开始（New 里归一，缺省=周一）。
 	//
-	// 「上周」的起点随它变，而周一起点是中文语境下的默认。
+	// 「上周」「本周」「下周」三条周规则的窗口起点随它变，
+	// 而周一起点是中文语境下的默认。
 	weekStart time.Weekday
 }
 
@@ -54,8 +55,16 @@ type Config struct {
 	// 相对时间按**本地时区**算：「昨天」是用户所在时区的昨天，
 	// 而服务器可能在 UTC 上——差一天就是整个窗口错位。
 	Loc *time.Location
-	// WeekStart 一周从哪天开始（零值=周一）。
-	WeekStart time.Weekday
+	// WeekStart 一周从哪天开始（nil=周一，中文语境默认）。
+	//
+	// **为什么是指针**：time.Weekday 的零值恰好是周日（0），
+	// 值类型区分不了「没配」与「配成周日」——用值类型时把周日传进来
+	// 会被当成「没配」静默落回周一（v0.10.0 及之前正是这个形态，
+	// 且那时整条配置只被赋值、从不被读）。
+	//
+	// 「上周」这类左右两端都靠周起点的窗口，起点差一天就是整窗错位：
+	// 按周日记法的宿主必须显式传 time.Sunday，配置才真的生效。
+	WeekStart *time.Weekday
 }
 
 // New 造查询理解器。
@@ -71,8 +80,8 @@ func New(cfg Config) *Analyzer {
 	if cfg.Loc != nil {
 		a.loc = cfg.Loc
 	}
-	if cfg.WeekStart != 0 {
-		a.weekStart = cfg.WeekStart
+	if cfg.WeekStart != nil {
+		a.weekStart = *cfg.WeekStart
 	}
 	return a
 }
