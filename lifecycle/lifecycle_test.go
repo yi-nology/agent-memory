@@ -2,8 +2,11 @@ package lifecycle_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yi-nology/agent-memory/lifecycle"
 	"github.com/yi-nology/agent-memory/storage/sqlite"
@@ -425,5 +428,143 @@ func TestExpireWritesJournalWithInjectedClock(t *testing.T) {
 	// 而看板上这两种长得一模一样。
 	if entries[0].Summary == "" {
 		t.Fatal("审计条目应写明处置原因")
+	}
+}
+
+// ── 合并审计条目的签名展示（第四轮 issue 清零，#40）──
+
+// 合并审计的 Summary 必须是**合法 UTF-8 且不含 0x1F 控制符**。
+//
+// 钉的缺陷：short() 用裸字节 s[:16] 截断，签名第三段是中文断言，
+// 切在多字节字符中间产出非法 UTF-8（PG 侧 journal INSERT 当场报错被 `_ =` 吞掉，
+// 整条审计静默丢失）；分隔符替换又还在替换 NUL 时代的 \x00，
+// 0x1F 控制符原文漏进人读的审计。
+func TestConsolidateJournalSummaryIsSafeText(t *testing.T) {
+	cases := []struct {
+		name string
+		atom *types.AtomCard
+	}{
+		{"长中文断言（截断点落在多字节字符中间）", &types.AtomCard{
+			ID: "a-cn", EntityID: "e1", Scope: "team-a",
+			Assertion: "机器甲的内核版本号是最新长期支持版且已开启自动更新策略", QuoteEventID: "ev1",
+			RawEventIDs: []string{"ev1"}, Importance: types.ImportanceMed,
+			Confidence: types.ConfidenceMed, OccurredAt: now(), CreatedAt: now(), UpdatedAt: now(),
+		}},
+		{"短签名（不截断也要换掉分隔符）", &types.AtomCard{
+			ID: "a-short", EntityID: "e", Assertion: "已修复", QuoteEventID: "ev1",
+			RawEventIDs: []string{"ev1"}, Importance: types.ImportanceMed,
+			Confidence: types.ConfidenceMed, OccurredAt: now(), CreatedAt: now(), UpdatedAt: now(),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := seed(t)
+			ctx := context.Background()
+			// 同签名两张 → 触发合并 → 审计 Summary 带截断后的签名。
+			tc.atom.ID = tc.atom.ID + "-1"
+			if err := s.SaveAtom(ctx, ns, tc.atom); err != nil {
+				t.Fatal(err)
+			}
+			dup := *tc.atom
+			dup.ID = tc.atom.ID[:len(tc.atom.ID)-1] + "2"
+			dup.CreatedAt = now().Add(time.Hour)
+			if err := s.SaveAtom(ctx, ns, &dup); err != nil {
+				t.Fatal(err)
+			}
+			res, err := lifecycle.Consolidate(ctx, s, ns, lifecycle.WithClock(func() time.Time { return now() }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Merged != 1 {
+				t.Fatalf("应合并 1 张，实得 %+v", res)
+			}
+			journal, err := s.ListJournal(ctx, ns, "", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(journal) == 0 {
+				t.Fatal("合并必须留审计条目")
+			}
+			for _, j := range journal {
+				if !utf8.ValidString(j.Summary) {
+					t.Fatalf("审计 Summary 必须是合法 UTF-8（截断切坏多字节字符的旧病）: %q", j.Summary)
+				}
+				if strings.Contains(j.Summary, "\x1f") {
+					t.Fatalf("审计 Summary 不得残留签名分隔符 0x1F: %q", j.Summary)
+				}
+			}
+		})
+	}
+}
+
+// fakeJournalStore 只让 AppendJournal 失败的假存储（其余走真 SQLite）。
+type failingJournalStore struct {
+	*sqlite.Store
+	appendErr error
+}
+
+func (f failingJournalStore) AppendJournal(ctx context.Context, ns store.Namespace, e *types.JournalEntry) error {
+	if f.appendErr != nil {
+		return f.appendErr
+	}
+	return f.Store.AppendJournal(ctx, ns, e)
+}
+
+// 审计写失败**必须可见**：`_ =` 吞掉的话，「退役/合并必须留审计条目」
+// 这条承诺静默失效——PG 侧写坏的年代正是这么丢的审计（issue #40）。
+func TestJournalWriteFailureIsVisible(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func(ctx context.Context, s lifecycle.Store) error
+	}{
+		{"Consolidate", func(ctx context.Context, s lifecycle.Store) error {
+			_, err := lifecycle.Consolidate(ctx, s, ns)
+			return err
+		}},
+		{"Expire", func(ctx context.Context, s lifecycle.Store) error {
+			_, err := lifecycle.Expire(ctx, s, ns)
+			return err
+		}},
+		{"Retention", func(ctx context.Context, s lifecycle.Store) error {
+			_, err := lifecycle.Retention(ctx, s, ns)
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := seed(t)
+			ctx := context.Background()
+			// 造一张会触发动作的事实卡：同签名两张（合并）、运行期错误证据（保留期）、
+			// 过期事件（按龄）三类各留一条，保证动作真的会写审计。
+			must := func(err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			// 证据事件带运行期错误来源：Retention 的判据是「全部证据都是运行期错误」。
+			must(s.SaveRaw(ctx, ns, &types.RawEvent{
+				ID: "ev1", Content: "某次报错", Timestamp: now(), Type: types.EventManual,
+				Provenance: types.Provenance{Origin: types.OriginModel, RuntimeError: true},
+			}))
+			must(s.SaveAtom(ctx, ns, &types.AtomCard{
+				ID: "a1", EntityID: "e1", Assertion: "机器甲磁盘不足", QuoteEventID: "ev1",
+				RawEventIDs: []string{"ev1"}, Importance: types.ImportanceMed,
+				Confidence: types.ConfidenceMed, OccurredAt: now().AddDate(0, 0, -40),
+				CreatedAt: now().AddDate(0, 0, -40), UpdatedAt: now(),
+				Kind: types.FactEvent,
+			}))
+			if tc.name == "Consolidate" {
+				must(s.SaveAtom(ctx, ns, &types.AtomCard{
+					ID: "a2", EntityID: "e1", Assertion: "机器甲磁盘不足", QuoteEventID: "ev1",
+					RawEventIDs: []string{"ev1"}, Importance: types.ImportanceMed,
+					Confidence: types.ConfidenceMed, OccurredAt: now(), CreatedAt: now().Add(time.Hour), UpdatedAt: now(),
+				}))
+			}
+			fake := failingJournalStore{Store: s, appendErr: errors.New("journal 后端不可写")}
+			if err := tc.run(ctx, fake); err == nil {
+				t.Fatal("审计写失败必须以 error 可见：吞掉等于「留痕承诺」静默失效")
+			}
+		})
 	}
 }

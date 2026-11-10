@@ -19,13 +19,12 @@ package page
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/oagentkit/textx/textutil"
+	"github.com/oekit/pkg/jsonrepair"
 
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
@@ -272,20 +271,19 @@ func (r *Regenerator) regenerateOne(ctx context.Context, ns store.Namespace, ent
 //
 // 围栏容忍不算「宽松」：模型被要求输出 JSON 时，经常连着 ```json 围栏一起
 // 给。不剥围栏的结果是每次模型重生成都失败一次，而失败保持脏标记、
-// 于是这个实体的画像永远重生成不出来。剥离交给 oekit/textx 的
-// textutil.StripCodeFence；「字段缺失即失败」那条不变。
+// 于是这个实体的画像永远重生成不出来。围栏剥离与语法修复都在
+// jsonrepair 那一份实现里（见函数内注释）；「字段缺失即失败」那条不变。
 func parsePage(raw string) (headline, body string, err error) {
-	s := textutil.StripCodeFence(raw)
-	if i := strings.Index(s, "{"); i >= 0 {
-		if j := strings.LastIndex(s, "}"); j > i {
-			s = s[i : j+1]
-		}
-	}
+	// 解析走 oekit/pkg/jsonrepair：围栏剥离与语法级修复（尾逗号/全角冒号/
+	// 未闭合括号/散文里抽对象）只有一份实现，与 promotion/extractor/episode
+	// 同一套口径（issue #41）。「字段缺失即失败」那条不变：jsonrepair 只修
+	// 语法——失败保持脏标记、这个实体的画像永远重生成不出来，故格式噪声
+	// 与内容缺失必须分得开。
 	var obj struct {
 		Headline string `json:"headline"`
 		Body     string `json:"body"`
 	}
-	if uerr := json.Unmarshal([]byte(s), &obj); uerr != nil {
+	if uerr := jsonrepair.Unmarshal(raw, &obj); uerr != nil {
 		return "", "", fmt.Errorf("page: 解析失败: %w", uerr)
 	}
 	obj.Headline = strings.TrimSpace(obj.Headline)

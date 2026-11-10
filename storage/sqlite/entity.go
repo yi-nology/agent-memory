@@ -146,7 +146,7 @@ func (s *entityStore) ListEntities(ctx context.Context, ns store.Namespace, enti
 		args = append(args, string(entityType))
 	}
 	q += ` ORDER BY atom_count DESC, canonical_name ASC LIMIT ?`
-	args = append(args, limitOf(limit, 50))
+	args = append(args, limitOf(limit, defaultFetchLimit))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
@@ -242,11 +242,18 @@ func (s *entityStore) UpsertActiveEntity(ctx context.Context, ns store.Namespace
 	return err
 }
 
+// ListActiveEntities 按最近提及倒序列出（契约：store.EntityStore）。
+//
+// 排序**不带 pinned**：「钉住不参与淘汰」是 EvictActiveEntities 的职责
+// （那里单独处理 pinned = 0），把钉住混进读取顺序会顺手改掉
+// 「谁是当前话题」的判据——只要栈里有任何钉住项，代词「那个」就恒定
+// 指向那个三天前提及的钉住项，而不是当前正在聊的对象（issue #33）。
+// 钉住的可见性诉求（若有）应是独立方法，不是悄悄改这张的读取序。
 func (s *entityStore) ListActiveEntities(ctx context.Context, ns store.Namespace, threadID string, limit int) ([]*types.ActiveEntity, error) {
 	rows, err := s.query(ctx,
 		`SELECT entity_id, canonical_name, last_seen, pinned, pin_time
 		 FROM thread_active_entities WHERE namespace = ? AND thread_id = ?
-		 ORDER BY pinned DESC, last_seen DESC LIMIT ?`,
+		 ORDER BY last_seen DESC, entity_id ASC LIMIT ?`,
 		nsOf(ns), threadID, limitOf(limit, 10))
 	if err != nil {
 		return nil, err

@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/yi-nology/agent-memory/ports"
-	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
 )
 
@@ -48,6 +47,13 @@ func (p *Pipeline) collectSemantic(ctx context.Context, req Request, limit int) 
 	if p.cfg.Semantic == nil {
 		return nil, nil
 	}
+	// 显式声明了事实范围但范围为空 → 语义路同样**一条不带**。
+	// 限定只在词面路生效、语义路照常带事实的话，「限定」就成了装饰
+	// （issue #31）——别家实体的事实照样能从这条路进 prompt。
+	scope := p.entityScope(req)
+	if scope != nil && len(scope) == 0 {
+		return nil, nil
+	}
 	hits, err := p.cfg.Semantic.Search(ctx, string(req.Namespace), req.Query, string(req.Scope), limit)
 	if err != nil {
 		// 语义面失败**上抛**：静默忽略的话，混合检索悄悄退化成纯词面，
@@ -67,21 +73,28 @@ func (p *Pipeline) collectSemantic(ctx context.Context, req Request, limit int) 
 		seen[h.ID] = true
 		ids = append(ids, h.ID)
 	}
-	atoms, err := p.store.ListAtoms(ctx, req.Namespace, store.AtomFilter{
-		IDs:          ids,
-		Scope:        req.Scope,
-		ActiveOnly:   true,
-		OccurredFrom: req.OccurredFrom,
-		OccurredTo:   req.OccurredTo,
-		At:           req.At,
-	})
+	// 过滤条件与两条词面路**单源**（atomFilter，issue #31/#36）：
+	// 此前这一路独缺 EventSince（过期事件绕回候选池）与 EntityIDs
+	// （宿主显式声明的实体边界失效），且不带 Limit——后端兜底默认
+	// （50）小于 ids 数量时，融合名次尾部按重要度序静默截断。
+	f := p.atomFilter(req, len(ids))
+	f.IDs = ids
+	atoms, err := p.store.ListAtoms(ctx, req.Namespace, f)
 	if err != nil {
 		return nil, err
 	}
-	// 按语义面的次序重排，并做可见性复查。
+	// 按语义面的次序重排，并做可见性复查（纵深防御，与宽松路同款）：
+	// 语义面是宿主写的，取数层漏了哪条都由这里兜住——
+	// 事件窗口同样只作用于事件类（与存储层的判据逐字一致）。
 	byID := make(map[string]*types.AtomCard, len(atoms))
 	for _, a := range atoms {
 		if !a.Active() || !a.Scope.VisibleTo(req.Scope) {
+			continue
+		}
+		if scope != nil && !scope[a.EntityID] {
+			continue
+		}
+		if !f.EventSince.IsZero() && a.Kind.IsEvent() && a.OccurredAt.Before(f.EventSince) {
 			continue
 		}
 		byID[a.ID] = a
@@ -111,9 +124,9 @@ func (p *Pipeline) collectSemantic(ctx context.Context, req Request, limit int) 
 //
 // 零漂移：没装语义面、且没有宽松路可用时，候选的次序与从前逐条一致。
 func (p *Pipeline) fuse(ctx context.Context, lexical, loose []*candidate,
-	semantic []*types.AtomCard) []*candidate {
+	semantic []*types.AtomCard) ([]*candidate, error) {
 	if len(loose) == 0 && len(semantic) == 0 {
-		return lexical
+		return lexical, nil
 	}
 	lists := map[string][]string{}
 	// 每条候选的来源：同一个 ID 可能出现在多路里，候选本体只造一次。
@@ -158,8 +171,11 @@ func (p *Pipeline) fuse(ctx context.Context, lexical, loose []*candidate,
 		c, ok, err := p.snippet(ctx, SourceAtom, a.ID, a.EntityID, "记忆", a.Assertion,
 			a.Importance, a.OccurredAt)
 		if err != nil {
-			// 造片段失败（计量失败）→ 上抛：与别处一致，不静默丢内容。
-			return lexical
+			// 造片段失败（计量失败）→ **上抛**：与别处一致，不静默丢内容。
+			// 此前这里是 `return lexical`——注释与代码相反：单个片段计量失败
+			// 会把整条融合结果（含宽松与语义两路候选）静默丢弃、退回纯词面，
+			// 且返回 nil 错误，降级完全不可见（issue #35）。
+			return nil, err
 		}
 		if !ok {
 			continue
@@ -169,7 +185,7 @@ func (p *Pipeline) fuse(ctx context.Context, lexical, loose []*candidate,
 		c.fusion = f.Score
 		out = append(out, c)
 	}
-	return out
+	return out, nil
 }
 
 // looseCandidates 把宽松路的事实卡变成候选片段。

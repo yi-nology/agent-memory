@@ -554,8 +554,14 @@ func (p *Promoter) merge(ctx context.Context, ns store.Namespace,
 func (p *Promoter) checkConflict(ctx context.Context, ns store.Namespace,
 	entityID string, c *types.Candidate) (*Verdict, error) {
 
+	// 归属限定必须进**取数层**（ScopeExact），不能取回来再滤：
+	// 这一路带 LIMIT 配额（按重要度/新鲜度取前 200），后置过滤时
+	// 别家归属的高重要度事实会先占满配额，本归属里真正矛盾的那张卡
+	// 根本进不了候选集——矛盾检测静默失效，候选被自动晋升，
+	// 库里同时留下两条互相矛盾的事实（issue #32）。
 	atoms, err := p.store.ListAtoms(ctx, ns, store.AtomFilter{
 		EntityIDs:  []string{entityID},
+		ScopeExact: c.Scope, // 归属逐字相同才算可比，连「全局的」也不参与比较
 		ActiveOnly: true,
 		Limit:      200,
 	})
@@ -563,6 +569,8 @@ func (p *Promoter) checkConflict(ctx context.Context, ns store.Namespace,
 		return nil, err
 	}
 	for _, a := range atoms {
+		// 纵深防御：ScopeExact 已在取数层生效，这里再挡一道
+		// （万一某个后端漏了条件，后果是跨环境误判矛盾）。
 		if a.Scope != c.Scope {
 			continue // 归属不同 = 不同环境，不是矛盾
 		}

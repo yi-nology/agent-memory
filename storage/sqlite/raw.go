@@ -84,9 +84,20 @@ func (s *rawStore) SaveRaw(ctx context.Context, ns store.Namespace, ev *types.Ra
 		if !ok {
 			return fmt.Errorf("事务内拿到的不是本后端实现，事件无法落库: %T", tx)
 		}
+		// **upsert 而不是纯 INSERT**（与 PG 侧逐字对齐，issue #29）：
+		// 事件的重放/重试是常态（at-least-once 捕获、崩溃恢复补写、迁移包
+		// 重复导入），纯 INSERT 在第二次写同 ID 时撞唯一键——错误被丢弃后
+		// 库里留着第一版，重试的那版**静默丢在库外**，且本地（SQLite）
+		// 失败、服务端（PG）正常的症状隔着部署形态，极难归因。
+		// 更新集是除键外的全字段（与 PG 一致）：重写一条事件 = 以最新为准。
 		if _, err := tsStore.exec(ctx, `INSERT INTO raw_events
 			(namespace, id, host, session_id, thread_id, user, scope, ts, type, content, payload, provenance)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(namespace, id) DO UPDATE SET
+				host = excluded.host, session_id = excluded.session_id,
+				thread_id = excluded.thread_id, user = excluded.user, scope = excluded.scope,
+				ts = excluded.ts, type = excluded.type, content = excluded.content,
+				payload = excluded.payload, provenance = excluded.provenance`,
 			nsOf(ns), ev.ID, ev.Host, ev.SessionID, ev.ThreadID, ev.User, string(ev.Scope),
 			ts(ev.Timestamp), string(ev.Type), ev.Content, mapJSON(ev.Payload),
 			provenanceJSON(provenanceOf(ev.Provenance)),
@@ -177,7 +188,7 @@ func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, scope types.
 		args = append(args, ts(before))
 	}
 	q += ` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`
-	args = append(args, limitOf(p.Limit, 50), p.Offset)
+	args = append(args, limitOf(p.Limit, defaultFetchLimit), p.Offset)
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
 		return nil, err

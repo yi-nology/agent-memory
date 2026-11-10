@@ -3,12 +3,14 @@ package recall_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yi-nology/agent-memory/pipeline/query"
 	"github.com/yi-nology/agent-memory/pipeline/recall"
 	"github.com/yi-nology/agent-memory/ports"
+	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
 )
 
@@ -345,3 +347,228 @@ func TestEventWindowFiltersOldEvents(t *testing.T) {
 		t.Fatalf("显式问历史时事件窗口应让位: %+v", res2.Snippets)
 	}
 }
+
+// 代词消解用的「最近实体」必须按 LastSeen 排序，而不是信存储的返回序。
+//
+// 纵深防御：宿主自实现的存储可能仍按 pinned 优先排（v0.11.0 及之前两个
+// 内置后端正是如此）——直接当「最近在前」喂给查询理解，「那个」就会恒定
+// 消解到三天前的钉住项，而不是当前正在聊的对象（issue #33）。
+func TestRecentEntitiesSortedByLastSeenForAnalyzer(t *testing.T) {
+	// 假存储**按钉住优先**返回（模拟没改过的后端）：钉住的旧实体在前。
+	f := &fakeReader{
+		pages: map[string]*types.EntityPage{},
+		stack: []*types.ActiveEntity{
+			{ThreadID: "th", EntityID: "ent-pinned-old", LastSeen: time.Now().Add(-72 * time.Hour), Pinned: true},
+			{ThreadID: "th", EntityID: "ent-current", LastSeen: time.Now()},
+		},
+	}
+	// fakeReader.ListActiveEntities 反序返回 → 钉住旧实体恰好排在第一位。
+	f.pages[pageKey("", "ent-pinned-old")] = &types.EntityPage{EntityID: "ent-pinned-old", Headline: "三天前的旧对象画像"}
+	f.pages[pageKey("", "ent-current")] = &types.EntityPage{EntityID: "ent-current", Headline: "当前话题对象的画像"}
+
+	cfg := recall.DefaultConfig()
+	cfg.Sources = []recall.Source{recall.SourcePageHeadline}
+	cfg.Analyzer = query.New(query.Config{})
+	p := newPipe(t, f, cfg)
+
+	res, err := p.Recall(context.Background(), recall.Request{
+		Namespace: ns, Query: "它的磁盘怎么样", ThreadID: "th",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 「它」应消解到最近提及的 ent-current，画像源带出的是当前话题的画像。
+	for _, s := range res.Snippets {
+		if s.Source == recall.SourcePageHeadline && strings.Contains(s.Body, "三天前的旧对象画像") {
+			t.Fatalf("代词消解到了钉住的旧实体（应指最近提及者）: %+v", res.Snippets)
+		}
+	}
+	found := false
+	for _, s := range res.Snippets {
+		if s.Source == recall.SourcePageHeadline && strings.Contains(s.Body, "当前话题对象的画像") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("代词应消解到最近提及的实体，画像没带出来: %+v", res.Snippets)
+	}
+}
+
+// ── 语义路的过滤条件与词面路同口径（第四轮 issue 清零，#31/#36/#35）──
+
+// recordingReader 记下语义路交给存储层的过滤条件。
+type recordingReader struct {
+	*fakeReader
+	filters []store.AtomFilter
+}
+
+func (r *recordingReader) ListAtoms(ctx context.Context, ns store.Namespace, f store.AtomFilter) ([]*types.AtomCard, error) {
+	r.filters = append(r.filters, f)
+	return r.fakeReader.ListAtoms(ctx, ns, f)
+}
+
+// 语义路交给存储层的过滤条件必须**逐条**与词面路一致：
+// EventSince（过期事件不进 prompt）、实体限定（边界不是装饰）、
+// Limit=len(ids)（候选池不静默截断）。
+func TestSemanticRouteFilterMatchesLexicalRoutes(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  func(*recall.Config)
+		req  recall.Request
+		// 断言（对语义路那次 ListAtoms 的过滤条件）：
+		wantEntityIDs  []string
+		wantEventSince bool
+		wantNoIDs      bool
+	}{
+		{
+			name: "带实体限定时限进语义路",
+			cfg: func(c *recall.Config) {
+				c.RestrictAtomsToEntities = true
+			},
+			req:            recall.Request{Namespace: ns, Query: "磁盘", Entities: []string{"entA"}},
+			wantEntityIDs:  []string{"entA"},
+			wantEventSince: true,
+		},
+		{
+			name: "显式限定为空 → 语义路一条不带",
+			cfg: func(c *recall.Config) {
+				c.RestrictAtomsToEntities = true
+			},
+			req: recall.Request{Namespace: ns, Query: "磁盘", Entities: nil},
+		},
+		{
+			name:           "默认口径：事件窗口在，不限实体",
+			cfg:            func(*recall.Config) {},
+			req:            recall.Request{Namespace: ns, Query: "磁盘"},
+			wantEventSince: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &recordingReader{fakeReader: &fakeReader{}}
+			cfg := recall.DefaultConfig()
+			cfg.Semantic = &fakeSemantic{ids: []string{"a1", "a2", "a3"}}
+			tc.cfg(&cfg)
+			p := newPipe(t, f, cfg)
+
+			_, err := p.Recall(context.Background(), tc.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "显式限定为空 → 语义路一条不带" {
+				// 这一条在取数之前就该早退：语义面命中也一条不带。
+				for _, flt := range f.filters {
+					if len(flt.IDs) > 0 {
+						t.Fatal("显式限定为空时，语义路不该取任何事实卡")
+					}
+				}
+				return
+			}
+			if len(f.filters) == 0 {
+				t.Fatal("语义路没有走存储层取事实卡")
+			}
+			got := f.filters[len(f.filters)-1]
+			if tc.wantEntityIDs != nil && !equalStrings(got.EntityIDs, tc.wantEntityIDs) {
+				t.Fatalf("实体限定没进语义路的取数: %+v", got)
+			}
+			if tc.wantEventSince && got.EventSince.IsZero() {
+				t.Fatalf("事件窗口没进语义路的取数: %+v", got)
+			}
+			if len(got.IDs) != 3 {
+				t.Fatalf("语义路应按融合出的标识集合取回（IDs=%v）: %+v", got.IDs, got)
+			}
+			if got.Limit < len(got.IDs) {
+				t.Fatalf("Limit 不该小于标识数（尾部会被静默截断）: %+v", got)
+			}
+		})
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// 语义路的**纵深防御**复查：事件类事实过了窗口，即便存储层漏了过滤
+// （宿主自实现的后端），也不能进 prompt。
+func TestSemanticRouteRechecksEventWindow(t *testing.T) {
+	stale := atom("stale", "e1", "三周前的一次重启", types.ImportanceHigh)
+	stale.Kind = types.FactEvent
+	stale.OccurredAt = time.Now().UTC().Add(-40 * 24 * time.Hour) // 超过 30 天默认窗口
+	fresh := atom("fresh", "e1", "今天的一次重启", types.ImportanceHigh)
+	fresh.Kind = types.FactEvent
+	fresh.OccurredAt = time.Now().UTC()
+
+	// 忽视过滤条件的假存储：把 EventSince 当不存在（模拟漏过滤的后端）。
+	leaky := &leakyFilterReader{fakeReader: &fakeReader{atoms: []*types.AtomCard{stale, fresh}}}
+	cfg := recall.DefaultConfig()
+	cfg.Semantic = &fakeSemantic{ids: []string{"stale", "fresh"}}
+	// 只留语义路带事实：词面路若也在跑，stale 从那条路进来会冤枉语义路。
+	cfg.Sources = []recall.Source{recall.SourceRaw}
+	cfg.NoCaptureFace = true // 摘掉 raw 源（fakeReader 没有捕获面）
+	p := newPipe(t, leaky, cfg)
+
+	res, err := p.Recall(context.Background(), recall.Request{Namespace: ns, Query: "重启"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range res.Snippets {
+		if s.RefID == "stale" {
+			t.Fatal("过了事件窗口的事实不该从语义路进 prompt（模型会把旧状态当当前状态）")
+		}
+	}
+	found := false
+	for _, s := range res.Snippets {
+		if s.RefID == "fresh" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("窗口内的事实应照常进 prompt")
+	}
+}
+
+// leakyFilterReader 故意无视 EventSince：只用于纵深防御用例。
+type leakyFilterReader struct {
+	*fakeReader
+}
+
+func (l *leakyFilterReader) ListAtoms(ctx context.Context, ns store.Namespace, f store.AtomFilter) ([]*types.AtomCard, error) {
+	since := f.EventSince
+	f.EventSince = time.Time{} // 模拟「漏了这条过滤」的后端
+	out, err := l.fakeReader.ListAtoms(ctx, ns, f)
+	f.EventSince = since
+	return out, err
+}
+
+// 融合时片段计量失败必须**上抛**，而不是静默退回纯词面路
+// ——整条融合结果（宽松 + 语义两路候选）被丢弃且返回 nil 错误，
+// 是「召回质量莫名下降」的隐形形态（issue #35）。
+func TestFuseSnippetFailurePropagates(t *testing.T) {
+	f := &fakeReader{atoms: []*types.AtomCard{atom("a1", "e1", "内存占用偏高", types.ImportanceHigh)}}
+	cfg := recall.DefaultConfig()
+	cfg.Semantic = &fakeSemantic{ids: []string{"a1"}}
+	cfg.Sources = []recall.Source{recall.SourceAtom}
+	p := newPipe(t, f, cfg)
+	// 计量器对语义路命中的那条失败。
+	fail := &failingEstimator{err: errors.New("计量器坏了")}
+	p2, err := recall.New(cfg, f, fail, ports.MemoryBand{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = p
+	if _, err := p2.Recall(context.Background(), recall.Request{Namespace: ns, Query: "磁盘"}); err == nil {
+		t.Fatal("片段计量失败必须上抛：静默退回纯词面路 = 融合结果整条被丢且不可见")
+	}
+}
+
+type failingEstimator struct{ err error }
+
+func (e *failingEstimator) Estimate(context.Context, string) (int, error) { return 0, e.err }

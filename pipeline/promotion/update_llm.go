@@ -96,7 +96,7 @@ func UpdatePrompt(oldAssertion, newAssertion string) string {
 // 模型给不出合法 JSON、或给了不认识的关系 → 当作 conflict（送人工）。
 // 理由：判不出意味着**不该自动裁决**，而「送人工」正是本仓的默认姿态。
 // 但「模型调用失败」（网络/超时）是另一回事 → 上抛。
-func classifyUpdate(out string) (relation, string, error) {
+func classifyUpdate(out string) (relation, string) {
 	s := strings.TrimSpace(out)
 	// 解析走 oekit/pkg/jsonrepair：围栏剥离 → 直解 → 语法级修复（尾逗号 /
 	// 全角冒号 / 未闭合括号）→ 散文里抽对象只有一份实现。
@@ -109,21 +109,26 @@ func classifyUpdate(out string) (relation, string, error) {
 		Reason   string `json:"reason"`
 	}
 	if err := jsonrepair.Unmarshal(s, &obj); err != nil {
-		return relationConflict, "", fmt.Errorf("判定结果解析失败: %w", err)
+		// 解析失败与「关系串不认识」同款处置：送人工（conflict），**不上抛**。
+		// 上抛会让 askModel 的调用点把整笔晋升回滚、候选永远停在 pending
+		// ——与本函数 godoc「判不出来 → conflict → 送人工」相反，
+		// 且反复重试同一输出永远失败（症状是「事实更新悄悄停了」+ 候选积压）。
+		// error 只留给「模型调用失败」（网络/超时），那在 askModel 里。
+		return relationConflict, "判定结果解析失败：" + err.Error()
 	}
 	switch relation(strings.ToLower(strings.TrimSpace(obj.Relation))) {
 	case relationAdd:
-		return relationAdd, obj.Reason, nil
+		return relationAdd, obj.Reason
 	case relationUpdate:
-		return relationUpdate, obj.Reason, nil
+		return relationUpdate, obj.Reason
 	case relationDelete:
-		return relationDelete, obj.Reason, nil
+		return relationDelete, obj.Reason
 	case relationNoop:
-		return relationNoop, obj.Reason, nil
+		return relationNoop, obj.Reason
 	case relationConflict:
-		return relationConflict, obj.Reason, nil
+		return relationConflict, obj.Reason
 	default:
-		return relationConflict, obj.Reason, nil
+		return relationConflict, obj.Reason
 	}
 }
 
@@ -142,9 +147,6 @@ func (p *Promoter) askModel(ctx context.Context, c *types.Candidate, old *types.
 	if err != nil {
 		return relationConflict, "", fmt.Errorf("事实更新判定调用模型失败: %w", err)
 	}
-	rel, reason, err := classifyUpdate(out)
-	if err != nil {
-		return relationConflict, "", err
-	}
+	rel, reason := classifyUpdate(out)
 	return rel, reason, nil
 }

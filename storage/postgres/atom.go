@@ -175,7 +175,7 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 	// importance 列是 TEXT，字典序下 'med' > 'low' > 'high'，最重要的会排最后。
 	q := `SELECT ` + atomCols + ` FROM atoms WHERE ` + strings.Join(where, " AND ") +
 		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT $` + fmt.Sprint(len(args)+1)
-	args = append(args, limitOf(f.Limit, 50))
+	args = append(args, limitOf(f.Limit, defaultFetchLimit))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
@@ -240,6 +240,14 @@ func atomConditions(f store.AtomFilter, start int) (string, []any) {
 		// 这里是它的可执行形态。
 		where = append(where, "(scope = '' OR scope = $"+fmt.Sprint(start)+")")
 		args = append(args, string(f.Scope))
+		start++
+	}
+	if f.ScopeExact != "" {
+		// 归属**严格等于**：连全局的也不要（同归属比较语义，见
+		// store.AtomFilter.ScopeExact）。必须在这里生效而不是后置过滤：
+		// 后置时被滤掉的条目已经占掉 LIMIT 配额（issue #32）。
+		where = append(where, "scope = $"+fmt.Sprint(start))
+		args = append(args, string(f.ScopeExact))
 		start++
 	}
 	if f.ActiveOnly {

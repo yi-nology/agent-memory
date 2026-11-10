@@ -464,3 +464,83 @@ func TestStatsCountEverything(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// 取代（update）之后画像必须标脏——与晋升（promote）同口径。
+//
+// 这条曾经漏过：markPageDirty 只认 promote，取代路的新事实生效、旧事实退役，
+// 而页面不脏 ⇒ 宿主的 page.regen 只重生成脏页 ⇒ 画像正文永久停在旧值
+// （页面写「容量 4G」而事实已 8G），且页面存在、看板无异常（issue #43）。
+func TestUpdateDecisionMarksPageDirty(t *testing.T) {
+	ctx := context.Background()
+	s := openFresh(t)
+	llm := fakeLLM{
+		extract: `[{"assertion":"机器甲的内存容量是 8G","quote":"机器甲的内存容量是 8G",` +
+			`"event_id":"ev2","type":"fact","subject_name":"机器甲",` +
+			`"importance":"high","confidence":"high"}]`,
+	}
+	svc, err := application.New(
+		application.Config{Namespace: ns, Host: "it"},
+		application.Deps{
+			Store: s, Redactor: ports.PatternRedactor{}, Bander: ports.MemoryBand{},
+			LLM: llm,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 既有事实：容量 4G。它就是接下来被取代的那条。
+	res, err := entity.New(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent, err := res.Register(ctx, ns, "机器甲", types.EntityType("service"), "", types.DecidedUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAtom := &types.AtomCard{
+		ID: "a-old", EntityID: ent.ID, Assertion: "机器甲的内存容量是 4G",
+		QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+		Importance: types.ImportanceMed, Confidence: types.ConfidenceMed,
+		OccurredAt: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := s.SaveAtom(ctx, ns, oldAtom); err != nil {
+		t.Fatal(err)
+	}
+
+	// 新事件 → 候选：同一主体、值变了（4G → 8G）。
+	cap, err := svc.Capture(ctx, application.CaptureInput{
+		EventID: "ev2", Type: types.EventTurnEnd,
+		Content: "机器甲的内存容量是 8G", SessionID: "s1", ThreadID: "t1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cands, err := svc.Extract(ctx, ns, "s1", []*types.RawEvent{cap.Event})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("应抽出 1 条候选，实得 %d 条", len(cands))
+	}
+	if err := s.SaveCandidate(ctx, ns, cands[0]); err != nil {
+		t.Fatal(err)
+	}
+	v, err := svc.Promote(ctx, ns, cands[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Decision != "update" {
+		t.Fatalf("同一主体且值变了应走取代，实得 %+v", v)
+	}
+
+	// 取代后该实体的页面必须脏：事实的断言正文换掉了，
+	// 画像是断言的摘要，不标脏就永远停在「4G」那一版。
+	pg, err := s.GetEntityPage(ctx, ns, ent.ID, "")
+	if err != nil {
+		t.Fatalf("取代后应自建脏页面: %v", err)
+	}
+	if !pg.Dirty {
+		t.Fatal("取代（update）必须把该实体的画像标脏：事实变了摘要就该重算")
+	}
+}

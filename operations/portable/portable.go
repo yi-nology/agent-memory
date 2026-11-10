@@ -469,7 +469,10 @@ type Target interface {
 type ImportReport struct {
 	// Counts 各类导入条数。
 	Counts map[string]int
-	// Skipped 跳过的条数（已存在或校验不过）。
+	// Skipped 跳过的条数（已存在：重复导入同一批记忆时不再写第二份）。
+	//
+	// v0.11.0 及之前这是死字段——全仓没有任何一处写它：重导同一个包
+	// 直接撞唯一键报错，宿主拿不到任何可观测的量（issue #30）。
 	Skipped int
 }
 
@@ -534,133 +537,154 @@ func Import(ctx context.Context, pkgPath string, tgt Target, ns store.Namespace)
 		return json.Unmarshal(raw, dst)
 	}
 
-	err = read(fileRaw, func(raw json.RawMessage) error {
-		var v types.RawEvent
-		if err := decode(raw, &v); err != nil {
-			return err
+	// importAll 把九类数据逐文件落库（probe 非 nil 时带「已存在 → 跳过」）。
+	//
+	// 幂等的判据是**主键存在**：同一批记忆重导（重试、换机器）时，
+	// 已在库里的一条不再写第二份——而不是靠 upsert 静默覆盖
+	// （覆盖会重置 decided_at 这类落定痕迹，且宿主看不见发生过什么）。
+	importAll := func(t Target, probe *importProbe) error {
+		// admit 统一「探存在 → 跳过计数 / 落库计数」的骨架，九类共用。
+		admit := func(kind string, exists func() (bool, error), write func() error) error {
+			if probe != nil {
+				ok, err := exists()
+				if err != nil {
+					return err
+				}
+				if ok {
+					out.Skipped++
+					return nil
+				}
+			}
+			if err := write(); err != nil {
+				return err
+			}
+			out.Counts[kind]++
+			return nil
 		}
-		if err := tgt.SaveRaw(ctx, ns, &v); err != nil {
-			return err
+		steps := []struct {
+			file string
+			run  func(json.RawMessage) error
+		}{
+			{fileRaw, func(raw json.RawMessage) error {
+				var v types.RawEvent
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("raw",
+					func() (bool, error) { return probe.raw(ctx, ns, v.ID) },
+					func() error { return t.SaveRaw(ctx, ns, &v) },
+				)
+			}},
+			{fileAtoms, func(raw json.RawMessage) error {
+				var v types.AtomCard
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("atoms",
+					func() (bool, error) { return probe.atom(ctx, ns, v.ID) },
+					func() error { return t.SaveAtom(ctx, ns, &v) },
+				)
+			}},
+			{fileEntities, func(raw json.RawMessage) error {
+				var v types.Entity
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("entities",
+					func() (bool, error) { return probe.entity(ctx, ns, v.ID) },
+					func() error { return t.SaveEntity(ctx, ns, &v) },
+				)
+			}},
+			{fileAliases, func(raw json.RawMessage) error {
+				var v types.Alias
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("aliases",
+					func() (bool, error) { return probe.alias(ctx, ns, v.EntityID, v.Alias) },
+					func() error { return t.SaveAlias(ctx, ns, &v) },
+				)
+			}},
+			{filePages, func(raw json.RawMessage) error {
+				var v types.EntityPage
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("pages",
+					func() (bool, error) { return probe.page(ctx, ns, v.EntityID, v.Scope) },
+					func() error { return t.UpsertEntityPage(ctx, ns, &v) },
+				)
+			}},
+			{fileEpisodes, func(raw json.RawMessage) error {
+				var v types.Episode
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("episodes",
+					func() (bool, error) { return probe.episode(ctx, ns, v.ID) },
+					func() error { return t.SaveEpisode(ctx, ns, &v) },
+				)
+			}},
+			{fileDigests, func(raw json.RawMessage) error {
+				var v types.DigestRecord
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("digests",
+					func() (bool, error) { return probe.digest(ctx, ns, v.Period, v.PeriodKey) },
+					func() error { return t.SaveDigest(ctx, ns, &v) },
+				)
+			}},
+			{fileCandidates, func(raw json.RawMessage) error {
+				var v types.Candidate
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("candidates",
+					func() (bool, error) { return probe.candidate(ctx, ns, v.ID) },
+					func() error { return t.SaveCandidate(ctx, ns, &v) },
+				)
+			}},
+			{fileJournal, func(raw json.RawMessage) error {
+				var v types.JournalEntry
+				if err := decode(raw, &v); err != nil {
+					return err
+				}
+				return admit("journal",
+					func() (bool, error) { return probe.journalID(ctx, ns, v.ID) },
+					func() error { return t.AppendJournal(ctx, ns, &v) },
+				)
+			}},
 		}
-		out.Counts["raw"]++
+		for _, step := range steps {
+			if err := read(step.file, step.run); err != nil {
+				return err
+			}
+		}
 		return nil
-	})
-	if err != nil {
-		return out, err
 	}
-	err = read(fileAtoms, func(raw json.RawMessage) error {
-		var v types.AtomCard
-		if err := decode(raw, &v); err != nil {
-			return err
+
+	// 整包导入要么全落、要么一句不落：目标实现了事务面（store.Store 天然
+	// 满足）时整体包一层——此前逐类落库没有事务，后半程出错时前半程
+	// 已落库，宿主拿到一个静默残缺的记忆库且不知道缺了什么（issue #30）。
+	// 探测在**同一个事务里**做：本包前半程刚写入的行，后半程的重号行
+	// 会作为「已存在」跳过（包内重复行不落第二份）。
+	run := func(t Target) error {
+		var probe *importProbe
+		if p, ok := t.(ExistingProbe); ok {
+			probe = &importProbe{r: p}
 		}
-		if err := tgt.SaveAtom(ctx, ns, &v); err != nil {
-			return err
-		}
-		out.Counts["atoms"]++
-		return nil
-	})
-	if err != nil {
-		return out, err
+		return importAll(t, probe)
 	}
-	err = read(fileEntities, func(raw json.RawMessage) error {
-		var v types.Entity
-		if err := decode(raw, &v); err != nil {
-			return err
-		}
-		if err := tgt.SaveEntity(ctx, ns, &v); err != nil {
-			return err
-		}
-		out.Counts["entities"]++
-		return nil
-	})
-	if err != nil {
-		return out, err
+	if tx, ok := tgt.(transactor); ok {
+		err = tx.Transaction(ctx, func(ctx context.Context, s store.Store) error {
+			return run(s)
+		})
+	} else {
+		err = run(tgt)
 	}
-	err = read(fileAliases, func(raw json.RawMessage) error {
-		var v types.Alias
-		if err := decode(raw, &v); err != nil {
-			return err
-		}
-		if err := tgt.SaveAlias(ctx, ns, &v); err != nil {
-			return err
-		}
-		out.Counts["aliases"]++
-		return nil
-	})
-	if err != nil {
-		return out, err
-	}
-	err = read(filePages, func(raw json.RawMessage) error {
-		var v types.EntityPage
-		if err := decode(raw, &v); err != nil {
-			return err
-		}
-		if err := tgt.UpsertEntityPage(ctx, ns, &v); err != nil {
-			return err
-		}
-		out.Counts["pages"]++
-		return nil
-	})
-	if err != nil {
-		return out, err
-	}
-	err = read(fileEpisodes, func(raw json.RawMessage) error {
-		var v types.Episode
-		if err := decode(raw, &v); err != nil {
-			return err
-		}
-		if err := tgt.SaveEpisode(ctx, ns, &v); err != nil {
-			return err
-		}
-		out.Counts["episodes"]++
-		return nil
-	})
-	if err != nil {
-		return out, err
-	}
-	err = read(fileDigests, func(raw json.RawMessage) error {
-		var v types.DigestRecord
-		if err := decode(raw, &v); err != nil {
-			return err
-		}
-		if err := tgt.SaveDigest(ctx, ns, &v); err != nil {
-			return err
-		}
-		out.Counts["digests"]++
-		return nil
-	})
-	if err != nil {
-		return out, err
-	}
-	err = read(fileCandidates, func(raw json.RawMessage) error {
-		var v types.Candidate
-		if err := decode(raw, &v); err != nil {
-			return err
-		}
-		if err := tgt.SaveCandidate(ctx, ns, &v); err != nil {
-			return err
-		}
-		out.Counts["candidates"]++
-		return nil
-	})
-	if err != nil {
-		return out, err
-	}
-	err = read(fileJournal, func(raw json.RawMessage) error {
-		var v types.JournalEntry
-		if err := decode(raw, &v); err != nil {
-			return err
-		}
-		if err := tgt.AppendJournal(ctx, ns, &v); err != nil {
-			return err
-		}
-		out.Counts["journal"]++
-		return nil
-	})
-	if err != nil {
-		return out, err
-	}
-	return out, nil
+
+	return out, err
 }
 
 func lookup(zr *zip.Reader, name string) (*zip.File, bool) {

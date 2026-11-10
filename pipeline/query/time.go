@@ -141,6 +141,14 @@ var timeMatchers = []timeMatcher{
 		},
 	},
 	{
+		name: "大前天", re: regexp.MustCompile(`大前天`),
+		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
+			day := timex.BeginningOfDay(now).AddDate(0, 0, -3)
+			return types.TimeWindow{From: day, To: day.AddDate(0, 0, 1)}
+		},
+		dayLevel: true,
+	},
+	{
 		name: "前天", re: regexp.MustCompile(`前天`),
 		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			day := timex.BeginningOfDay(now).AddDate(0, 0, -2)
@@ -149,7 +157,12 @@ var timeMatchers = []timeMatcher{
 		dayLevel: true,
 	},
 	{
-		name: "昨天", re: regexp.MustCompile(`(昨天|昨日|昨儿|昨)`),
+		// 今/明/昨的**单字备选已删**：中文里这三个字几乎只在词内出现
+		// （「如今」「说明」「昨」在「昨夜」这类文言残留之外没有单用形态），
+		// 单字备选把「说明上次的变更」抽成「明天」窗、「如今的部署状况」
+		// 抽成「今天」窗——时间窗错位 + 词面被吞，全程静默（issue #38）。
+		// 要新增说法就写全形态（「明儿」「昨儿」这类口语已各自列出）。
+		name: "昨天", re: regexp.MustCompile(`(昨天|昨日|昨儿)`),
 		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			day := timex.BeginningOfDay(now).AddDate(0, 0, -1)
 			return types.TimeWindow{From: day, To: day.AddDate(0, 0, 1)}
@@ -157,7 +170,7 @@ var timeMatchers = []timeMatcher{
 		dayLevel: true,
 	},
 	{
-		name: "今天", re: regexp.MustCompile(`(今天|今日|今儿|今)`),
+		name: "今天", re: regexp.MustCompile(`(今天|今日|今儿)`),
 		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			day := timex.BeginningOfDay(now)
 			return types.TimeWindow{From: day, To: day.AddDate(0, 0, 1)}
@@ -165,7 +178,7 @@ var timeMatchers = []timeMatcher{
 		dayLevel: true,
 	},
 	{
-		name: "明天", re: regexp.MustCompile(`(明天|明日|明儿|明)`),
+		name: "明天", re: regexp.MustCompile(`(明天|明日|明儿)`),
 		resolve: func(g []string, now time.Time, _ time.Weekday) types.TimeWindow {
 			day := timex.BeginningOfDay(now).AddDate(0, 0, 1)
 			return types.TimeWindow{From: day, To: day.AddDate(0, 0, 1)}

@@ -67,13 +67,16 @@ func Run(t *testing.T, open OpenFn) {
 		{"捕获事件：全文检索", tRawSearch},
 		{"捕获事件：按龄清理连带索引", tRawDeleteBefore},
 		{"捕获事件：来源凭证往返", tRawProvenance},
+		{"捕获事件：重复保存是更新而不是冲突", tRawSaveIsUpsert},
 		{"候选：存取与状态流转", tCandidateLifecycle},
 		{"候选：重复检测只认未落定", tCandidateDuplicate},
 		{"候选：乐观锁挡住并发覆盖", tCandidateStaleWrite},
 		{"候选：并列创建时刻的列表顺序确定", tCandidateListOrderDeterministic},
+		{"候选：重复保存是更新而不是冲突", tCandidateSaveIsUpsert},
 		{"事实卡：软退役两态都排除出召回", tAtomRetiredExcluded},
 		{"事实卡：签名去重", tAtomSignature},
 		{"事实卡：全文检索只命中相关事实", tAtomSearch},
+		{"事实卡：检索路与列表路的缺省条数同源", tAtomSearchDefaultLimitMatchesList},
 		{"事实卡：中文子串检索命中真实形态中文", tAtomSearchChineseSubstring},
 		{"事实卡：形状校验拦无出处", tAtomValidation},
 		{"事实卡：退役后仍可搜到（可追问「当初为何」）", tAtomRetiredStillSearchable},
@@ -85,6 +88,7 @@ func Run(t *testing.T, open OpenFn) {
 		{"事实卡：归属隔离（全局 + 同归属）", tAtomScopeIsolation},
 		{"事实卡：检索路也按归属隔离", tAtomScopeSearchIsolation},
 		{"事实卡：归属过滤在取数层（配额不被别家吃掉）", tAtomScopeSearchQuota},
+		{"事实卡：归属严格等于在取数层（配额不被全局吃掉）", tAtomScopeExactFiltersAtFetch},
 		{"事实卡：按时刻过滤（生效区间）", tAtomTemporalFilter},
 		{"事实卡：老数据（无生效区间）按发生时刻算", tAtomLegacyEffectiveByOccurredAt},
 		{"事实卡：时效类别往返", tAtomKindRoundTrip},
@@ -106,6 +110,7 @@ func Run(t *testing.T, open OpenFn) {
 		{"实体：计数钳到 0 不报错", tEntityCountClamp},
 		{"活跃实体栈：钉住项不参与淘汰", tActiveEntityPin},
 		{"活跃实体栈：按最近提及排序", tActiveEntityOrder},
+		{"活跃实体栈：钉住项不改变读取顺序", tActiveEntityPinnedKeepsOrder},
 		{"活跃实体栈：淘汰期间并发落钉", tActiveEntityEvictPinRace},
 		{"页面：标脏在页面不存在时自建", tPageMarkDirtyCreates},
 		{"页面：重生成失败保持脏标记", tPageRegenFailureKeepsDirty},
@@ -199,6 +204,53 @@ func tRawRoundTrip(t *testing.T, s store.Store) {
 
 	if _, err := s.GetRaw(bg(), nsA, "不存在"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("不存在应判 ErrNotFound，实得 %v", err)
+	}
+}
+
+// 重复保存是更新而不是冲突——与事实卡（tAtomSaveIsUpsert）同款承诺。
+//
+// 这条断言曾经缺位：SQLite 侧两张表（raw_events / candidates）是纯 INSERT，
+// 第二次写同 ID 撞唯一键，重放/重试在本地后端直接失败——而 PG 是 upsert，
+// 分叉没被 parity 挡住（issue #29）。
+func tRawSaveIsUpsert(t *testing.T, s store.Store) {
+	first := &types.RawEvent{
+		ID: "e-up", Host: "h1", Timestamp: base, Type: types.EventManual, Content: "第一版内容",
+	}
+	if err := s.SaveRaw(bg(), nsA, first); err != nil {
+		t.Fatal(err)
+	}
+	second := &types.RawEvent{
+		ID: "e-up", Host: "h2", SessionID: "s2", Timestamp: base.Add(time.Hour),
+		Type: types.EventManual, Content: "第二版内容",
+	}
+	if err := s.SaveRaw(bg(), nsA, second); err != nil {
+		t.Fatalf("重复保存应是更新而不是唯一键冲突: %v", err)
+	}
+	got, err := s.GetRaw(bg(), nsA, "e-up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Content != "第二版内容" || got.Host != "h2" || got.SessionID != "s2" {
+		t.Fatalf("重复保存未落更新: %+v", got)
+	}
+	if !got.Timestamp.Equal(base.Add(time.Hour)) {
+		t.Fatalf("时刻未随更新: %v", got.Timestamp)
+	}
+	// FTS 索引要跟着换版：行换了内容、索引还停在旧正文的话，
+	// 新词搜不到、旧词还在命中——「搜得到但取不到」的镜像形态。
+	hits, err := s.SearchRaw(bg(), nsA, "", "第二版内容", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].ID != "e-up" {
+		t.Fatalf("索引应命中新版正文: %+v", hits)
+	}
+	old, err := s.SearchRaw(bg(), nsA, "", "第一版内容", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(old) != 0 {
+		t.Fatalf("旧版正文不该再命中: %+v", old)
 	}
 }
 
@@ -367,6 +419,38 @@ func tCandidateLifecycle(t *testing.T, s store.Store) {
 	}
 }
 
+// 重复保存是更新而不是冲突——raw 面那条（tRawSaveIsUpsert）的候选同款。
+//
+// 候选的重放面比事件还宽：迁移包重导、晋升器读改写回写都会再写同 ID。
+func tCandidateSaveIsUpsert(t *testing.T, s store.Store) {
+	first := &types.Candidate{
+		ID: "c-up", RawEventIDs: []string{"e1"}, Type: types.CandidateFact,
+		Status: types.CandidatePending, Assertion: "第一版断言",
+		SubjectName: "机器甲", Confidence: types.ConfidenceMed, Importance: types.ImportanceMed,
+		CreatedAt: base,
+	}
+	if err := s.SaveCandidate(bg(), nsA, first); err != nil {
+		t.Fatal(err)
+	}
+	second := &types.Candidate{
+		ID: "c-up", RawEventIDs: []string{"e1", "e2"}, Type: types.CandidateFact,
+		Status: types.CandidatePending, Assertion: "第二版断言",
+		SubjectName: "机器甲", Confidence: types.ConfidenceHigh, Importance: types.ImportanceHigh,
+		CreatedAt: base.Add(time.Hour),
+	}
+	if err := s.SaveCandidate(bg(), nsA, second); err != nil {
+		t.Fatalf("重复保存应是更新而不是唯一键冲突: %v", err)
+	}
+	got, err := s.GetCandidate(bg(), nsA, "c-up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Assertion != "第二版断言" || got.Confidence != types.ConfidenceHigh ||
+		len(got.RawEventIDs) != 2 {
+		t.Fatalf("重复保存未落更新: %+v", got)
+	}
+}
+
 func tCandidateDuplicate(t *testing.T, s store.Store) {
 	mk := func(id string, status types.CandidateStatus) *types.Candidate {
 		return &types.Candidate{
@@ -413,101 +497,6 @@ func tCandidateStaleWrite(t *testing.T, s store.Store) {
 	got, _ := s.GetCandidate(bg(), nsA, "c1")
 	if got.Status != types.CandidatePromoted || got.PromotionReason != "先到" {
 		t.Fatalf("后到的判定不得覆盖先到的: %+v", got)
-	}
-}
-
-// ── 实体 ──
-
-func tEntityLookupBothPaths(t *testing.T, s store.Store) {
-	_ = s.SaveEntity(bg(), nsA, &types.Entity{
-		ID: "e1", EntityType: "机器", CanonicalName: "机器甲", CreatedAt: base,
-	})
-	// 规范名路径
-	got, err := s.FindEntityByName(bg(), nsA, "机器甲")
-	if err != nil {
-		t.Fatalf("规范名查不到: %v", err)
-	}
-	if got.ID != "e1" {
-		t.Fatalf("实得 %s", got.ID)
-	}
-	// 别名路径——漏掉这条的后果是「用户换个说法就召回不到」
-	_ = s.SaveAlias(bg(), nsA, &types.Alias{
-		Alias: "那台开发机", EntityID: "e1", EntityType: "机器",
-		CreatedBy: types.DecidedUser, CreatedAt: base,
-	})
-	viaAlias, err := s.FindEntityByName(bg(), nsA, "那台开发机")
-	if err != nil {
-		t.Fatalf("别名查不到: %v", err)
-	}
-	if viaAlias.ID != "e1" || len(viaAlias.Aliases) != 1 {
-		t.Fatalf("别名路径结果失真: %+v", viaAlias)
-	}
-}
-
-func tEntityCountClamp(t *testing.T, s store.Store) {
-	_ = s.SaveEntity(bg(), nsA, &types.Entity{ID: "e1", CanonicalName: "机器甲", CreatedAt: base})
-	// 退役一条事实时计数会减，计数已是 0 时不许报错（否则真事实退役被阻断）。
-	if err := s.BumpEntityAtomCount(bg(), nsA, "e1", -1); err != nil {
-		t.Fatalf("计数为负必须钳住而不是报错: %v", err)
-	}
-	got, err := s.GetEntity(bg(), nsA, "e1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.AtomCount != 0 {
-		t.Fatalf("计数应钳到 0，实得 %d", got.AtomCount)
-	}
-}
-
-func tActiveEntityPin(t *testing.T, s store.Store) {
-	_ = s.UpsertActiveEntity(bg(), nsA, &types.ActiveEntity{
-		ThreadID: "th", EntityID: "e-old", CanonicalName: "很久以前",
-		LastSeen: base.Add(-time.Hour),
-	})
-	_ = s.UpsertActiveEntity(bg(), nsA, &types.ActiveEntity{
-		ThreadID: "th", EntityID: "e-pin", CanonicalName: "刚确认的",
-		LastSeen: base.Add(-2 * time.Hour), Pinned: true, PinTime: base,
-	})
-	_ = s.UpsertActiveEntity(bg(), nsA, &types.ActiveEntity{
-		ThreadID: "th", EntityID: "e-new", CanonicalName: "刚提到的",
-		LastSeen: base,
-	})
-
-	victims, err := s.EvictActiveEntities(bg(), nsA, "th", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, v := range victims {
-		if v.EntityID == "e-pin" {
-			t.Fatal("钉住项不得被淘汰：用户刚确认过的对象滑出栈会让「那个」立刻指错人")
-		}
-	}
-	left, err := s.ListActiveEntities(bg(), nsA, "th", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids := map[string]bool{}
-	for _, a := range left {
-		ids[a.EntityID] = true
-	}
-	if !ids["e-pin"] || !ids["e-new"] {
-		t.Fatalf("淘汰后应留下钉住项与最近项，实得 %v", ids)
-	}
-}
-
-func tActiveEntityOrder(t *testing.T, s store.Store) {
-	_ = s.UpsertActiveEntity(bg(), nsA, &types.ActiveEntity{
-		ThreadID: "th", EntityID: "e1", LastSeen: base.Add(-time.Hour),
-	})
-	_ = s.UpsertActiveEntity(bg(), nsA, &types.ActiveEntity{
-		ThreadID: "th", EntityID: "e2", LastSeen: base,
-	})
-	got, err := s.ListActiveEntities(bg(), nsA, "th", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0].EntityID != "e2" {
-		t.Fatalf("应按最近提及倒序，栈顶是当前话题")
 	}
 }
 

@@ -224,3 +224,31 @@ func TestEmptyEventsSkipCall(t *testing.T) {
 		t.Fatal("空素材不该发起模型调用")
 	}
 }
+
+// LLM 常态抖动（尾逗号 / 全角冒号）不该把整批候选作废。
+//
+// 同一类格式噪声在事实更新判定面已被 jsonrepair 吸收（update_llm.go），
+// 抽取面此前仍是手搓版：尾逗号一个就 ParseError，整批候选丢失——
+// 失败模式与「模型真没给内容」无法区分（issue #41）。
+func TestToleratesCommonJSONNoise(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+	}{
+		{"尾逗号", `[{"assertion":"磁盘长期偏小","quote":"磁盘长期偏小","event_id":"e1","type":"fact","subject_name":"机器甲","importance":"high","confidence":"high",}]`},
+		{"全角冒号", `[{"assertion"："磁盘长期偏小","quote":"磁盘长期偏小","event_id":"e1","type":"fact","subject_name":"机器甲","importance":"high","confidence":"high"}]`},
+		{"散文包裹", `好的，抽取结果如下：[{"assertion":"磁盘长期偏小","quote":"磁盘长期偏小","event_id":"e1","type":"fact","subject_name":"机器甲","importance":"high","confidence":"high"}] 以上。`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := extractor.New(&fakeLLM{out: tc.out})
+			cands, err := e.Extract(ctx2(), store.Namespace("t"), "s1", events())
+			if err != nil {
+				t.Fatalf("格式噪声不该把整批候选作废: %v", err)
+			}
+			if len(cands) != 1 {
+				t.Fatalf("应解析出 1 条候选，实得 %d 条", len(cands))
+			}
+		})
+	}
+}

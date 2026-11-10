@@ -2,6 +2,7 @@ package parity
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -168,6 +169,38 @@ func tAtomSaveIsUpsert(t *testing.T, s store.Store) {
 	}
 	if len(got.RawEventIDs) != 2 {
 		t.Fatalf("重复保存未落更新: %+v", got.RawEventIDs)
+	}
+}
+
+// 检索路的缺省条数与列表路**同源同值**。
+//
+// AtomFilter.Limit 的契约是「0=后端默认」；两条路的默认各写一个数时
+// （列表 50、检索 10），同一参数在两条路上拿到 5 倍差距的候选池——
+// 症状是「搜索反而不如不搜」，数据上完全看不出（issue #37）。
+func tAtomSearchDefaultLimitMatchesList(t *testing.T, s store.Store) {
+	// 60 张可命中的卡（同一检索词、不同标识），超过缺省 50 才测得出兜底值。
+	for i := range 60 {
+		id := fmt.Sprintf("bulk-%02d", i)
+		a := atom(id, "e1", "例行记录 "+id, "ev1", types.ImportanceLow)
+		if err := s.SaveAtom(bg(), nsA, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 检索路：不设 Limit（0=后端默认）。
+	hits, err := s.SearchAtoms(bg(), nsA, "例行记录", store.AtomFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 列表路：不设 Limit。
+	listed, err := s.ListAtoms(bg(), nsA, store.AtomFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != len(listed) {
+		t.Fatalf("两条路的缺省条数必须一致（候选池不该差 5 倍）: 检索 %d vs 列表 %d", len(hits), len(listed))
+	}
+	if len(hits) == 0 || len(hits) > 60 {
+		t.Fatalf("缺省应兜到 50 一档，实得 %d", len(hits))
 	}
 }
 

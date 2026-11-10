@@ -3,6 +3,9 @@ package promotion_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,13 +61,37 @@ func (f *fakeStore) FindAtomBySignature(_ context.Context, _ store.Namespace, si
 	return nil, store.ErrNotFound
 }
 
+// ListAtoms 复刻后端的取数语义：过滤条件在**取数层**生效、按
+// 「重要度 → 发生时刻 → 标识」排序后再截 LIMIT——
+// 「别家条目占满配额」这类失效只有排序 + 截断都真的做，才在用例里现形。
 func (f *fakeStore) ListAtoms(_ context.Context, _ store.Namespace, flt store.AtomFilter) ([]*types.AtomCard, error) {
 	var out []*types.AtomCard
 	for _, a := range f.atoms {
 		if flt.ActiveOnly && !a.Active() {
 			continue
 		}
+		if flt.Scope != "" && a.Scope != "" && a.Scope != flt.Scope {
+			continue
+		}
+		if flt.ScopeExact != "" && a.Scope != flt.ScopeExact {
+			continue
+		}
+		if len(flt.EntityIDs) > 0 && !slices.Contains(flt.EntityIDs, a.EntityID) {
+			continue
+		}
 		out = append(out, a)
+	}
+	slices.SortFunc(out, func(x, y *types.AtomCard) int {
+		if rx, ry := x.Importance.Rank(), y.Importance.Rank(); rx != ry {
+			return ry - rx
+		}
+		if !x.OccurredAt.Equal(y.OccurredAt) {
+			return y.OccurredAt.Compare(x.OccurredAt)
+		}
+		return strings.Compare(x.ID, y.ID)
+	})
+	if flt.Limit > 0 && len(out) > flt.Limit {
+		out = out[:flt.Limit]
 	}
 	return out, nil
 }
@@ -426,5 +453,87 @@ func TestNoMergeAcrossScopes(t *testing.T) {
 	}
 	if v.Atom != nil && v.Atom.Scope != "scope-a" {
 		t.Fatalf("新卡的归属应是本组: %q", v.Atom.Scope)
+	}
+}
+
+// ── 归属过滤必须进取数层（第四轮 issue 清零，#32）──
+
+// 同实体下塞满别家归属的高重要度事实时，本归属里那条低重要度的矛盾事实
+// **仍必须**被判为矛盾（送人工）——归属过滤在 LIMIT 之后做的话，
+// 配额被别家吃光，矛盾检测静默失效，候选被自动晋升，
+// 库里同时留下两条互相矛盾的事实。
+func TestConflictQuotaNotEatenByOtherScopes(t *testing.T) {
+	f := newFake()
+	f.raws["e1"] = &types.RawEvent{ID: "e1", Content: "内存泄漏未修复"}
+	f.ents["e1"] = &types.Entity{ID: "e1", CanonicalName: "机器甲"}
+	// 本归属的矛盾事实：重要度**低**（排不进「被别家占满的」前 200 条
+	// ——只有归属过滤进取数层，它才进得了候选集）。
+	mine := &types.AtomCard{
+		ID: "mine-001", EntityID: "e1", Scope: "team-a", Assertion: "内存泄漏未修复",
+		QuoteEventID: "e1", Importance: types.ImportanceLow, Confidence: types.ConfidenceMed,
+		OccurredAt: now(), CreatedAt: now(),
+	}
+	f.atoms = append(f.atoms, mine)
+	// 200 条别家归属的高重要度事实：足以占满旧实现的整份配额。
+	for i := range 200 {
+		f.atoms = append(f.atoms, &types.AtomCard{
+			ID: fmt.Sprintf("other-%03d", i), EntityID: "e1", Scope: "team-b",
+			Assertion: "内存泄漏已修复（B 组视角）", QuoteEventID: "e1",
+			Importance: types.ImportanceHigh, Confidence: types.ConfidenceMed,
+			OccurredAt: now().Add(time.Duration(i) * time.Minute), CreatedAt: now(),
+		})
+	}
+	p := newPromoter(t, f, nil)
+
+	// 候选带归属（捕获时定下）：与 mine-001 同属 team-a。
+	c := cand("内存泄漏已修复", "e1", "机器甲")
+	c.Scope = "team-a"
+	v, err := p.Promote(ctx2(), ns, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Decision != promotion.DecisionReview || v.Check != "conflict" {
+		t.Fatalf("同归属的矛盾事实必须被检出并送人工，实得 %+v", v)
+	}
+	if len(f.savedA) != 0 {
+		t.Fatal("送人工时不得写入事实")
+	}
+}
+
+// 取代判定同理：全局事实不该挤掉同归属里「同一主体换了值」的那张卡
+// （旧实现 SQL 取「全局 + 同归属」，Go 里再滤掉全局的，配额已被占）。
+func TestUpdateQuotaNotEatenByGlobalAtoms(t *testing.T) {
+	f := newFake()
+	f.raws["e1"] = &types.RawEvent{ID: "e1", Content: "机器甲的内存容量是 8G"}
+	f.ents["e1"] = &types.Entity{ID: "e1", CanonicalName: "机器甲"}
+	// 本归属的旧值（重要度低）：取代判定的对象。
+	f.atoms = append(f.atoms, &types.AtomCard{
+		ID: "old-value", EntityID: "e1", Scope: "team-a", Assertion: "机器甲的内存容量是 4G",
+		QuoteEventID: "e1", Importance: types.ImportanceLow, Confidence: types.ConfidenceMed,
+		OccurredAt: now(), CreatedAt: now(), Version: 1,
+	})
+	// 60 条**全局**高重要度事实：足以占满旧实现的 LIMIT 50。
+	for i := range 60 {
+		f.atoms = append(f.atoms, &types.AtomCard{
+			ID: fmt.Sprintf("global-%03d", i), EntityID: "e1",
+			Assertion: "通用条目 " + fmt.Sprintf("%03d", i), QuoteEventID: "e1",
+			Importance: types.ImportanceHigh, Confidence: types.ConfidenceMed,
+			OccurredAt: now().Add(time.Duration(i) * time.Minute), CreatedAt: now(),
+		})
+	}
+	p := newPromoter(t, f, nil)
+
+	// 候选带归属（捕获时定下）：与 old-value 同属 team-a。
+	c := cand("机器甲的内存容量是 8G", "e1", "机器甲")
+	c.Scope = "team-a"
+	v, err := p.Promote(ctx2(), ns, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Decision != promotion.DecisionUpdate {
+		t.Fatalf("同归属「同一主体值变了」必须被判取代，实得 %+v", v)
+	}
+	if v.Superseded == nil || v.Superseded.ID != "old-value" {
+		t.Fatalf("被取代的应是同归属那条旧值卡，实得 %+v", v.Superseded)
 	}
 }

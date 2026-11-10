@@ -24,6 +24,7 @@ package query
 import (
 	"context"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -231,12 +232,44 @@ func termsOf(consumed string, rest string) []string {
 	return out
 }
 
-// pronounRe 代词表。
+// 代词表：多字与单字分两条规则，差别在**语境约束**。
 //
 // 刻意只收**指示代词与人称代词**：它们在事实正文里几乎不出现，
-// 留着只会稀释词面；而「这」「那」单独出现时也常是口语填充词，
-// 故要求它们后面**跟着别的东西**才算代词指代（见 resolvePronouns）。
-var pronounRe = regexp.MustCompile(`(这个|那个|这些|那些|它|他|她|此|该|本)+`)
+// 留着只会稀释词面。
+//
+//   - 多字形态（这个/那个/这些/那些）作为整词出现时几乎必是指代，
+//     任意位置可认；
+//   - 单字形态（它/他/她/此/该/本）在中文里几乎总出现在**别的词内部**
+//     （其他/脚本/应该/因此/日本/成本……），裸认单字会把普通查询的词面
+//     撕坏（「其他服务的告警」→「其 服务的告警」），还把误命中的代词
+//     消解到最近实体——**误指对象**比少一条线索坏得多（issue #39）。
+//     故只认**词首**：位于句首、或前一字符不是汉字（标点/空白/拉丁）。
+//     「它的磁盘满了」（句首）、「本服务」（句首）这类真指代恰好都在词首。
+//
+// RE2 没有逆向断言，「前一个字符不是汉字」用「消耗一个前导字符 + 捕获组」
+// 表达——消费词面时只删捕获组那段，前导字符留在原处。
+var (
+	pronounMultiRe  = regexp.MustCompile(`(?:这个|那个|这些|那些)+`)
+	pronounSingleRe = regexp.MustCompile(`(?:^|[^\p{Han}])(它|他|她|此|该|本)`)
+)
+
+// pronounSpans 句中全部代词区间（左闭右开，按出现顺序）。
+//
+// 两条规则的字符集不相交（多字形态只含 这/那/个/些，单字表里没有它们；
+// 单字规则的前导字符又不是汉字，落不进任何汉字区间），
+// 故合并不需要去重，排序后即无重叠。
+func pronounSpans(q string) [][2]int {
+	var out [][2]int
+	for _, loc := range pronounMultiRe.FindAllStringIndex(q, -1) {
+		out = append(out, [2]int{loc[0], loc[1]})
+	}
+	for _, m := range pronounSingleRe.FindAllStringSubmatchIndex(q, -1) {
+		// m[2]:m[3] 是捕获组（代词本身）；m[0]:m[1] 含前导字符。
+		out = append(out, [2]int{m[2], m[3]})
+	}
+	slices.SortFunc(out, func(a, b [2]int) int { return a[0] - b[0] })
+	return out
+}
 
 // resolvePronouns 消解代词。
 //
@@ -247,7 +280,7 @@ var pronounRe = regexp.MustCompile(`(这个|那个|这些|那些|它|他|她|此
 // 消不出来就**不消**（记一条 EntityID 为空的记录）——
 // 宁可少一条线索，也不要猜错。
 func resolvePronouns(q string, recent []string) ([]types.PronounRef, string) {
-	locs := pronounRe.FindAllStringIndex(q, -1)
+	locs := pronounSpans(q)
 	if len(locs) == 0 {
 		return nil, q
 	}
