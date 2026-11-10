@@ -69,10 +69,14 @@ type updateHint struct {
 // （「A 组的是 1.32」与「B 组的是 1.36」不构成取代关系）。
 func (p *Promoter) checkUpdate(ctx context.Context, ns store.Namespace, entityID string,
 	c *types.Candidate) (*updateHint, error) {
+	// 归属限定必须进**取数层**（ScopeExact）：此前这里传 Scope（SQL 语义
+	// 「全局 + 同归属」）再在 Go 里滤掉全局的——LIMIT 50 的配额被全局事实
+	// 占满时，同归属里「同一主体换了值」的那张卡进不了候选集，取代判定
+	// 静默漏判：旧事实不退役、新事实也不并入，两条同时活跃（issue #32）。
 	atoms, err := p.store.ListAtoms(ctx, ns, store.AtomFilter{
 		EntityIDs:  []string{entityID},
 		ActiveOnly: true,
-		Scope:      c.Scope,
+		ScopeExact: c.Scope,
 		Limit:      50,
 	})
 	if err != nil {
@@ -81,6 +85,7 @@ func (p *Promoter) checkUpdate(ctx context.Context, ns store.Namespace, entityID
 	var best *updateHint
 	bestSim := 0.0
 	for _, a := range atoms {
+		// 纵深防御：ScopeExact 已在取数层生效，这里再挡一道。
 		if a.Scope != c.Scope {
 			continue
 		}

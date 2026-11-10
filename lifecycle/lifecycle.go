@@ -153,11 +153,16 @@ func GC(ctx context.Context, s Store, ns store.Namespace, before time.Time, opt 
 			return res, err
 		}
 		res.AtomsRetired++
-		_ = s.AppendJournal(ctx, ns, &types.JournalEntry{
+		if err := s.AppendJournal(ctx, ns, &types.JournalEntry{
 			ID: "journal-gc-" + a.ID, At: o.now(),
 			Kind: types.JournalRetire, Subject: a.ID, Actor: types.DecidedRule,
 			Summary: "证据已过保留期，事实退役",
-		})
+		}); err != nil {
+			// 审计写失败**不静默**：退役已经落库、无法回滚，
+			// 但「这张卡被谁退役的」从此查不到——把失败端给调用方，
+			// 由它决定重跑或报警，好过让它以为一切正常（issue #40）。
+			return res, fmt.Errorf("gc: 事实 %s 已退役但审计条目写失败: %w", a.ID, err)
+		}
 	}
 	return res, nil
 }
@@ -225,11 +230,15 @@ func Consolidate(ctx context.Context, s Store, ns store.Namespace, opt ...Option
 			}
 			res.Merged++
 			res.EvidenceMoved += len(a.RawEventIDs)
-			_ = s.AppendJournal(ctx, ns, &types.JournalEntry{
+			if err := s.AppendJournal(ctx, ns, &types.JournalEntry{
 				ID: "journal-consolidate-" + a.ID, At: o.now(),
 				Kind: types.JournalSupersede, Subject: a.ID, Actor: types.DecidedRule,
 				Summary: "同签名事实合并到 " + keep.ID + "（签名 " + short(sig) + "）",
-			})
+			}); err != nil {
+				// 合并审计的 Summary 恰恰带着签名（含中文断言），
+				// 正是 short() 曾经写坏、PG 侧整条丢弃的那条路径（issue #40）。
+				return res, fmt.Errorf("consolidate: 事实 %s 已合并但审计条目写失败: %w", a.ID, err)
+			}
 		}
 	}
 	return res, nil
@@ -300,11 +309,13 @@ func Retention(ctx context.Context, s Store, ns store.Namespace, opt ...Option) 
 			return res, err
 		}
 		res.Retired++
-		_ = s.AppendJournal(ctx, ns, &types.JournalEntry{
+		if err := s.AppendJournal(ctx, ns, &types.JournalEntry{
 			ID: "journal-retention-" + a.ID, At: o.now(),
 			Kind: types.JournalRetire, Subject: a.ID, Actor: types.DecidedRule,
 			Summary: "证据全部为运行期错误，事实退役",
-		})
+		}); err != nil {
+			return res, fmt.Errorf("retention: 事实 %s 已退役但审计条目写失败: %w", a.ID, err)
+		}
 	}
 	return res, nil
 }
@@ -389,11 +400,13 @@ func Expire(ctx context.Context, s Store, ns store.Namespace, opt ...Option) (*E
 		// 审计条目：退役时刻与原因都要可追。
 		// 用既有的「人工作废」这一类审计动作——types 的枚举面不由本包扩充，
 		// 而按龄过期的**原因**写在 Summary 里（读审计的人分得出它与人工作废）。
-		_ = s.AppendJournal(ctx, ns, &types.JournalEntry{
+		if err := s.AppendJournal(ctx, ns, &types.JournalEntry{
 			ID: "journal-expire-" + a.ID, At: o.now(),
 			Kind: types.JournalDeprecate, Subject: a.ID, Actor: types.DecidedRule,
 			Summary: "按龄过期：事件类事实超过保留期（" + o.eventRetention.String() + "），退役",
-		})
+		}); err != nil {
+			return res, fmt.Errorf("expire: 事实 %s 已退役但审计条目写失败: %w", a.ID, err)
+		}
 	}
 	return res, nil
 }
@@ -442,9 +455,22 @@ func dedup(in []string) []string {
 	return out
 }
 
+// short 签名展示用的截断（合并审计条目的 Summary 用）。
+//
+// 三条约束，每条对应一个真实写坏过审计的形态（issue #40）：
+//
+//  1. 截断必须落在 rune 边界：签名是 entity + 0x1f + scope + 0x1f + **中文断言**，
+//     裸字节 s[:16] 会把多字节字符切一半，产出非法 UTF-8——PG 的 journal
+//     INSERT 当场报 invalid byte sequence，整条审计写失败。
+//  2. 分隔符替换的目标是 0x1f（types.SignatureSep）：老代码替换 \x00 是
+//     NUL 时代的死防御，0x1F 控制符原文漏进 Summary——人读的审计里带着
+//     不可见字符，肉眼看不出、复制出来是乱码。
+//  3. 替换先于截断：先换后截，截断产物里不可能再残留分隔符。
 func short(s string) string {
-	if len(s) <= 16 {
+	const limit = 16
+	s = strings.ReplaceAll(s, "\x1f", "|")
+	if len([]rune(s)) <= limit {
 		return s
 	}
-	return strings.ReplaceAll(s[:16], "\x00", "|") + "…"
+	return string([]rune(s)[:limit]) + "…"
 }

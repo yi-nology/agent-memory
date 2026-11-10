@@ -264,3 +264,57 @@ func TestUpdateKeepsTimeOrder(t *testing.T) {
 			v.Superseded.ValidTo, v.Atom.ValidFrom)
 	}
 }
+
+// 模型输出**解析失败**（jsonrepair 也修不动的格式）→ 与「关系串不认识」同款：
+// 送人工，**不上抛**。
+//
+// 上抛会让整笔晋升回滚、候选永远停在 pending，而反复重试同一输出永远失败
+// ——症状是「事实更新悄悄停了」+ 候选积压（issue #42）。
+// error 只留给「模型调用失败」（网络/超时），那条在 TestModelCallFailurePropagates。
+func TestModelGarbageOutputGoesToReviewNotError(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+	}{
+		{"空输出", ""},
+		{"纯散文（修不出 JSON）", "这两条说的应该是同一件事，版本换了。"},
+		{"登录过期页残句", `{"relation": "update", "reason": "版本变`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := updateFixture()
+			f.atoms[0].Assertion = "机器甲使用版本 1.32"
+			c.Assertion = "机器甲已升级到版本 1.36"
+			llm := &fakeLLM{out: tc.out}
+			pr, err := promotion.New(f, nil, promotion.Config{LLM: llm})
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err := pr.Promote(ctx2(), ns, c)
+			if err != nil {
+				t.Fatalf("解析失败必须落人工而不是上抛: %v", err)
+			}
+			if v.Decision != promotion.DecisionReview {
+				t.Fatalf("解析失败应按 conflict 送人工: %+v", v)
+			}
+			if len(f.savedA) != 0 {
+				t.Fatal("送人工时不得写入事实")
+			}
+		})
+	}
+}
+
+// 对照：**模型调用失败**（网络/超时）仍然上抛——那是通道故障，不是「判不出来」。
+func TestModelCallFailurePropagates(t *testing.T) {
+	f, c := updateFixture()
+	f.atoms[0].Assertion = "机器甲使用版本 1.32"
+	c.Assertion = "机器甲已升级到版本 1.36"
+	llm := &fakeLLM{err: errors.New("dial tcp: timeout")}
+	pr, err := promotion.New(f, nil, promotion.Config{LLM: llm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pr.Promote(ctx2(), ns, c); err == nil {
+		t.Fatal("模型调用失败必须上抛：静默退化会把「模型挂了」变成「事实更新悄悄停了」")
+	}
+}

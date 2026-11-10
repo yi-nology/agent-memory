@@ -150,6 +150,43 @@ func tAtomScopeSearchQuota(t *testing.T, s store.Store) {
 	}
 }
 
+// ScopeExact（归属严格等于）在**取数层**生效：连全局的也不许占配额。
+//
+// 这是矛盾/取代检测的取数面（issue #32）：同归属比较语义下，
+// 别家与全局的条目必须在 LIMIT 之前被滤掉——后置过滤时它们吃光配额，
+// 本归属里真正要比的那张卡进不了候选集，检测静默失效。
+func tAtomScopeExactFiltersAtFetch(t *testing.T, s store.Store) {
+	// 本归属那条：重要度最低（排序在最后——只有取数层过滤，它才进得了小配额）。
+	mine := atomInScope("sx-a", "e1", "scope-a", "本归属的低重要度事实", "ev1", types.ImportanceLow)
+	// 全局一条 + 别家两条，重要度都更高（足以占满小配额）。
+	global := atom("sx-g", "e1", "全局的高重要度事实", "ev1", types.ImportanceHigh)
+	other1 := atomInScope("sx-b1", "e1", "scope-b", "别家的高重要度事实一", "ev1", types.ImportanceHigh)
+	other2 := atomInScope("sx-b2", "e1", "scope-b", "别家的高重要度事实二", "ev1", types.ImportanceHigh)
+	for _, a := range []*types.AtomCard{mine, global, other1, other2} {
+		if err := s.SaveAtom(bg(), nsA, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// limit=1：ScopeExact 语义下，唯一该拿回的是本归属那条（哪怕它重要度最低）。
+	hits, err := s.ListAtoms(bg(), nsA, store.AtomFilter{
+		EntityIDs: []string{"e1"}, ScopeExact: "scope-a", Limit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].ID != "sx-a" {
+		t.Fatalf("ScopeExact 应在取数层滤掉别家与全局（配额不被占），实得 %+v", hits)
+	}
+	// 零值 = 不启用这一条：行为与从前逐条一致。
+	all, err := s.ListAtoms(bg(), nsA, store.AtomFilter{EntityIDs: []string{"e1"}, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("ScopeExact 零值不该过滤，实得 %d 条", len(all))
+	}
+}
+
 // 归属也要管住**原始事件**面。
 //
 // 原始事件是召回的兜底源，一次就取 MaxRaw 条——

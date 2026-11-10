@@ -363,3 +363,49 @@ func TestRegenFailureRecordsUnderOwnScope(t *testing.T) {
 		t.Fatal("失败不许写到别的视角那一页上")
 	}
 }
+
+// LLM 常态抖动（尾逗号 / 全角冒号 / 散文包裹）不该让画像重生成失败——
+// 失败保持脏标记、这个实体的画像永远重生成不出来（issue #41）。
+//
+// 「既无 headline 也无 body 即失败」的语义判定保持不变（见下一条用例）。
+func TestRegenToleratesJSONNoise(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+	}{
+		{"尾逗号", `{"headline": "一句话画像", "body": "正文",}`},
+		{"全角冒号", `{"headline"："一句话画像", "body": "正文"}`},
+		{"散文包裹", `画像如下：{"headline": "一句话画像", "body": "正文"} 以上。`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFake()
+			f.dirty = []string{pgKey("", "e1")}
+			f.pages[pgKey("", "e1")] = &types.EntityPage{EntityID: "e1", Dirty: true}
+			f.atoms = []*types.AtomCard{{ID: "a1", EntityID: "e1", Assertion: "x"}}
+
+			r, _ := page.New(f, &fakeLLM{out: tc.out}, page.Config{})
+			res, err := r.RegenerateDirty(ctx2(), ns, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Failed != 0 || res.Regenerated != 1 {
+				t.Fatalf("格式噪声不该让画像重生成失败: %+v", res)
+			}
+		})
+	}
+}
+
+// 语义判定不因收编 jsonrepair 而放宽：字段全空仍然失败。
+func TestRegenStillRequiresContent(t *testing.T) {
+	f := newFake()
+	f.dirty = []string{pgKey("", "e1")}
+	f.pages[pgKey("", "e1")] = &types.EntityPage{EntityID: "e1", Dirty: true}
+	f.atoms = []*types.AtomCard{{ID: "a1", EntityID: "e1", Assertion: "x"}}
+
+	r, _ := page.New(f, &fakeLLM{out: `{"headline":"","body":""}`}, page.Config{})
+	res, _ := r.RegenerateDirty(ctx2(), ns, "")
+	if res.Failed != 1 || res.Regenerated != 0 {
+		t.Fatalf("既无 headline 也无 body 必须失败: %+v", res)
+	}
+}

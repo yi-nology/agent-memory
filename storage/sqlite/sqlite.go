@@ -625,7 +625,7 @@ func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, l
 	rows, err := s.query(ctx,
 		`SELECT `+refCol(table)+` FROM `+table+`
 		 WHERE `+where+` ORDER BY rank LIMIT ?`,
-		append(args, limitOf(limit, 10))...)
+		append(args, limitOf(limit, defaultFetchLimit))...)
 	if err != nil {
 		// MATCH 语法错误不该炸掉整条召回路径——退回空结果，让上层决定要不要兜底。
 		//
@@ -692,6 +692,15 @@ func notFound(err error) error {
 	}
 	return err
 }
+
+// defaultFetchLimit 取数缺省条数（Limit/limit 传 0 时的兜底）。
+//
+// **单源**：列表路与检索路共用同一个缺省（issue #37）——
+// 两条路各写一个数（列表 50、检索 10）时，宿主不设 Limit 的同一参数
+// 在两条路上拿到 5 倍差距的候选池，症状是「搜索反而不如不搜」，
+// 数据上完全看不出。活跃实体栈的 10 与边/全量导出的 100/1000 是
+// **各自查询面**的缺省（契约不同），不在此列。
+const defaultFetchLimit = 50
 
 func limitOf(limit, def int) int {
 	if limit <= 0 {

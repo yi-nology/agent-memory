@@ -208,6 +208,28 @@ func (p *Pipeline) pageOf(ctx context.Context, req Request, entityID string) (*t
 // 路 A 的检索**故意**能搜到已退役的事实（「当初为什么这么判」要能追问，
 // 见 store 的软退役约定），所以这里必须显式滤掉——
 // 否则一条被推翻的事实会照进 prompt，而它在数据上完全看不出异常。
+// atomFilter 召回各路（严格词面 / 宽松词面 / 语义）共用的过滤条件，单源构造。
+//
+// 三路各写一份的话，少一条不报错、少一条就泄漏或过期——语义路曾漏过
+// EventSince 与实体限定（issue #31/#36），正是「各写各的」的直接后果。
+// IDs 留空：它是语义路的私有覆写（融合出的标识集合一次取回），其余字段
+// 三路逐字一致。
+func (p *Pipeline) atomFilter(req Request, limit int) store.AtomFilter {
+	f := store.AtomFilter{
+		Scope:        req.Scope,
+		ActiveOnly:   true,
+		OccurredFrom: req.OccurredFrom,
+		OccurredTo:   req.OccurredTo,
+		At:           req.At,
+		EventSince:   p.eventSince(req),
+		Limit:        limit,
+	}
+	if p.cfg.RestrictAtomsToEntities {
+		f.EntityIDs = req.Entities
+	}
+	return f
+}
+
 func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]*types.AtomCard, error) {
 	// 显式限定时：事实范围 = Request.Entities。
 	scope := p.entityScope(req)
@@ -217,38 +239,18 @@ func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]
 		// 而宿主正是靠这个开关把全库事实挡在 prompt 之外的。
 		return nil, nil
 	}
-	var entityIDs []string
-	if scope != nil {
-		entityIDs = req.Entities
-	}
+	// 过滤条件三路单源（见 atomFilter）。
+	f := p.atomFilter(req, limit)
 
 	var hits []*types.AtomCard
 	if strings.TrimSpace(req.Query) != "" {
 		var err error
-		hits, err = p.store.SearchAtoms(ctx, req.Namespace, req.Query, store.AtomFilter{
-			Scope:        req.Scope,
-			EntityIDs:    entityIDs,
-			ActiveOnly:   true,
-			OccurredFrom: req.OccurredFrom,
-			OccurredTo:   req.OccurredTo,
-			At:           req.At,
-			EventSince:   p.eventSince(req),
-			Limit:        limit,
-		})
+		hits, err = p.store.SearchAtoms(ctx, req.Namespace, req.Query, f)
 		if err != nil {
 			return nil, err
 		}
 	}
-	base, err := p.store.ListAtoms(ctx, req.Namespace, store.AtomFilter{
-		ActiveOnly:   true,
-		Scope:        req.Scope,
-		EntityIDs:    entityIDs,
-		OccurredFrom: req.OccurredFrom,
-		OccurredTo:   req.OccurredTo,
-		At:           req.At,
-		EventSince:   p.eventSince(req),
-		Limit:        limit,
-	})
+	base, err := p.store.ListAtoms(ctx, req.Namespace, f)
 	if err != nil {
 		return nil, err
 	}
@@ -328,20 +330,8 @@ func (p *Pipeline) collectLoose(ctx context.Context, req Request, limit int) ([]
 	if scope != nil && len(scope) == 0 {
 		return nil, nil
 	}
-	var entityIDs []string
-	if scope != nil {
-		entityIDs = req.Entities
-	}
-	atoms, err := p.loose.SearchAtomsLoose(ctx, req.Namespace, req.Query, store.AtomFilter{
-		Scope:        req.Scope,
-		EntityIDs:    entityIDs,
-		ActiveOnly:   true,
-		OccurredFrom: req.OccurredFrom,
-		OccurredTo:   req.OccurredTo,
-		At:           req.At,
-		EventSince:   p.eventSince(req),
-		Limit:        limit,
-	})
+	// 过滤条件三路单源（见 atomFilter）。
+	atoms, err := p.loose.SearchAtomsLoose(ctx, req.Namespace, req.Query, p.atomFilter(req, limit))
 	if err != nil {
 		return nil, err
 	}

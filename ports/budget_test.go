@@ -127,10 +127,39 @@ func TestBudgetWithoutSharesOnlyCapsTotal(t *testing.T) {
 }
 
 // total <= 0 表示**不限总量**（宿主可能只想用分桶配额）。
+//
+// 用例必须打在 **shares 里登记过的桶**上：打在没登记的桶上，
+// 「桶不设上限」是既有语义，测不出「total<=0 把登记桶乘成 0」这个坑
+// （v0.11.0 及之前的旧用例正是打在没登记的桶上，坑留在契约件上没人看见）。
 func TestBudgetNonPositiveTotalMeansUnlimited(t *testing.T) {
-	b := NewBudget(0, map[BucketID]float64{"a": 0.5})
-	if !b.Admit("free", 100000) {
-		t.Fatal("总量不限时不该因总量拒收")
+	cases := []struct {
+		name  string
+		total int
+	}{
+		{"total 为 0", 0},
+		{"total 为负", -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := NewBudget(tc.total, map[BucketID]float64{"fact": 1})
+			if !b.Admit("fact", 100000) {
+				t.Fatalf("总量不限时登记桶也该全收（cap 被乘成 0 的症状是 DropQuota 恒拒）: drops=%v", b.Dropped())
+			}
+			if _, ok := b.Dropped()[DropQuota]; ok {
+				t.Fatalf("不该记桶配额丢弃: %v", b.Dropped())
+			}
+			if b.UsedTotal() != 100000 {
+				t.Fatalf("用量没记上: %d", b.UsedTotal())
+			}
+		})
+	}
+	// 对照：total > 0 时桶上限照常生效（同一条代码路径不许被顺手改坏）。
+	b := NewBudget(1500, map[BucketID]float64{"fact": 1})
+	if b.Admit("fact", 1501) {
+		t.Fatal("total > 0 时登记桶应按配额拒收")
+	}
+	if got := b.Dropped()[DropQuota]; got != 1 {
+		t.Fatalf("应记桶配额不足，实得 %d", got)
 	}
 }
 

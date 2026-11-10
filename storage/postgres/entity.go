@@ -138,7 +138,7 @@ func (s *entityStore) ListEntities(ctx context.Context, ns store.Namespace, enti
 		args = append(args, string(entityType))
 	}
 	q += ` ORDER BY atom_count DESC, canonical_name ASC LIMIT $` + itoa(len(args)+1)
-	args = append(args, limitOf(limit, 50))
+	args = append(args, limitOf(limit, defaultFetchLimit))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
@@ -229,11 +229,16 @@ func (s *entityStore) UpsertActiveEntity(ctx context.Context, ns store.Namespace
 	return err
 }
 
+// ListActiveEntities 按最近提及倒序列出（契约：store.EntityStore）。
+//
+// 排序**不带 pinned**，与 SQLite 侧逐字一致：「钉住不参与淘汰」是
+// EvictActiveEntities 的职责，混进读取序会让代词「那个」恒定指到
+// 钉住项而不是当前话题（issue #33）。entity_id 兜底键保证并列时刻的全序。
 func (s *entityStore) ListActiveEntities(ctx context.Context, ns store.Namespace, threadID string, limit int) ([]*types.ActiveEntity, error) {
 	rows, err := s.query(ctx,
 		`SELECT entity_id, canonical_name, last_seen, pinned, pin_time
 		 FROM thread_active_entities WHERE namespace = $1 AND thread_id = $2
-		 ORDER BY pinned DESC, last_seen DESC LIMIT $3`,
+		 ORDER BY last_seen DESC, entity_id ASC LIMIT $3`,
 		nsOf(ns), threadID, limitOf(limit, 10))
 	if err != nil {
 		return nil, err

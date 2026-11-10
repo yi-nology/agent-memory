@@ -25,6 +25,7 @@ package recall
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -494,7 +495,10 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	cands = p.fuse(ctx, cands, loose, sem)
+	cands, err = p.fuse(ctx, cands, loose, sem)
+	if err != nil {
+		return nil, err
+	}
 	p.metrics().Gauge(MetricSemanticHits, float64(len(sem)))
 
 	cands, droppedByDuplicate := p.suppress(cands, eff)
@@ -559,6 +563,13 @@ func (p *Pipeline) analyze(ctx context.Context, req Request) (Request, types.Que
 	var recent []string
 	if req.ThreadID != "" {
 		if ents, err := p.store.ListActiveEntities(ctx, req.Namespace, req.ThreadID, 5); err == nil {
+			// 显式按最近提及排序，而不是信存储的返回序（纵深防御）：
+			// 「最近在前」是本层对 Analyzer 的承诺（query.Input.RecentEntities），
+			// 而宿主自实现的存储可能仍按 pinned 优先排——直接当「最近在前」用，
+			// 代词就会恒定消解到钉住项而不是当前话题（issue #33）。
+			slices.SortFunc(ents, func(a, b *types.ActiveEntity) int {
+				return b.LastSeen.Compare(a.LastSeen)
+			})
 			for _, e := range ents {
 				recent = append(recent, e.EntityID)
 			}

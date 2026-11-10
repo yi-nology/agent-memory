@@ -191,7 +191,7 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 	// （时间存纳秒 + id 次序），这里是同一课的第二处。
 	q := `SELECT ` + atomCols + ` FROM atoms WHERE ` + strings.Join(where, " AND ") +
 		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT ?`
-	args = append(args, limitOf(f.Limit, 50))
+	args = append(args, limitOf(f.Limit, defaultFetchLimit))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
@@ -254,6 +254,13 @@ func atomConditions(f store.AtomFilter) (string, []any) {
 		// 这里是它的可执行形态。
 		where = append(where, "(scope = '' OR scope = ?)")
 		args = append(args, string(f.Scope))
+	}
+	if f.ScopeExact != "" {
+		// 归属**严格等于**：连全局的也不要（同归属比较语义，见
+		// store.AtomFilter.ScopeExact）。必须在这里生效而不是后置过滤：
+		// 后置时被滤掉的条目已经占掉 LIMIT 配额（issue #32）。
+		where = append(where, "scope = ?")
+		args = append(args, string(f.ScopeExact))
 	}
 	if f.ActiveOnly {
 		// 软退役两态合起来才是「不参与召回」：只看其中一列会漏掉另一种。

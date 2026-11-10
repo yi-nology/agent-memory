@@ -15,12 +15,11 @@ package extractor
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/oagentkit/textx/textutil"
+	"github.com/oekit/pkg/jsonrepair"
 
 	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
@@ -228,12 +227,15 @@ func normalizeForMatch(s string) string {
 // 悄悄取缺省——静默取缺省会让「模型开始输出 confidence: Very High」这件事
 // 在数据上完全看不出来，而那正是口径开始漂移的第一个信号。
 func Parse(raw string) ([]rawCandidate, error) {
-	body := extractJSONArray(raw)
-	if body == "" {
-		return nil, &ParseError{Reason: "输出里找不到 JSON 数组"}
-	}
+	// 解析走 oekit/pkg/jsonrepair：围栏剥离 → 直解 → 语法级修复（尾逗号 /
+	// 全角冒号 / 未闭合括号）→ 散文里抽数组，只有一份实现。
+	//
+	// 此前是手搓的「剥围栏 + 取首个 [ 到末个 ] + json.Unmarshal」：模型输出里
+	// 多一句散文、多个尾逗号、全角冒号就整段作废——同一类格式噪声在事实更新
+	// 判定（promotion/update_llm.go）已被 jsonrepair 吸收，三面共用一套口径，
+	// 「候选整批丢失」与「模型真没给内容」才分得开（issue #41）。
 	var list []rawCandidate
-	if err := json.Unmarshal([]byte(body), &list); err != nil {
+	if err := jsonrepair.Unmarshal(raw, &list); err != nil {
 		return nil, &ParseError{Reason: err.Error()}
 	}
 	for _, r := range list {
@@ -302,23 +304,4 @@ func parseImportance(s string) types.Importance {
 	default:
 		return types.ImportanceMed
 	}
-}
-
-// extractJSONArray 从模型输出里抠出 JSON 数组。
-//
-// 容忍首尾的散文与 ``` 围栏：模型总会多说两句，那是格式噪声不是内容问题。
-// 但**不做**「找到第一个 { 就截到最后一个 }」这种宽松切法——那会把两段
-// 并列 JSON 粘成一段，报一个和真实病因无关的语法错。
-//
-// 围栏剥离交给 oekit/textx 的 textutil.StripCodeFence：它按「第一个围栏块
-// 的内容」取（语言标记 ```json 一并吃掉），而本仓原来那份手写实现与它
-// 逐条等价——本仓多写的那份只是没把语言标记处理得更细。
-func extractJSONArray(s string) string {
-	s = textutil.StripCodeFence(s)
-	if i := strings.Index(s, "["); i >= 0 {
-		if j := strings.LastIndex(s, "]"); j > i {
-			return s[i : j+1]
-		}
-	}
-	return ""
 }

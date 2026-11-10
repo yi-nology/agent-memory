@@ -196,7 +196,7 @@ func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, scope types.
 		args = append(args, ts(before))
 	}
 	q += ` ORDER BY ts DESC, id DESC LIMIT $` + fmt.Sprint(len(args)+1) + ` OFFSET $` + fmt.Sprint(len(args)+2)
-	args = append(args, limitOf(p.Limit, 50), p.Offset)
+	args = append(args, limitOf(p.Limit, defaultFetchLimit), p.Offset)
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -331,7 +331,7 @@ func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, l
 		`SELECT id FROM `+table+`
 		 WHERE `+where+`
 		 ORDER BY ts_rank(body_tsv, `+matchFn+`) DESC LIMIT $`+fmt.Sprint(len(args)+1),
-		append(args, limitOf(limit, 10))...)
+		append(args, limitOf(limit, defaultFetchLimit))...)
 	if err != nil {
 		return nil, err
 	}

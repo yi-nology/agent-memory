@@ -220,7 +220,13 @@ func (s *Service) Promote(ctx context.Context, ns store.Namespace, c *types.Cand
 // 为了一次标脏把整张页面表塞进晋升面的依赖，是**为了一个派生标记**扩大依赖面。
 // 装配面本来就看得见全量存储，故这一步落在它这里。
 //
-// # 只在「晋升成新事实」时标
+// # 只在「改了断言」的两种判定时标
+//
+//   - promote（新增事实）：画像多了内容；
+//   - update（取代）：**断言正文换掉了**——不标脏的话画像正文永久停在旧值
+//     （页面写「版本 1.32」而事实已 1.36），与 Promote 上面那条
+//     「事实变了摘要就该重算」的承诺相反（issue #43）。与向量轨的口径
+//     （DecisionPromote || DecisionUpdate）同款。
 //
 // 并入（merge）只补证据不改断言，画像的正文由断言决定，故并入不必标脏——
 // 标了就是白花一次模型调用去重算一份一模一样的摘要。
@@ -232,7 +238,10 @@ func (s *Service) Promote(ctx context.Context, ns store.Namespace, c *types.Cand
 // 而「页面存在且是旧的」与「页面正常」在看板上长得一模一样——
 // 没有留痕就没人知道该去重算它。
 func (s *Service) markPageDirty(ctx context.Context, ns store.Namespace, v *promotion.Verdict) {
-	if v == nil || v.Decision != promotion.DecisionPromote || v.Atom == nil || v.EntityID == "" {
+	if v == nil || v.Atom == nil || v.EntityID == "" {
+		return
+	}
+	if v.Decision != promotion.DecisionPromote && v.Decision != promotion.DecisionUpdate {
 		return
 	}
 	now := s.now()

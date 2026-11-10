@@ -19,12 +19,12 @@ package episode
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/oekit/pkg/jsonrepair"
 	"github.com/oekit/pkg/timex"
 
 	"github.com/yi-nology/agent-memory/ports"
@@ -108,17 +108,17 @@ func (e *Extractor) ExtractFromSession(ctx context.Context, ns store.Namespace,
 
 func parseEpisode(raw, sessionID string, events []*types.RawEvent, now time.Time) (*types.Episode, error) {
 	s := strings.TrimSpace(raw)
-	if i := strings.Index(s, "{"); i >= 0 {
-		if j := strings.LastIndex(s, "}"); j > i {
-			s = s[i : j+1]
-		}
-	}
+	// 解析走 oekit/pkg/jsonrepair（围栏剥离 → 直解 → 语法级修复 → 散文里抽
+	// 对象）：与 promotion/update_llm.go、extractor、page 同一套口径——
+	// 同一类格式噪声（尾逗号/全角冒号/多一句散文）在判定面被吸收、
+	// 在情节面却整段作废，是「一个仓两种解析命运」（issue #41）。
+	// 字段语义判定（summary 缺失即失败）保持不变：jsonrepair 只修语法。
 	var obj struct {
 		Title     string   `json:"title"`
 		Summary   string   `json:"summary"`
 		Decisions []string `json:"decisions"`
 	}
-	if err := json.Unmarshal([]byte(s), &obj); err != nil {
+	if err := jsonrepair.Unmarshal(s, &obj); err != nil {
 		return nil, fmt.Errorf("episode: 解析失败: %w", err)
 	}
 	if strings.TrimSpace(obj.Summary) == "" {

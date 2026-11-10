@@ -119,7 +119,7 @@ func (s *pageStore) ListDirtyEntityPages(ctx context.Context, ns store.Namespace
 	limit int) ([]*types.EntityPage, error) {
 	rows, err := s.query(ctx,
 		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = $1 AND scope = $2 AND dirty
-		 ORDER BY updated_at ASC, entity_id ASC, scope ASC LIMIT $3`, nsOf(ns), string(scope), limitOf(limit, 50))
+		 ORDER BY updated_at ASC, entity_id ASC, scope ASC LIMIT $3`, nsOf(ns), string(scope), limitOf(limit, defaultFetchLimit))
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +451,7 @@ func (s *episodeStore) ListEpisodes(ctx context.Context, ns store.Namespace, ses
 		args = append(args, session)
 	}
 	q += ` ORDER BY occurred_at DESC LIMIT $` + itoa(len(args)+1)
-	args = append(args, limitOf(limit, 50))
+	args = append(args, limitOf(limit, defaultFetchLimit))
 	return s.queryEpisodes(ctx, q, args...)
 }
 
@@ -584,7 +584,7 @@ func (s *journalStore) ListJournal(ctx context.Context, ns store.Namespace, subj
 		args = append(args, subject)
 	}
 	q += ` ORDER BY at DESC, id DESC LIMIT $` + itoa(len(args)+1)
-	args = append(args, limitOf(limit, 50))
+	args = append(args, limitOf(limit, defaultFetchLimit))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {

@@ -115,7 +115,14 @@ func NewBudget(total int, shares map[BucketID]float64) *Budget {
 	for id, v := range shares {
 		norm := v / sum
 		b.shares[id] = norm
-		b.caps[id] = int(float64(total) * norm)
+		if total > 0 {
+			b.caps[id] = int(float64(total) * norm)
+		}
+		// total <= 0（不限总量）时**不设桶上限**：cap = total × norm 在这里
+		// 恒等于 0，于是「只想用分桶配额」的宿主被乘成「一条都收不下」，
+		// 且丢弃原因记成 DropQuota，把排查方向指向「调分桶占比」——
+		// 与 NewBudget 自己的契约（total <= 0 表示不限总量）相反。
+		// 不设上限即「不进 caps」，与「桶没出现在 shares 里」的语义同型。
 	}
 	return b
 }

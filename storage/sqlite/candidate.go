@@ -58,12 +58,28 @@ func (s *candidateStore) SaveCandidate(ctx context.Context, ns store.Namespace, 
 		if !ok {
 			return fmt.Errorf("事务内拿到的不是本后端实现，候选无法落库: %T", tx)
 		}
+		// **upsert 而不是纯 INSERT**（与 PG 侧逐字对齐，issue #29）：
+		// 候选的重放/迁移包重导都会再写同 ID——纯 INSERT 撞唯一键后整笔失败，
+		// 而 SQLite 是本地默认后端、PG 是服务端形态，「本地重试失败、
+		// 迁到服务端就正常」违反 parity 承诺（见 storage/parity 的包注释）。
+		// 更新集是除键外的全字段（与 PG 一致）：重写一条候选 = 以最新为准。
 		if _, err := tsStore.exec(ctx, `INSERT INTO candidates
 			(namespace, id, raw_event_ids, candidate_type, status, title, assertion,
 			 verbatim_quote, quote_event_id, subject_name, subject_entity_type, target_entity_id,
 			 confidence, importance, recommended_action, promotion_reason, extractor_version,
 			 session_id, scope, created_at, decided_at, decided_by, payload, signature)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(namespace, id) DO UPDATE SET
+				raw_event_ids = excluded.raw_event_ids, candidate_type = excluded.candidate_type,
+				status = excluded.status, title = excluded.title, assertion = excluded.assertion,
+				verbatim_quote = excluded.verbatim_quote, quote_event_id = excluded.quote_event_id,
+				subject_name = excluded.subject_name, subject_entity_type = excluded.subject_entity_type,
+				target_entity_id = excluded.target_entity_id, confidence = excluded.confidence,
+				importance = excluded.importance, recommended_action = excluded.recommended_action,
+				promotion_reason = excluded.promotion_reason, extractor_version = excluded.extractor_version,
+				session_id = excluded.session_id, scope = excluded.scope, created_at = excluded.created_at,
+				decided_at = excluded.decided_at, decided_by = excluded.decided_by,
+				payload = excluded.payload, signature = excluded.signature`,
 			nsOf(ns), c.ID, stringsJSON(c.RawEventIDs), string(c.Type), string(c.Status), c.Title,
 			c.Assertion, c.VerbatimQuote, c.QuoteEventID, c.SubjectName, string(c.SubjectEntityType),
 			c.TargetEntityID, string(c.Confidence), string(c.Importance), string(c.RecommendedAction),
@@ -133,7 +149,7 @@ func (s *candidateStore) ListCandidates(ctx context.Context, ns store.Namespace,
 		// ⇒ 跨仓对账用的黄金样本就没法固定 ✓。
 		// 兜底键与 ListRaw 的 `ts DESC, id DESC` 同款 ✓。
 		` ORDER BY created_at DESC, id DESC LIMIT ?`
-	args = append(args, limitOf(f.Limit, 50))
+	args = append(args, limitOf(f.Limit, defaultFetchLimit))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {

@@ -134,7 +134,7 @@ func (s *candidateStore) ListCandidates(ctx context.Context, ns store.Namespace,
 		// （翻页重行/漏行），导出的包也逐次不同。导入/迁移路径用固定 base
 		// 时间戳写行时全部并列，这条兜底不是理论需求。
 		` ORDER BY created_at DESC, id DESC LIMIT $` + fmt.Sprint(len(args)+1)
-	args = append(args, limitOf(f.Limit, 50))
+	args = append(args, limitOf(f.Limit, defaultFetchLimit))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {

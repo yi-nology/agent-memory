@@ -305,3 +305,141 @@ func TestWeekStartSundayLastWeekWindow(t *testing.T) {
 		t.Fatalf("时间窗不对: %+v", plan.Time)
 	}
 }
+
+// ── 时间词单字备选的误命中（第四轮 issue 清零，#38）──
+
+// 今/明/昨的**单字形态**不得单独命中：它们几乎只出现在别的词里
+// （说明/声明/证明/如今/至今），单字命中会把普通查询抽成时间窗，
+// 且把匹配的字从词面里吞掉——时间窗错位 + FTS 词面残缺，两头都输。
+func TestTimeSingleCharInsideWordsNotMatched(t *testing.T) {
+	a := newAnalyzer()
+	cases := []struct {
+		query string
+	}{
+		{"说明上次的变更"},
+		{"声明文件里的配置"},
+		{"证明为什么失败"},
+		{"如今的部署状况"},
+		{"至今没有回复"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			plan := a.Analyze(context.Background(), Input{Query: tc.query})
+			if !plan.Time.Empty() {
+				t.Fatalf("%q 不含时间表达式，却被抽成 %+v", tc.query, plan.Time)
+			}
+			for _, term := range plan.Terms {
+				switch term {
+				case "说", "明的变更", "证", "如的部署状况", "至没有回复", "明", "今", "昨":
+					t.Fatalf("%q 的词面被时间词撕坏: %+v", tc.query, plan.Terms)
+				}
+			}
+		})
+	}
+}
+
+// 对照：全形态时间词照常命中（删掉单字备选不许误伤正路）。
+func TestTimeFullFormsStillMatched(t *testing.T) {
+	a := newAnalyzer()
+	cases := []struct {
+		query string
+		from  time.Time
+		to    time.Time
+	}{
+		{"帮我看看明天的发布", at(t, 2026, 10, 22, 0), at(t, 2026, 10, 23, 0)},
+		{"今天下午那次重启", at(t, 2026, 10, 21, 12), at(t, 2026, 10, 21, 18)},
+		{"昨日那次告警", at(t, 2026, 10, 20, 0), at(t, 2026, 10, 21, 0)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			plan := a.Analyze(context.Background(), Input{Query: tc.query})
+			if !plan.Time.From.Equal(tc.from) || !plan.Time.To.Equal(tc.to) {
+				t.Fatalf("%q 的时间窗不对: %+v", tc.query, plan.Time)
+			}
+		})
+	}
+}
+
+// 「大前天」是独立规则（-3 天），不是「前天」的子串命中（那会把窗错成 -2 天）。
+func TestDayBeforeYesterdayPrefixForms(t *testing.T) {
+	a := newAnalyzer()
+	cases := []struct {
+		query string
+		day   int
+	}{
+		{"大前天的告警", 18},
+		{"前天的告警", 19},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			plan := a.Analyze(context.Background(), Input{Query: tc.query})
+			want := types.TimeWindow{From: at(t, 2026, 10, tc.day, 0), To: at(t, 2026, 10, tc.day+1, 0)}
+			if !plan.Time.From.Equal(want.From) || !plan.Time.To.Equal(want.To) {
+				t.Fatalf("%q 的时间窗不对: %+v（想要 %+v）", tc.query, plan.Time, want)
+			}
+		})
+	}
+}
+
+// ── 代词单字备选的误命中（第四轮 issue 清零，#39）──
+
+// 词内单字（其他/脚本/应该/因此）不得被当代词：误命中会同时干两件错事——
+// 把查询误限定到最近实体（误指对象），并把词面撕坏（FTS 降级）。
+func TestPronounSingleCharInsideWordsNotMatched(t *testing.T) {
+	a := newAnalyzer()
+	cases := []struct{ query string }{
+		{"其他服务的告警"},
+		{"脚本执行失败"},
+		{"应该检查配置"},
+		{"因此需要重试"},
+		{"日本地区的负载"},
+		{"版本号对不上"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			plan := a.Analyze(context.Background(), Input{
+				Query: tc.query, RecentEntities: []string{"ent-recent"},
+			})
+			for _, r := range plan.Pronouns {
+				t.Fatalf("%q 不含代词，却命中了 %q（误消解到 %q）", tc.query, r.Pronoun, r.EntityID)
+			}
+			if len(plan.Entities) != 0 {
+				t.Fatalf("%q 不该消解出实体: %+v", tc.query, plan.Entities)
+			}
+			for _, term := range plan.Terms {
+				if strings.Contains(term, " ") {
+					t.Fatalf("%q 的词面被代词撕坏: %+v", tc.query, plan.Terms)
+				}
+			}
+		})
+	}
+}
+
+// 对照：真指代形态照常命中（词首的单字、多字形态整词）。
+func TestPronounRealFormsStillMatched(t *testing.T) {
+	a := newAnalyzer()
+	cases := []struct{ query, pronoun string }{
+		{"它的磁盘满了", "它"},
+		{"这个服务挂了", "这个"},
+		{"那个盘又告警了", "那个"},
+		{"看看它，它撑不住了", "它"},
+		{"本服务的端口是多少", "本"},
+		{"该配置是谁改的", "该"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			plan := a.Analyze(context.Background(), Input{
+				Query: tc.query, RecentEntities: []string{"ent-recent"},
+			})
+			hit := false
+			for _, r := range plan.Pronouns {
+				if r.Pronoun == tc.pronoun && r.EntityID == "ent-recent" {
+					hit = true
+				}
+			}
+			if !hit {
+				t.Fatalf("%q 应把 %q 消解到最近实体，实得 %+v", tc.query, tc.pronoun, plan.Pronouns)
+			}
+		})
+	}
+}

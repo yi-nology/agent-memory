@@ -165,3 +165,50 @@ func TestDigestEmptyWindow(t *testing.T) {
 		t.Fatalf("空窗口该是空摘要，实得 %q", rec.Markdown)
 	}
 }
+
+// LLM 常态抖动（尾逗号 / 全角冒号 / 散文包裹）不该让情节解析整段作废。
+//
+// 与 promotion/extractor/page 同一套 jsonrepair 口径（issue #41）；
+// 「summary 缺失即失败」的语义判定保持不变（见下一条用例）。
+func TestExtractEpisodeToleratesJSONNoise(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+	}{
+		{"尾逗号", `{"title":"一次排查","summary":"定位到磁盘","decisions":["清理旧文件"],}`},
+		{"全角冒号", `{"title"："一次排查","summary":"定位到磁盘","decisions":["清理旧文件"]}`},
+		{"散文包裹", `总结如下：{"title":"一次排查","summary":"定位到磁盘","decisions":["清理旧文件"]} 请查收。`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeStore{}
+			ex, err := episode.New(f, &fakeLLM{out: tc.out}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ep, err := ex.ExtractFromSession(ctx2(), ns, "s1", []*types.RawEvent{
+				{ID: "e1", Content: "排查过程", Timestamp: now()},
+			})
+			if err != nil {
+				t.Fatalf("格式噪声不该让情节解析失败: %v", err)
+			}
+			if ep == nil || ep.Title != "一次排查" {
+				t.Fatalf("情节没落对: %+v", ep)
+			}
+		})
+	}
+}
+
+// 语义判定不因收编 jsonrepair 而放宽：summary 缺失仍然失败。
+func TestExtractEpisodeStillRequiresSummary(t *testing.T) {
+	f := &fakeStore{}
+	ex, err := episode.New(f, &fakeLLM{out: `{"title":"只有标题"}`}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ex.ExtractFromSession(ctx2(), ns, "s1", []*types.RawEvent{
+		{ID: "e1", Content: "排查过程", Timestamp: now()},
+	}); err == nil {
+		t.Fatal("summary 缺失必须失败：jsonrepair 只修语法，不救内容缺失")
+	}
+}

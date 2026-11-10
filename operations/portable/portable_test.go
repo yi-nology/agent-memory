@@ -2,6 +2,7 @@ package portable_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,4 +207,118 @@ func TestFileNameSanitizesNamespace(t *testing.T) {
 
 func errorsIsNotFound(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "not found")
+}
+
+// ── 导入幂等与原子性（第四轮 issue 清零，#30）──
+
+// 同一个包连导两次：第二次应**整包跳过**（Skipped == 总条数）且 err == nil。
+//
+// 「重试 / 换机器重导」是迁移的正常操作：v0.11.0 及之前第二次导入
+// 直接撞唯一键报错（部分导入），且 ImportReport.Skipped 从未被写——
+// 宿主拿不到任何可观测的量。
+func TestImportSamePackageTwiceSkipsExisting(t *testing.T) {
+	src := seed(t)
+	dir := t.TempDir()
+	pkg := filepath.Join(dir, "m"+portable.Extension)
+	if _, err := portable.ExportFile(context.Background(), src, ns, pkg,
+		portable.ExportOptions{Host: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := sqlite.OpenMemory("portable-reimport")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dst.Close() }()
+
+	first, err := portable.Import(context.Background(), pkg, dst, store.Namespace("other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Skipped != 0 {
+		t.Fatalf("首次导入不该有跳过: %+v", first)
+	}
+	total := 0
+	for _, n := range first.Counts {
+		total += n
+	}
+	if total == 0 {
+		t.Fatal("前置失真：包里应有内容")
+	}
+
+	second, err := portable.Import(context.Background(), pkg, dst, store.Namespace("other"))
+	if err != nil {
+		t.Fatalf("重复导入必须成功（幂等跳过）: %v", err)
+	}
+	if second.Skipped != total {
+		t.Fatalf("第二次导入应整包跳过：Skipped=%d，总条数=%d（Counts=%v）",
+			second.Skipped, total, second.Counts)
+	}
+	for kind, n := range second.Counts {
+		if n != 0 {
+			t.Fatalf("第二次导入不该再落库 %s=%d", kind, n)
+		}
+	}
+}
+
+// 半路失败必须**整包回滚**：注释里「宁可一句都不导」的承诺。
+//
+// v0.11.0 及之前逐类落库没有事务：后半程（如事实卡）失败时，
+// 前半程（原始事件）已落库，宿主拿到一个静默残缺的记忆库。
+func TestImportRollsBackOnMidwayFailure(t *testing.T) {
+	src := seed(t)
+	dir := t.TempDir()
+	pkg := filepath.Join(dir, "m"+portable.Extension)
+	if _, err := portable.ExportFile(context.Background(), src, ns, pkg,
+		portable.ExportOptions{Host: "t"}); err != nil {
+		t.Fatal(err)
+	}
+
+	dst, err := sqlite.OpenMemory("portable-rollback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dst.Close() }()
+	// 第一张事实卡就失败：导入顺序是 raw 先落、atoms 后落——
+	// 回滚是否生效就看先落的 raw 还在不在。
+	broken := &midwayFailStore{Store: dst, failAtomAfter: -1}
+
+	if _, err := portable.Import(context.Background(), pkg, broken, store.Namespace("other")); err == nil {
+		t.Fatal("写入失败必须让导入报错")
+	}
+	// 半途而废的库不许留残迹：raw 一条都不该在。
+	raws, err := dst.ListRaw(context.Background(), store.Namespace("other"), "", time.Time{}, store.Page{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raws) != 0 {
+		t.Fatalf("整包导入失败后必须回滚到一句不落，实得 %d 条事件", len(raws))
+	}
+}
+
+// midwayFailStore 第 N 次 SaveAtom 之后开始失败，其余全部代理给真库。
+//
+// 同时透传 ExistingProbe 与事务面：探测与事务都要走**同一个包裹层**，
+// 否则探测看到的与写入落的是两份状态。
+type midwayFailStore struct {
+	*sqlite.Store
+	failAtomAfter int
+	savedAtoms    int
+}
+
+func (m *midwayFailStore) SaveAtom(ctx context.Context, ns store.Namespace, a *types.AtomCard) error {
+	if m.savedAtoms > m.failAtomAfter {
+		return errors.New("写事实卡失败：模拟半路故障")
+	}
+	m.savedAtoms++
+	return m.Store.SaveAtom(ctx, ns, a)
+}
+
+func (m *midwayFailStore) Transaction(ctx context.Context, fn func(context.Context, store.Store) error) error {
+	// 事务回调里拿到的是**真库**（不带失败注入），把注入重新套上：
+	// 否则「事务内写事实卡」这条路测不到故障。
+	return m.Store.Transaction(ctx, func(ctx context.Context, s store.Store) error {
+		wrapped := *m
+		wrapped.Store = s.(*sqlite.Store)
+		return fn(ctx, &wrapped)
+	})
 }
