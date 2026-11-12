@@ -139,7 +139,7 @@ func tCandidateListOrderDeterministic(t *testing.T, s store.Store) {
 		}
 	}
 	want := []string{"c-mid", "c-late", "c-early"} // id 降序的前三个（全并列 ⇒ 只剩 id 决胜）
-	for round := 0; round < 2; round++ {
+	for round := range 2 {
 		got, err := s.ListCandidates(bg(), nsA, store.CandidateFilter{Limit: 3})
 		if err != nil {
 			t.Fatal(err)
@@ -166,7 +166,7 @@ func tDirtyPageOrderDeterministic(t *testing.T, s store.Store) {
 		}
 	}
 	want := []string{"p-alpha", "p-bravo"} // updated_at 全并列 ⇒ entity_id 升序
-	for round := 0; round < 2; round++ {
+	for round := range 2 {
 		got, err := s.ListDirtyEntityPages(bg(), nsA, "", 2)
 		if err != nil {
 			t.Fatal(err)
@@ -205,7 +205,7 @@ func tActiveEntityEvictPinRace(t *testing.T, s store.Store) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < rounds; i++ {
+		for range rounds {
 			err := s.UpsertActiveEntity(bg(), nsA, &types.ActiveEntity{
 				ThreadID: "th-race", EntityID: "e-pin", CanonicalName: "被钉的",
 				LastSeen: base, Pinned: true, PinTime: base,
@@ -219,7 +219,7 @@ func tActiveEntityEvictPinRace(t *testing.T, s store.Store) {
 			}
 		}
 	}()
-	for i := 0; i < rounds; i++ {
+	for range rounds {
 		victims, err := s.EvictActiveEntities(bg(), nsA, "th-race", 0)
 		if err != nil {
 			t.Fatal(err)

@@ -158,7 +158,7 @@ func numberedPlaceholders(start, n int) string {
 		return ""
 	}
 	var b strings.Builder
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i > 0 {
 			b.WriteByte(',')
 		}

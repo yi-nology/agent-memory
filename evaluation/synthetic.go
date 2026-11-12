@@ -124,7 +124,7 @@ func NewSynthetic(seed int64, n int) *SyntheticSet {
 		return w
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		caseID := fmt.Sprintf("case-%03d", i)
 		entityID := fmt.Sprintf("ent-%03d", i)
 		scope := synthScopes[rng.Intn(len(synthScopes))]
@@ -142,7 +142,7 @@ func NewSynthetic(seed int64, n int) *SyntheticSet {
 		// 递减是有意的：共享 1 个词的那条排在最后，
 		// 于是「前 k 条装不装得下全部相关」成为一道真问题，
 		// Recall@k 随 k 变化，而不是一条直线。
-		for r := 0; r < relevantN; r++ {
+		for r := range relevantN {
 			var tokens []string
 			switch r {
 			case 0:
@@ -158,7 +158,7 @@ func NewSynthetic(seed int64, n int) *SyntheticSet {
 		}
 
 		// 近义干扰：共享 2 个词，另一个词换掉。
-		for d := 0; d < 2; d++ {
+		for d := range 2 {
 			var tokens []string
 			if d == 0 {
 				tokens = []string{q[0], q[1], nextWord()}
@@ -171,7 +171,7 @@ func NewSynthetic(seed int64, n int) *SyntheticSet {
 		}
 
 		// 无关事实：与查询一个词都不共享。
-		for u := 0; u < 3; u++ {
+		for u := range 3 {
 			tokens := []string{nextWord(), nextWord()}
 			id := fmt.Sprintf("%s-u%d", caseID, u)
 			set.facts = append(set.facts, synthCard(id, entityID, scope, tokens, at, len(set.facts)))

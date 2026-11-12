@@ -1,7 +1,7 @@
 package ports
 
 import (
-	"sort"
+	"slices"
 	"sync"
 	"time"
 )
@@ -153,7 +153,7 @@ func summarize(samples []time.Duration) DurationStats {
 		return DurationStats{}
 	}
 	sorted := append([]time.Duration(nil), samples...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sorted)
 	var total time.Duration
 	for _, d := range sorted {
 		total += d

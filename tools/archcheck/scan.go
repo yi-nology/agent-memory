@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -8,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -107,14 +108,14 @@ func run(p *policy, repoRoot string) ([]violation, error) {
 		}
 	}
 
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Path != out[j].Path {
-			return out[i].Path < out[j].Path
+	slices.SortStableFunc(out, func(a, b violation) int {
+		if c := strings.Compare(a.Path, b.Path); c != 0 {
+			return c
 		}
-		if out[i].Line != out[j].Line {
-			return out[i].Line < out[j].Line
+		if c := cmp.Compare(a.Line, b.Line); c != 0 {
+			return c
 		}
-		return out[i].Rule < out[j].Rule
+		return strings.Compare(a.Rule, b.Rule)
 	})
 	return out, nil
 }
@@ -169,7 +170,7 @@ func collect(r rule, repoRoot string) []string {
 		})
 	}
 
-	sort.Strings(files)
+	slices.Sort(files)
 	return files
 }
 

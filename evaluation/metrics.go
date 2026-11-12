@@ -2,7 +2,7 @@ package evaluation
 
 import (
 	"math"
-	"sort"
+	"slices"
 )
 
 // Metrics 一组用例的评测结果。
@@ -130,7 +130,7 @@ func scoreCase(c Case, retrieved []string, ks []int) CaseResult {
 // countHits 前 k 条里的相关条数（去重后的命中数）。
 func countHits(gains []bool, k int) int {
 	n := 0
-	for i := 0; i < len(gains) && i < k; i++ {
+	for i := range min(len(gains), k) {
 		if gains[i] {
 			n++
 		}
@@ -157,18 +157,15 @@ func ndcgAtK(relCount int, gains []bool, k int) float64 {
 		return 0
 	}
 	dcg := 0.0
-	for i := 0; i < len(gains) && i < k; i++ {
+	for i := range min(len(gains), k) {
 		if !gains[i] {
 			continue
 		}
 		dcg += relGain(1) / math.Log2(float64(i+2))
 	}
-	m := relCount
-	if m > k {
-		m = k
-	}
+	m := min(relCount, k)
 	idcg := 0.0
-	for j := 0; j < m; j++ {
+	for j := range m {
 		idcg += relGain(1) / math.Log2(float64(j+2))
 	}
 	if idcg == 0 {
@@ -258,7 +255,7 @@ func normalizeKs(ks []int) []int {
 		seen[k] = true
 		out = append(out, k)
 	}
-	sort.Ints(out)
+	slices.Sort(out)
 	if len(out) == 0 {
 		// 全是非正数：退回缺省，不让除零发生。
 		out = append(out, DefaultKs...)

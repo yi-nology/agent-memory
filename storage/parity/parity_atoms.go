@@ -218,7 +218,7 @@ func tAtomOrderIsDeterministic(t *testing.T, s store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		again, err := s.ListAtoms(bg(), nsA, store.AtomFilter{Limit: 100})
 		if err != nil {
 			t.Fatal(err)

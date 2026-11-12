@@ -1,10 +1,11 @@
 package graph
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/yi-nology/agent-memory/store"
@@ -232,12 +233,12 @@ func (t *Traverser) Traverse(ctx context.Context, ns store.Namespace, from []str
 		})
 	}
 	// 强度高的在前；同强度按到达顺序稳定排序。
-	sort.SliceStable(out, func(i, j int) bool {
-		oi, oj := arrived[out[i].EntityID], arrived[out[j].EntityID]
-		if oi.weight != oj.weight {
-			return oi.weight > oj.weight
+	slices.SortStableFunc(out, func(a, b Traversal) int {
+		ia, ib := arrived[a.EntityID], arrived[b.EntityID]
+		if c := cmp.Compare(ib.weight, ia.weight); c != 0 {
+			return c
 		}
-		return oi.order < oj.order
+		return cmp.Compare(ia.order, ib.order)
 	})
 	if len(out) > maxResults {
 		out = out[:maxResults]
