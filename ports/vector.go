@@ -1,11 +1,13 @@
 package ports
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"hash/fnv"
 	"math"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/oagentkit/textx/textutil"
@@ -223,11 +225,11 @@ func (m *MemIndex) Search(_ context.Context, namespace, scope string, vec []floa
 		score := dot / qnorm
 		hits = append(hits, VectorHit{ID: id, Score: float32(score)})
 	}
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Score != hits[j].Score {
-			return hits[i].Score > hits[j].Score
+	slices.SortFunc(hits, func(a, b VectorHit) int {
+		if c := cmp.Compare(b.Score, a.Score); c != 0 {
+			return c
 		}
-		return hits[i].ID < hits[j].ID
+		return strings.Compare(a.ID, b.ID)
 	})
 	if topK > 0 && len(hits) > topK {
 		hits = hits[:topK]

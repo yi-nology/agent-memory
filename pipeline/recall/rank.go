@@ -1,9 +1,10 @@
 package recall
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/oekit/pkg/container"
@@ -162,7 +163,7 @@ func sortByScore(cands []*candidate) {
 	//
 	// 稳定性必须保留：同分的片段之间的相对顺序是上游定的（存储层按重要度
 	// 排过），换成不稳定排序会在同分时悄悄换序，而那在结果里看不出来。
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
+	slices.SortStableFunc(cands, func(a, b *candidate) int { return cmp.Compare(b.score, a.score) })
 }
 
 var _ = types.ImportanceMed

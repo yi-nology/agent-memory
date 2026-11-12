@@ -1,6 +1,9 @@
 package ports
 
-import "sort"
+import (
+	"cmp"
+	"slices"
+)
 
 // 本文件：多路召回结果的融合（RRF）。
 //
@@ -73,7 +76,7 @@ func RRF(lists map[string][]string, k float64) []FusedHit {
 	for r := range lists {
 		routes = append(routes, r)
 	}
-	sort.Strings(routes)
+	slices.Sort(routes)
 	for _, route := range routes {
 		for i, id := range lists[route] {
 			if id == "" {
@@ -90,6 +93,6 @@ func RRF(lists map[string][]string, k float64) []FusedHit {
 	for _, id := range order {
 		out = append(out, FusedHit{ID: id, Score: score[id], Sources: srcs[id]})
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+	slices.SortStableFunc(out, func(a, b FusedHit) int { return cmp.Compare(b.Score, a.Score) })
 	return out
 }

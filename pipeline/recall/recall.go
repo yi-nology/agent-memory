@@ -26,7 +26,6 @@ package recall
 import (
 	"context"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -702,14 +701,14 @@ func (p *Pipeline) cacheKey(req Request, plan types.QueryPlan) string {
 	// 不进键的话，缓存会把上一次的解析结果端上来，
 	// 而症状是「同一句话两次问，答案不一样」——看着像随机。
 	planEnts := append([]string(nil), plan.Entities...)
-	sort.Strings(planEnts)
+	slices.Sort(planEnts)
 	b.WriteString(strings.Join(planEnts, "\x01"))
 	sep()
 	// 实体集合**排序后**再进键：同一组实体换个书写顺序是同一次请求，
 	// 不排序的话键会随调用点的遍历顺序变，命中率凭空掉一截
 	//（而那会让人误以为「缓存好像不太行」，去查一个本来没问题的方向）。
 	ents := append([]string(nil), req.Entities...)
-	sort.Strings(ents)
+	slices.Sort(ents)
 	b.WriteString(strings.Join(ents, "\x01"))
 	sep()
 	b.WriteString(strconv.Itoa(req.Limit))

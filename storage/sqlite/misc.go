@@ -1,11 +1,12 @@
 package sqlite
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -740,11 +741,11 @@ func (s *vectorStore) Search(ctx context.Context, namespace, scope string, vec [
 // 同分时的标识序是**可复现性**的一部分：没有它，同样的查询每次返回的
 // 次序可能不同，而融合层按名次算分——于是「召回结果不可复现」。
 func sortHits(hits []ports.VectorHit) {
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Score != hits[j].Score {
-			return hits[i].Score > hits[j].Score
+	slices.SortFunc(hits, func(a, b ports.VectorHit) int {
+		if c := cmp.Compare(b.Score, a.Score); c != 0 {
+			return c
 		}
-		return hits[i].ID < hits[j].ID
+		return strings.Compare(a.ID, b.ID)
 	})
 }
 

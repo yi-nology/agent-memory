@@ -300,7 +300,7 @@ func placeholders(n int) string {
 		return ""
 	}
 	b := make([]byte, 0, n*2-1)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i > 0 {
 			b = append(b, ',')
 		}

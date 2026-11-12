@@ -351,7 +351,7 @@ func addScopePrimaryKey(ctx context.Context, q querier, name string) error {
 // 故宁可换一个名字：约束名对行为没有影响
 // （ON CONFLICT 的仲裁索引靠**列集合**推断，不靠名字）。
 func freeConstraintName(ctx context.Context, q querier, table, want string) (string, error) {
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		name := want
 		if i > 0 {
 			name = fmt.Sprintf("%s_scope%d", want, i)

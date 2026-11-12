@@ -19,7 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -64,7 +64,7 @@ func main() {
 	for r := range byRule {
 		rules = append(rules, r)
 	}
-	sort.Strings(rules)
+	slices.Sort(rules)
 	parts := make([]string, 0, len(rules))
 	for _, r := range rules {
 		parts = append(parts, fmt.Sprintf("%s×%d", r, byRule[r]))
