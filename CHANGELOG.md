@@ -2,6 +2,27 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.13.0] — 2026-11-13
+
+- 重构（**BREAKING**）：删 `recall.Result` 三条旧丢弃字段——归因只留 `Drops` 通用表
+
+**下游要做什么：**
+- 读 `res.DroppedByBudget`（预算装不下）→ `res.Drops[ports.DropBudget]+res.Drops[ports.DropQuota]`
+- 读 `res.DroppedByDiversity`（单实体超额）→ `res.Drops[ports.DropDiversity]`
+- 读 `res.DroppedByDuplicate`（内容重复）→ `res.Drops[ports.DropDuplicate]`
+- memory.recall 工具（bridge）返回 JSON：`dropped_by_budget` / `dropped_by_diversity` /
+  `dropped_by_duplicate` 三键移除，改读 `drops` 表（按 `ports.DropReason` 分路，键为
+  budget/quota/low_score/expired/duplicate/diversity）+ `dropped` 合计；`count`/`entities`/
+  `rendered` 不变
+- CLI `recall` 命令 stderr 统计口径不变（仍打印 预算/多样性/重复 三路）
+
+细节：`DroppedByBudget/DroppedByDiversity/DroppedByDuplicate` 是 v0.12.0 引入
+`Drops`（ports.Budget 通用表）时刻意保留的投影兼容面，两张口径并存一个版本周期后
+清掉旧面，归因入口收敛到单源。仓内消费方（recall 构造处、cloneResult、bridge、cli）
+全部改读 `Drops`；测试保留「合计=通用表之和」不变量并钉住分路可定位。
+`Period` / `CaptureInput` 包内简写别名系架构简写非历史兼容，保留不动。
+验证=make check 全绿（fmt/vet/test/architecture-check/tidy-check）。
+
 ## [v0.12.1] — 2026-11-12
 
 - 杂务：高版本 Go 现代化——sort→slices/cmp、range-over-int、builtin min（零行为变更）
