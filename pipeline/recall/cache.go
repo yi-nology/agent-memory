@@ -90,9 +90,6 @@ func cloneResult(r *Result) *Result {
 	cp := &Result{
 		Snippets:               append([]Snippet(nil), r.Snippets...),
 		Dropped:                r.Dropped,
-		DroppedByBudget:        r.DroppedByBudget,
-		DroppedByDiversity:     r.DroppedByDiversity,
-		DroppedByDuplicate:     r.DroppedByDuplicate,
 		Drops:                  copyDropReasons(r.Drops),
 		Buckets:                copyBuckets(r.Buckets),
 		FromCache:              r.FromCache,

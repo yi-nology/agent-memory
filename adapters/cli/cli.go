@@ -584,7 +584,8 @@ func cmdRecall(ctx context.Context, opt Options, stdout, stderr io.Writer,
 	fmt.Fprintln(stdout, res.Render())
 	fmt.Fprintf(stderr, "命中 %d 条，丢弃 %d 条（预算 %d / 多样性 %d / 重复 %d）\n",
 		len(res.Snippets), res.Dropped,
-		res.DroppedByBudget, res.DroppedByDiversity, res.DroppedByDuplicate)
+		res.Drops[ports.DropBudget]+res.Drops[ports.DropQuota],
+		res.Drops[ports.DropDiversity], res.Drops[ports.DropDuplicate])
 	return 0
 }
 

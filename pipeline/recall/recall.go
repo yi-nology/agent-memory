@@ -517,14 +517,9 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 	res := &Result{
 		Snippets: kept,
 		Entities: ents,
-		// 旧的三条具名字段是通用表的投影：DroppedByBudget 仍是「预算装不下」
-		// 的总数（桶不足 + 总量不足），处置不变。
-		DroppedByBudget:    drops[ports.DropBudget] + drops[ports.DropQuota],
-		DroppedByDiversity: droppedByDiversity,
-		DroppedByDuplicate: droppedByDuplicate,
-		Dropped:            budget.DroppedTotal(),
-		Drops:              drops,
-		Buckets:            budget.Kept(),
+		Dropped:  budget.DroppedTotal(),
+		Drops:    drops,
+		Buckets:  budget.Kept(),
 		// 能力缺失也要说清：降级不可见 ⇒ 宿主以为自己在用宽松路。
 		LooseSearchUnavailable: p.loose == nil,
 	}

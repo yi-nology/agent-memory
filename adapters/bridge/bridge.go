@@ -296,10 +296,8 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 		}
 		return map[string]any{
 			"rendered": res.Render(), "dropped": res.Dropped,
-			"dropped_by_budget":    res.DroppedByBudget,
-			"dropped_by_diversity": res.DroppedByDiversity,
-			"dropped_by_duplicate": res.DroppedByDuplicate,
-			"entities":             res.Entities, "count": len(res.Snippets),
+			"drops":    res.Drops,
+			"entities": res.Entities, "count": len(res.Snippets),
 		}, nil
 
 	case "memory.search":

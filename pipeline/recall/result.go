@@ -55,28 +55,19 @@ type Snippet struct {
 type Result struct {
 	// Snippets 按优先级排序，可直接渲染。
 	Snippets []Snippet
-	// Dropped 被丢弃的总条数（预算 + 多样性两路之和）。
+	// Dropped 被丢弃的总条数（Drops 各路之和）。
 	//
 	// 刻意暴露：装不下就是装不下，而「用户以为带上了记忆、实际被静默丢掉」
-	// 是最难被发现的失效。分两路给出，是因为处置不同——预算不足说明该调大
-	// TotalBudget 或改进提炼，多样性超限说明该调大 PerEntityMax。
+	// 是最难被发现的失效。分路归因见 Drops。
 	Dropped int
-	// DroppedByBudget 预算装不下而丢弃的条数。
-	DroppedByBudget int
-	// DroppedByDiversity 单一实体超额而丢弃的条数。
-	DroppedByDiversity int
-	// DroppedByDuplicate 内容重复而丢弃的条数。
-	//
-	// 三路分开给是因为处置不同：重复说明提炼层在制造同一件事（改 extractor），
-	// 多样性说明实体偏斜（改 PerEntityMax 或改分桶），预算说明装不下（改总量）。
-	DroppedByDuplicate int
 	// Drops 按原因分路的丢弃计数（**通用面**）。
 	//
-	// 上面的三条具名字段是这张表在本仓召回里的**投影**（宿主读旧字段不破），
-	// 这张表才是可复用的那一面：宿主自造召回时用 ports.Budget 拿到同样形状的
-	// 计数，于是「为什么少了」在两边都能归因——
+	// 宿主自造召回时用 ports.Budget 拿到同样形状的计数，于是「为什么少了」
+	// 在两边都能归因——
 	// 而分桶不足（DropQuota）与总量不足（DropBudget）必须分开：
-	// 前者该调分桶占比，后者该调总量，合成一个数就看不出是哪一种。
+	// 前者该调分桶占比，后者该调总量，合成一个数就看不出是哪一种；
+	// 重复（DropDuplicate）说明提炼层在制造同一件事，多样性（DropDiversity）
+	// 说明实体偏斜——处置各不相同，故按原因分路而不是合成一个数。
 	Drops map[ports.DropReason]int
 	// Buckets 各配额桶收到的条数（**通用面**）。
 	//

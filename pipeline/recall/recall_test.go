@@ -437,12 +437,13 @@ func TestDropsAreAttributableByReason(t *testing.T) {
 	if res.Drops[ports.DropBudget] != 0 {
 		t.Fatalf("总量没到，丢弃原因不该是总量不足，实得 %v", res.Drops)
 	}
-	// 旧字段与新表必须一致（宿主读旧字段不破）。
-	if res.DroppedByBudget != res.Drops[ports.DropBudget]+res.Drops[ports.DropQuota] {
-		t.Fatalf("旧字段与通用表对不上: %d vs %v", res.DroppedByBudget, res.Drops)
+	// 合计与通用表之和必须一致（宿主只读一张表也不丢口径）。
+	var dropSum int
+	for _, v := range res.Drops {
+		dropSum += v
 	}
-	if res.Dropped != res.DroppedByBudget+res.DroppedByDiversity+res.DroppedByDuplicate {
-		t.Fatalf("丢弃总数与分路之和对不上: %d", res.Dropped)
+	if res.Dropped != dropSum {
+		t.Fatalf("丢弃总数与通用表之和对不上: %d vs %v", res.Dropped, res.Drops)
 	}
 	// 桶计数：画像桶必须在场（它被挤空是个值得发现的症状）。
 	if res.Buckets["headline"] == 0 {
@@ -496,12 +497,12 @@ func TestBucketsAreIndependent(t *testing.T) {
 	if res.Dropped == 0 {
 		t.Fatal("装不下时 Dropped 必须非零：静默丢内容是最难被发现的失效")
 	}
-	if res.DroppedByBudget == 0 && res.DroppedByDiversity == 0 {
+	if res.Drops[ports.DropBudget]+res.Drops[ports.DropQuota] == 0 && res.Drops[ports.DropDiversity] == 0 {
 		t.Fatalf("丢弃来源应可分路定位，得到 %+v", res)
 	}
 	// 本用例里同一实体的事实数远超单实体配额（40 → 3），而画像必须在场：
 	// 画像桶不参与多样性裁剪——裁掉它等于裁掉整个实体。
-	if res.DroppedByDiversity == 0 {
+	if res.Drops[ports.DropDiversity] == 0 {
 		t.Fatal("本用例本该触发多样性裁剪；没触发说明夹具失真")
 	}
 }
