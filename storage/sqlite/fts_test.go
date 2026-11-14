@@ -2,6 +2,8 @@ package sqlite_test
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,5 +213,58 @@ func TestFTSTokenizeOption(t *testing.T) {
 	}
 	if len(hits) != 0 {
 		t.Fatalf("trigram 下 2 字符 query 不应命中（固有取舍），实得 %v", hitIDs(hits))
+	}
+}
+
+// 存量库换分词器**必须有信号**（issue #55）：WithFTSTokenize 对已存在的
+// 虚表是空操作（IF NOT EXISTS），不校验的话宿主以为已切换、中文召回依旧
+// 失效而查不出原因。显式指定且与库内不一致 ⇒ Open 响亮失败（错误带迁移
+// 步骤）；一致 ⇒ 正常打开；**不带本项** ⇒ 沿用库内现状正常打开
+// （trigram 库不带参数重开是常态操作）。
+func TestOpenRejectsTokenizeMismatchOnExistingDB(t *testing.T) {
+	ctx := context.Background()
+
+	// 存量库必须是**磁盘库**：具名内存库随最后一个连接关闭而消亡，
+	// 重开拿到的是空库——测不出「存量虚表」这条前提。
+	db := filepath.Join(t.TempDir(), "m.sqlite")
+	s, err := sqlite.OpenFile(db, sqlite.WithFTSTokenize("trigram"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := store.Namespace("ns-mm")
+	if err := s.SaveAtom(ctx, ns, ftsAtom("m1", "磁盘长期偏小")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 换 unicode61 重开同一份盘上库 ⇒ 显式错误。
+	_, err = sqlite.OpenFile(db, sqlite.WithFTSTokenize("unicode61"))
+	if err == nil {
+		t.Fatal("换分词器打开存量库必须报错（静默落空 = 配置了没生效）")
+	}
+	for _, want := range []string{"trigram", "DROP", "WithFTSTokenize"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误要带分词器现值与迁移步骤（含 %q）: %v", want, err)
+		}
+	}
+
+	// 同分词器重开：正常。
+	s2, err := sqlite.OpenFile(db, sqlite.WithFTSTokenize("trigram"))
+	if err != nil {
+		t.Fatalf("同分词器重开应成功: %v", err)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 不指定分词器重开：沿用库内现状，正常。
+	s3, err := sqlite.OpenFile(db)
+	if err != nil {
+		t.Fatalf("不带 WithFTSTokenize 重开应成功（缺省沿用库内现状）: %v", err)
+	}
+	if err := s3.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

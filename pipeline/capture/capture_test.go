@@ -146,6 +146,49 @@ func TestNestedPayloadRedactionSetsAuditBit(t *testing.T) {
 	}
 }
 
+// JSON 数组形态（encoding/json 解码产物是 []any，不是 []string）里的
+// 凭据同样不能漏（issue #52）：漏掉的形态是「凭据明文落库，且
+// Redacted=false」——本包存在的唯一理由就是落库前脱敏，此为直穿。
+// map[string]string（宿主手拼载荷的常见形态）一并钉住。
+func TestJSONArrayOfStringsAlsoRedacted(t *testing.T) {
+	s := &spyStore{}
+	c, _ := capture.New(s, ports.PatternRedactor{})
+	ipt := in("部署完成", types.Provenance{Origin: types.OriginTool})
+	// 模拟 encoding/json 解码产物：数组是 []any，元素里藏着凭据。
+	ipt.Payload = map[string]any{
+		"args": []any{"curl -s https://example.internal", "curl -H 'Authorization: Bearer ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'"},
+		"env":  []any{"API_KEY=sk-abcdefghij0123456789", "PATH=/usr/bin"},
+		"hdrs": map[string]string{"Authorization": "Bearer ghp_ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210"},
+	}
+	out, err := c.Capture(context.Background(), ipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Redacted {
+		t.Fatal("数组载荷里的凭据被打码了，审计位必须置真")
+	}
+	if !s.saved[0].Provenance.Redacted {
+		t.Fatal("落库事件上的来源凭证也必须记下「已脱敏」")
+	}
+	args := s.saved[0].Payload["args"].([]any)
+	for _, v := range args {
+		if strings.Contains(v.(string), "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") {
+			t.Fatalf("[]any 元素里的凭据漏了：%q", v)
+		}
+	}
+	env := s.saved[0].Payload["env"].([]any)
+	if strings.Contains(env[0].(string), "sk-abcdefghij0123456789") {
+		t.Fatalf("[]any 元素里的 API key 漏了：%q", env[0])
+	}
+	if env[1] != "PATH=/usr/bin" {
+		t.Fatalf("无关元素不该被动：%q", env[1])
+	}
+	hdrs := s.saved[0].Payload["hdrs"].(map[string]string)
+	if strings.Contains(hdrs["Authorization"], "ghp_ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210") {
+		t.Fatalf("map[string]string 里的凭据漏了：%q", hdrs["Authorization"])
+	}
+}
+
 // 载荷确实没被动时，审计位不该谎报「已脱敏」。
 func TestUnchangedPayloadKeepsAuditBitFalse(t *testing.T) {
 	s := &spyStore{}

@@ -115,7 +115,19 @@ func (s *Service) unindexVector(ctx context.Context, ns store.Namespace, id stri
 // （补算是调用方显式发起的重建动作，需要知道它没跑完），
 // 已写入的不回滚——索引是派生物，重跑即收敛（幂等）。
 // Embedder 未装配 ⇒ ports.ErrNoEmbedder；索引未装配 ⇒ ports.ErrNoIndex。
-// limit <= 0 = 不限量。
+//
+// # limit 语义（issue #49）
+//
+// limit > 0 = 至多补算 N 条（按存储层取数序）；limit <= 0 = **不限量**：
+// 按 store.ListAllAtoms 分页取尽全库，而不是把 0 交给存储层兜成缺省 50——
+// 那样宿主拿到成功回执但只补了前 50 条，低重要度的存量事实永无向量，
+// 语义轨对它们永久失灵。
+//
+// # 只补活跃卡（issue #50）
+//
+// 取数按 ActiveOnly 过滤：退役卡（被取代 / 人工作废）的向量在退役时
+// 已被删掉（vectorStore 包装），补算不得把它们写回索引——否则死向量
+// 复活，语义路的 TopK 配额被它们占掉，恰是本文件头声明要消灭的失效。
 func (s *Service) Reindex(ctx context.Context, ns store.Namespace, limit int) (int, error) {
 	if s.embedder == nil {
 		return 0, ports.ErrNoEmbedder
@@ -123,9 +135,23 @@ func (s *Service) Reindex(ctx context.Context, ns store.Namespace, limit int) (i
 	if s.vecIdx == nil {
 		return 0, ports.ErrNoIndex
 	}
-	atoms, err := s.store.ListAtoms(ctx, ns, store.AtomFilter{Limit: limit})
-	if err != nil {
-		return 0, err
+	f := store.AtomFilter{ActiveOnly: true}
+	var atoms []*types.AtomCard
+	if limit > 0 {
+		f.Limit = limit
+		batch, err := s.store.ListAtoms(ctx, ns, f)
+		if err != nil {
+			return 0, err
+		}
+		atoms = batch
+	} else {
+		// 不限量：分页翻到取尽。0 交给 ListAtoms 只会兜成缺省 50，
+		// 「不限量」就成了静默只补前 50 条（issue #49）。
+		batch, err := store.ListAllAtoms(ctx, s.store, ns, f, 0)
+		if err != nil {
+			return 0, err
+		}
+		atoms = batch
 	}
 	n := 0
 	for _, a := range atoms {

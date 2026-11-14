@@ -30,7 +30,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -245,7 +244,18 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 	case "reindex":
 		// 向量索引补算：存量事实没有向量时，语义轨等于失灵
 		//（索引里没有它们 → 语义路一条都捞不到）。
-		return cmdReindex(ctx, opt, stdout, stderr, *limit)
+		//
+		// --limit 在这里语义是「补算多少条」，与其它命令的「取几条结果」
+		// 不同：共享 FlagSet 的缺省 10 对补算是错的——宿主不带参跑，
+		// 只补前 10 条还拿到成功回执（issue #49）。故未显式给 --limit
+		// 时按不限量（0 = 取尽全库）处理，显式给了才限。
+		reindexLimit := 0
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "limit" {
+				reindexLimit = *limit
+			}
+		})
+		return cmdReindex(ctx, opt, stdout, stderr, reindexLimit)
 	case "export":
 		return cmdExport(ctx, opt, stdout, stderr, *out, *format)
 	case "import":
@@ -308,7 +318,7 @@ func usage(w io.Writer) {
   memory recall   <查询词> [--session S] [--thread T] [--limit N]
   memory search   <查询词> [--limit N]
   memory query    <问句>                        把一句问句翻成检索条件（诊断用，不入库）
-  memory reindex  [--limit N]                   给存量事实补算向量（语义轨缺它就失灵）
+  memory reindex  [--limit N]                   给存量事实补算向量（缺省取尽全库；语义轨缺它就失灵）
   memory stats
   memory export   --out <包路径> [--format octop]   导出迁移包（octop 布局供对方直接读）
   memory import   --pkg <包路径>
@@ -597,10 +607,17 @@ func cmdSearch(ctx context.Context, opt Options, stdout, stderr io.Writer, query
 	}
 	defer func() { _ = st.Close() }()
 
-	atoms, err := svc.Search(ctx, store.Namespace(opt.Namespace), query, store.AtomFilter{
-		Limit: limit,
-		Scope: opt.Scope,
-	})
+	// 归属是**读者语义**（与 recall 同判据，issue #53）：--scope 空=全局读者，
+	// 只看全局事实（用法文案里的「读=我要看谁的，空=全局」）。
+	atoms, err := svc.Search(ctx, store.Namespace(opt.Namespace), query, func() store.AtomFilter {
+		f := store.AtomFilter{Limit: limit}
+		if opt.Scope == "" {
+			f.GlobalReader = true
+		} else {
+			f.Scope = opt.Scope
+		}
+		return f
+	}())
 	if err != nil {
 		fmt.Fprintln(stderr, "检索失败:", err)
 		return 1
@@ -627,40 +644,6 @@ func cmdStats(ctx context.Context, opt Options, stdout, stderr io.Writer) int {
 	}
 	b, _ := json.MarshalIndent(s, "", "  ")
 	fmt.Fprintln(stdout, string(b))
-	return 0
-}
-
-// cmdReindex 给存量事实补算向量（幂等，按事实卡 ID 覆盖写）。
-//
-// 向量是**写路径**产生的：晋升成事实时顺手写一条。
-// 于是**存量**事实（写路径接上之前入库的）没有向量——
-// 而语义召回靠的是索引，索引里没有它们，就一条都捞不到。
-// 症状是「语义轨像是没生效」，而查不出原因（因为它确实在跑，只是索引是空的）。
-func cmdReindex(ctx context.Context, opt Options, stdout, stderr io.Writer, limit int) int {
-	svc, st, err := open(ctx, opt)
-	if err != nil {
-		fmt.Fprintln(stderr, "打开失败:", err)
-		return 1
-	}
-	defer func() { _ = st.Close() }()
-	// 走 Service.Reindex（与 Capture 写路径同一份 embedder/索引装配）：
-	// embedder 与写路径不同源时，混进同一命名空间的就是两种向量空间的
-	// 向量——维度不合撞 ErrDimensionMismatch，恰好一致则静默失真。
-	n, err := svc.Reindex(ctx, store.Namespace(opt.Namespace), limit)
-	if err != nil {
-		if errors.Is(err, ports.ErrNoEmbedder) {
-			fmt.Fprintln(stderr, "未注入向量化器（Options.Embedder）——纯词面后端没有向量轨，补算不了")
-			return 1
-		}
-		if errors.Is(err, ports.ErrNoIndex) {
-			fmt.Fprintln(stderr, "这个后端没有向量索引面，补算不了")
-			return 1
-		}
-		fmt.Fprintln(stderr, "补算失败（已写入的条数见下）:", err)
-		fmt.Fprintf(stderr, "已写入 %d 条\n", n)
-		return 1
-	}
-	fmt.Fprintf(stdout, "已补算 %d 条事实的向量\n", n)
 	return 0
 }
 

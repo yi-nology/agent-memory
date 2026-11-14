@@ -20,6 +20,8 @@
 package sqlite
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -380,4 +382,76 @@ func schemaWithTokenize(tokenize string) (string, error) {
 		return "", fmt.Errorf("sqlite: 不支持的 FTS5 分词器 %q（白名单: unicode61, trigram）", tokenize)
 	}
 	return strings.ReplaceAll(schema, "{{FTS_TOKENIZE}}", tokenize), nil
+}
+
+// checkExistingFTSTokenize 存量库的分词器校验（issue #55）。
+//
+// WithFTSTokenize 对已存在的虚表是**空操作**（CREATE VIRTUAL TABLE
+// IF NOT EXISTS 不改既有表）——配置面承诺「指定分词器」，运行期却
+// 零信号地落空，宿主以为已切到 trigram、中文召回依旧失效。故显式
+// 指定了分词器的 Open 会读 sqlite_master 里既有虚表的建表语句、
+// 比对 tokenize=...，不一致时**响亮失败**并把迁移步骤写进错误：
+// 停写 → DROP 虚表 → 重开库（按新分词器重建）→ 重灌正文。
+//
+// 只在**显式指定**时校验：不指定（缺省）时沿用库内现状——
+// 用 trigram 建的库不带参数重开是常态操作，不该被打红。
+// （分词器从建表语句里提取；提取不到就不判，不猜。）
+func checkExistingFTSTokenize(ctx context.Context, db *sql.DB, want string) error {
+	if want == "" {
+		return nil
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT name, sql FROM sqlite_master
+		 WHERE type = 'table' AND name IN ('raw_fts', 'candidate_fts', 'atom_fts')`)
+	if err != nil {
+		return fmt.Errorf("sqlite: 读取 FTS 虚表定义失败: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	type mismatch struct{ table, have string }
+	var bad []mismatch
+	for rows.Next() {
+		var name, ddl sql.NullString
+		if err := rows.Scan(&name, &ddl); err != nil {
+			return err
+		}
+		if !ddl.Valid {
+			continue
+		}
+		have := extractFTSTokenize(ddl.String)
+		if have != "" && have != want {
+			bad = append(bad, mismatch{table: name.String, have: have})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	var names []string
+	for _, m := range bad {
+		names = append(names, fmt.Sprintf("%s（现分词器 %q）", m.table, m.have))
+	}
+	return fmt.Errorf("sqlite: WithFTSTokenize(%q) 与库内既有 FTS 虚表的分词器不一致: %s——"+
+		"换分词器不会影响已存在的虚表（CREATE VIRTUAL TABLE IF NOT EXISTS 是空操作）。"+
+		"迁移步骤：停写 → DROP 这几张虚表 → 重开库（按新分词器重建）→ 重灌正文"+
+		"（或走 RebuildFTSIndex 回填，索引是派生物，真源表不丢）", want, strings.Join(names, ", "))
+}
+
+// extractFTSTokenize 从 FTS5 虚表的建表语句里提取 tokenize=... 的值。
+// 没写 tokenize（FTS5 缺省 unicode61）返回空串。
+func extractFTSTokenize(ddl string) string {
+	i := strings.Index(ddl, "tokenize=")
+	if i < 0 {
+		return ""
+	}
+	rest := ddl[i+len("tokenize="):]
+	if len(rest) == 0 || rest[0] != '\'' {
+		return ""
+	}
+	end := strings.IndexByte(rest[1:], '\'')
+	if end < 0 {
+		return ""
+	}
+	return rest[1 : 1+end]
 }

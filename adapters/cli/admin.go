@@ -2,12 +2,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/yi-nology/agent-memory/lifecycle"
 	"github.com/yi-nology/agent-memory/pipeline/entity"
+	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
 )
@@ -266,5 +268,39 @@ func cmdRebuildFTS(ctx context.Context, opt Options, stdout, stderr io.Writer) i
 		return 1
 	}
 	fmt.Fprintf(stdout, "已重建词面索引 %d 条\n", n)
+	return 0
+}
+
+// cmdReindex 给存量事实补算向量（幂等，按事实卡 ID 覆盖写）。
+//
+// 向量是**写路径**产生的：晋升成事实时顺手写一条。
+// 于是**存量**事实（写路径接上之前入库的）没有向量——
+// 而语义召回靠的是索引，索引里没有它们，就一条都捞不到。
+// 症状是「语义轨像是没生效」，而查不出原因（因为它确实在跑，只是索引是空的）。
+func cmdReindex(ctx context.Context, opt Options, stdout, stderr io.Writer, limit int) int {
+	svc, st, err := open(ctx, opt)
+	if err != nil {
+		fmt.Fprintln(stderr, "打开失败:", err)
+		return 1
+	}
+	defer func() { _ = st.Close() }()
+	// 走 Service.Reindex（与 Capture 写路径同一份 embedder/索引装配）：
+	// embedder 与写路径不同源时，混进同一命名空间的就是两种向量空间的
+	// 向量——维度不合撞 ErrDimensionMismatch，恰好一致则静默失真。
+	n, err := svc.Reindex(ctx, store.Namespace(opt.Namespace), limit)
+	if err != nil {
+		if errors.Is(err, ports.ErrNoEmbedder) {
+			fmt.Fprintln(stderr, "未注入向量化器（Options.Embedder）——纯词面后端没有向量轨，补算不了")
+			return 1
+		}
+		if errors.Is(err, ports.ErrNoIndex) {
+			fmt.Fprintln(stderr, "这个后端没有向量索引面，补算不了")
+			return 1
+		}
+		fmt.Fprintln(stderr, "补算失败（已写入的条数见下）:", err)
+		fmt.Fprintf(stderr, "已写入 %d 条\n", n)
+		return 1
+	}
+	fmt.Fprintf(stdout, "已补算 %d 条事实的向量\n", n)
 	return 0
 }

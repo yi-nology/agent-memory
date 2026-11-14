@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/yi-nology/agent-memory/types"
 )
@@ -137,4 +138,36 @@ type FTSIndexRebuilder interface {
 func FTSRebuilder(v any) (FTSIndexRebuilder, bool) {
 	rb, ok := v.(FTSIndexRebuilder)
 	return rb, ok
+}
+
+// GlobalRawReader **全局读者**取原始事件的能力（issue #53）。
+//
+// # 它是什么
+//
+// ListRaw 的 scope 参数空值是「不隔离」（导出与库管理面靠它取**全量**，
+// 该语义已随冻结接口发布），而**全局读者**按 types.Scope.VisibleTo
+// 只看得见全局事件——同一个空值承载了两种相反的语义，ListRaw 又已冻结
+// 不能加参数，故这条取数形态单独开一个可选口子：只取 scope = ” 的事件。
+//
+// # 为什么是可选能力
+//
+// 三个要件齐备：独立小接口（下游不实现也能编译）；消费方运行时探测
+// （pipeline/recall 在 New 里探一次）；明确降级路径（没实现时，
+// 召回对空读者回落 ListRaw(空 scope) + 后置 VisibleTo 滤除——
+// **正确性不变**（滤除兜着，绝不漏别的家），代价只是 TopK 配额可能
+// 被别家的事件占掉一部分，与修复前的行为一致）。
+type GlobalRawReader interface {
+	// ListRawGlobal 以全局读者身份取原始事件：只取全局（scope = ''）的，
+	// 按时间倒序，语义同 ListRaw（before 为分页游标，p 为分页参数）。
+	ListRawGlobal(ctx context.Context, ns Namespace, before time.Time, p Page) ([]*types.RawEvent, error)
+}
+
+// GlobalRawReaderOf 探测一个实现有没有全局读者取原始事件的能力
+// （语义同 LooseSearcher）。
+//
+// 返回 ok=false 时调用方**必须**走降级路径（ListRaw + 后置滤除），
+// 不许当它不存在地继续。
+func GlobalRawReaderOf(v any) (GlobalRawReader, bool) {
+	g, ok := v.(GlobalRawReader)
+	return g, ok
 }

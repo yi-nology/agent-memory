@@ -221,6 +221,14 @@ type Verdict struct {
 	Actor types.DecidedBy
 }
 
+// writeAction 判定产出的**落库计划**：判定阶段只读不写，事务回调里
+// 只执行它（issue #57 的两段拆分）。
+//
+// 它收到的那份 Promoter 的 store 已经换成**事务内**的那一份——
+// 与旧结构同一条纪律：写必须落在事务里（用外层那份的话原子性没了
+// 且不报任何错，连接池只有一条连接时还会直接挂起）。
+type writeAction func(ctx context.Context, tx *Promoter) (*Verdict, error)
+
 // Promote 判定一条候选，**并在通过时落库**。
 //
 // # 前置：候选必须已在库里
@@ -229,58 +237,79 @@ type Verdict struct {
 // 整笔晋升随即回滚（库里不留下半成品）。提炼器**不落库**
 // （「落库由调用方在看过结果后决定」），故调用方要先存候选再晋升。
 //
-// # 落库在事务里，且用回调收到的那份存储
+// # 两段拆分：判定在事务外，落库在事务内（issue #57）
 //
-// 晋升要写四样东西：候选落定、事实入库、实体计数、审计条目。四步必须原子——
+// 判定（五道检查）要**读库、问模型**（askModel，一次 LLM 调用超时可达
+// 数十秒）、**走宿主升级通道**（Escalation.ResolveEntity）。它们全进
+// Transaction 回调的话，事务/连接的持有时长 = 一次模型调用的时长：
+// PG 小连接池下并发晋升各占一条连接等模型，池耗尽后全库读写排队；
+// SQLite（WAL）的读快照长期不释放，checkpoint 被顶住、WAL 涨个不停。
+// 判定是纯读 + 外部调用，本就不需要事务的原子性——故它在**事务外**跑。
+//
+// 落库是四步写（候选落定、事实入库、实体计数、审计条目），四步必须原子——
 // 中途失败若不回滚，记忆库会出现「候选已判但事实没进」的空洞，
 // 而那类不一致在读取侧完全看不出来（只是那条事实凭空消失）。
 // 这正是 store.Store 把 Transaction 当作一等公民的原因。
 //
-// 事务回调收到的那份存储是**事务内**的那一份。若用外层那份（p.store），
-// 写会落到事务外——原子性没了**且不报任何错**；
-// 连接池只有一条连接时还会直接挂起（事务持着唯一连接，外层语句永远等不到）。
-// 故这里复制一份 Promoter，把存储换成回调给的那份。
+// # 判定与落库之间隔了一次模型调用的时长
+//
+// 拆分的代价是两段之间数据可能被别的晋升者改过，故**写前复核一次**：
+// 并入/取代按签名重取那张既有卡（不在了或已退役 ⇒ 回落为普通晋升，
+// 不把陈旧的读视图写回去）；候选落定自带 expected 乐观锁
+// （UpdateCandidateStatus），并发双判在事务里响亮失败。
 func (p *Promoter) Promote(ctx context.Context, ns store.Namespace, c *types.Candidate) (*Verdict, error) {
-	var v *Verdict
-	err := p.store.Transaction(ctx, func(ctx context.Context, s Store) error {
+	action, v, err := p.decide(ctx, ns, c)
+	if err != nil {
+		return nil, err
+	}
+	if action == nil {
+		// 无落库的结论（丢弃 / 送人工 / 判为不是同一件事）。
+		if v != nil {
+			// 判定者在这里统一盖章一次：内部十来个构造点不必各写一遍，
+			// 也不会漏掉某一处（漏一处就是审计条目少一个署名）。
+			v.Actor = p.cfg.Actor
+		}
+		return v, nil
+	}
+	var out *Verdict
+	err = p.store.Transaction(ctx, func(ctx context.Context, s Store) error {
 		tx := *p
 		tx.store = s
 		var err error
-		v, err = tx.promote(ctx, ns, c)
+		out, err = action(ctx, &tx)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	if v != nil {
-		// 判定者在这里统一盖章一次：内部十来个构造点不必各写一遍，
-		// 也不会漏掉某一处（漏一处就是审计条目少一个署名）。
-		v.Actor = p.cfg.Actor
+	if out != nil {
+		out.Actor = p.cfg.Actor
 	}
-	return v, nil
+	return out, nil
 }
 
-// promote 判定一条候选（五道检查），并在通过时落库。
+// decide 判定一条候选（五道检查，**事务外**），产出落库计划。
 //
-// 存储一律取自 p.store——Promote 已把它换成事务内的那一份。
-func (p *Promoter) promote(ctx context.Context, ns store.Namespace, c *types.Candidate) (*Verdict, error) {
+// 返回 (nil, v, nil) = 无落库的结论（丢弃 / 送人工 / 判为不是同一件事）；
+// 返回 (action, nil, nil) = 通过全部检查，事务内执行 action 即完成落库。
+func (p *Promoter) decide(ctx context.Context, ns store.Namespace, c *types.Candidate) (writeAction, *Verdict, error) {
 	// 1 价值
 	if v := p.checkValue(c); v != nil {
-		return v, nil
+		return nil, v, nil
 	}
 	// 2 证据
 	ev, v, err := p.checkEvidence(ctx, ns, c)
 	if err != nil || v != nil {
-		return v, err
+		return nil, v, err
 	}
 
 	entityID, v, err := p.resolveEntity(ctx, ns, c)
 	if err != nil {
 		// 存储故障上抛：继续走会产出一条无归属的事实。
-		return nil, err
+		return nil, nil, err
 	}
 	if v != nil {
-		return v, nil
+		return nil, v, nil
 	}
 
 	// 4 重复：同签名即并入，不新增
@@ -292,9 +321,9 @@ func (p *Promoter) promote(ctx context.Context, ns store.Namespace, c *types.Can
 	existing, err := p.store.FindAtomBySignature(ctx, ns, sig)
 	switch {
 	case err == nil && existing != nil:
-		return p.merge(ctx, ns, c, existing)
+		return p.mergeAction(ns, c, entityID, ev, sig), nil, nil
 	case err != nil && !errors.Is(err, store.ErrNotFound):
-		return nil, err
+		return nil, nil, err
 	}
 
 	// 5 取代：同一主体、不同值 → 新事实取代旧事实
@@ -306,26 +335,70 @@ func (p *Promoter) promote(ctx context.Context, ns store.Namespace, c *types.Can
 	// 那正是本仓明确禁止的自动裁决。
 	hint, err := p.checkUpdate(ctx, ns, entityID, c)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if hint != nil {
-		v, err := p.decideUpdate(ctx, ns, c, entityID, ev, hint)
+		action, v, err := p.decideUpdate(ctx, ns, c, entityID, ev, hint)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if v != nil {
-			return v, nil
+		if action != nil || v != nil {
+			return action, v, nil
 		}
 		// 判为「不是同一件事」→ 继续走普通晋升路径。
 	}
 
 	// 6 矛盾：与该实体下既有事实高度相似却互相否定 → 送人工，不自动裁决
 	if v, err := p.checkConflict(ctx, ns, entityID, c); err != nil || v != nil {
-		return v, err
+		return nil, v, err
 	}
 
 	// 全部通过 → 落库
-	return p.promoteToAtom(ctx, ns, c, entityID, ev)
+	return p.promoteAction(ns, c, entityID, ev), nil, nil
+}
+
+// promoteAction 普通晋升的落库计划（无既有卡要复核；
+// 候选落定的 expected 乐观锁就是它的一次性复核）。
+func (p *Promoter) promoteAction(ns store.Namespace, c *types.Candidate,
+	entityID string, ev *types.RawEvent) writeAction {
+	return func(ctx context.Context, tx *Promoter) (*Verdict, error) {
+		return tx.promoteToAtom(ctx, ns, c, entityID, ev)
+	}
+}
+
+// mergeAction 并入的落库计划：事务内**按签名复核一次**——
+// 判定读到的卡与落库隔了一次模型调用的时长，签名已不在（被清理/改写）
+// 或卡已退役时，并入没有对象，**回落为普通晋升**，不把陈旧读视图写回去。
+func (p *Promoter) mergeAction(ns store.Namespace, c *types.Candidate,
+	entityID string, ev *types.RawEvent, sig string) writeAction {
+	return func(ctx context.Context, tx *Promoter) (*Verdict, error) {
+		fresh, err := tx.store.FindAtomBySignature(ctx, ns, sig)
+		if errors.Is(err, store.ErrNotFound) || (err == nil && !fresh.Active()) {
+			return tx.promoteToAtom(ctx, ns, c, entityID, ev)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return tx.merge(ctx, ns, c, fresh)
+	}
+}
+
+// updateAction 取代的落库计划：事务内**按旧卡签名复核一次**——
+// 旧卡已不在或已被别人退役时，取代没有对象，**回落为普通晋升**
+// （新事实自立一张，不抢别人已经写下的取代链）。
+func (p *Promoter) updateAction(ns store.Namespace, c *types.Candidate,
+	entityID string, ev *types.RawEvent, old *types.AtomCard) writeAction {
+	sig := old.Signature()
+	return func(ctx context.Context, tx *Promoter) (*Verdict, error) {
+		fresh, err := tx.store.FindAtomBySignature(ctx, ns, sig)
+		if errors.Is(err, store.ErrNotFound) || (err == nil && !fresh.Active()) {
+			return tx.promoteToAtom(ctx, ns, c, entityID, ev)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return tx.updateToAtom(ctx, ns, c, entityID, ev, fresh)
+	}
 }
 
 // promoteToAtom 落库一条新事实（晋升路径的最后一步）。
@@ -587,15 +660,35 @@ func (p *Promoter) checkConflict(ctx context.Context, ns store.Namespace,
 	return nil, nil
 }
 
-// negationTokens 否定词表。
+// negationTokens 否定词表（中文族，按**子串**判）。
 //
 // 与 extractor 的防稀释提示**共用同一份词表**是硬约定：抽取器说「引用丢了否定」
 // 时，晋升器必须用同一个词族去检测「旧事实说 X，新候选说 非X」——两处词表
 // 一旦漂移，一条被悄悄反过来的事实就既抽不出来也查不出来。
+//
+// 中文按子串判是唯一可行的判法（中文没有词边界），且不会误伤——
+// 会误伤的是英文（见 negationEnglishWords）。
 var negationTokens = []string{
 	"不", "未", "没", "无", "非", "别", "勿", "尚未", "还没",
-	"not", "non", "un", "never", "no",
 }
+
+// negationEnglishWords 英文否定词（整词）与否定前缀（词元以它开头）。
+//
+// # 为什么英文不能按子串判（issue #56）
+//
+// 裸子串会让 un/no 命中 function/known/north 的**词内子串**——
+// 「The function returns the count」被判含否定，与不含否定词的相似断言
+// 进 XOR 矛盾判定后产生假矛盾，污染人审队列；判不判得中取决于拼写。
+// 故英文按词元判（连续字母数字段，word boundary 由切词保证）：
+//
+//   - not/never/no 整词；
+//   - non 整词或词元前缀（nonempty、non-zero 都是否定，且 non* 误伤面极小）；
+//   - un **只整词**（un- 连字形态切词后独立成词元即命中）——unhealthy 这类
+//     连写形态不判：unit/under/unless/union 这类非否定词全以 un 开头，
+//     前缀判的假阳性正是本单要修的病，比「un 连写否定漏检」贵
+//     （漏检方向是少送审，误检方向是污染人审队列）。
+var negationEnglishWords = []string{"not", "never", "no", "non", "un"}
+var negationEnglishPrefixes = []string{"non"}
 
 func negationDiffers(a, b string) bool {
 	return hasNegation(a) != hasNegation(b)
@@ -606,6 +699,21 @@ func hasNegation(s string) bool {
 	for _, t := range negationTokens {
 		if strings.Contains(lower, t) {
 			return true
+		}
+	}
+	// 英文按词元：连续的 ASCII 字母/数字算一个词元（CJK 不是词元也不是
+	// 分隔符，走上面的子串族）。词元整词或以否定前缀开头即含否定。
+	isAlnum := func(r rune) bool { return r >= 'a' && r <= 'z' || r >= '0' && r <= '9' }
+	for _, w := range strings.FieldsFunc(lower, func(r rune) bool { return !isAlnum(r) }) {
+		for _, t := range negationEnglishWords {
+			if w == t {
+				return true
+			}
+		}
+		for _, p := range negationEnglishPrefixes {
+			if strings.HasPrefix(w, p) {
+				return true
+			}
 		}
 	}
 	return false

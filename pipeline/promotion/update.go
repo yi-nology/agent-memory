@@ -121,33 +121,36 @@ func (p *Promoter) checkUpdate(ctx context.Context, ns store.Namespace, entityID
 //
 // 两条「重」的动作（作废已存事实、裁决矛盾）永远落在人工手里：
 // 模型能触发的只有「取代」与「并入」。
+// decideUpdate 处置「可能同主体」的情形，产出落库计划（判定阶段，事务外；
+// issue #57）。模型调用（askModel）在这里发生——它在事务外，
+// 不占着事务等模型。
 func (p *Promoter) decideUpdate(ctx context.Context, ns store.Namespace, c *types.Candidate,
-	entityID string, ev *types.RawEvent, hint *updateHint) (*Verdict, error) {
+	entityID string, ev *types.RawEvent, hint *updateHint) (writeAction, *Verdict, error) {
 	if hint.confident {
-		return p.updateToAtom(ctx, ns, c, entityID, ev, hint.old)
+		return p.updateAction(ns, c, entityID, ev, hint.old), nil, nil
 	}
 	if p.cfg.LLM == nil {
 		// 没装模型 = 没有这一支判定：按普通晋升处理。
 		//
 		// 刻意**不**送人工：那会让「没配模型」的宿主突然多出一堆待人处置的候选，
 		// 而降级路径（没模型也能记事实）必须保持原样。
-		return nil, nil
+		return nil, nil, nil
 	}
 	rel, reason, err := p.askModel(ctx, c, hint.old)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	switch rel {
 	case relationUpdate:
-		return p.updateToAtom(ctx, ns, c, entityID, ev, hint.old)
+		return p.updateAction(ns, c, entityID, ev, hint.old), nil, nil
 	case relationNoop:
-		return p.merge(ctx, ns, c, hint.old)
+		return p.mergeAction(ns, c, entityID, ev, hint.old.Signature()), nil, nil
 	case relationDelete, relationConflict:
-		return &Verdict{Decision: DecisionReview, Check: "update", EntityID: entityID,
+		return nil, &Verdict{Decision: DecisionReview, Check: "update", EntityID: entityID,
 			Reason: "与既有事实的关系待人工判定：" + reason}, nil
 	default:
 		// add：两条说的是不同的事 → 走普通晋升路径。
-		return nil, nil
+		return nil, nil, nil
 	}
 }
 

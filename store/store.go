@@ -112,6 +112,16 @@ type (
 		// 真正要比的那张卡根本进不了候选集——矛盾/取代检测静默失效
 		// （issue #32）。
 		ScopeExact types.Scope
+		// GlobalReader **全局读者**取数（空=不用这一条）：只取全局事实
+		// （scope = ''），本归属/别归属的一律不给。
+		//
+		// 存在的理由（issue #53）：空 Scope 作为**过滤条件**是「不隔离」
+		// （导出、生命周期扫描靠它取全量），而空 Scope 作为**读者**按
+		// types.Scope.VisibleTo 只看得见全局卡——同一空值两条判据逐字相反。
+		// 读者语义必须在这里生效：后置过滤时被别家占掉的 TopK 配额已经
+		// 花掉了，「该给我的那条全局事实」根本没进候选池。
+		// 置位时本栏与 Scope 互斥（以本栏为准）。
+		GlobalReader bool
 		// ActiveOnly 只要活跃事实（软退役排除）。
 		//
 		// 召回路径**必须**置位：默认值 false 意味着「忘了过滤就捞到已作废事实」，
@@ -153,6 +163,16 @@ type (
 		OccurredTo   time.Time
 		// Limit 条数上限（0=后端默认）。
 		Limit int
+		// Offset 跳过的条数（0=从头；分页取全的翻页用）。
+		//
+		// 存在的理由：「全量扫描」类动作（向量补算、生命周期四件套）不能
+		// 用一个写死的大 Limit 冒充全量——单 namespace 超过那个数时，排在
+		// 取数序尾部的卡静默落选，且落选的恰是最不重要的那批（issue #59）。
+		// 带上 Offset，调用方就能按页翻到取尽（见 store.ListAllAtoms）。
+		//
+		// 它与 LIMIT 同源同序（同一份 ORDER BY），翻页不重不漏的前提是
+		// **翻页期间数据不动**——维护类扫描是先取尽后处理，取数阶段只有读。
+		Offset int
 	}
 	// CandidateFilter 候选过滤条件。
 	CandidateFilter struct {
@@ -374,6 +394,12 @@ type EdgeFilter struct {
 	At time.Time
 	// Limit 条数上限（0=后端默认）。
 	Limit int
+	// Offset 跳过的条数（0=从头；分页取全的翻页用）。
+	//
+	// 语义同 AtomFilter.Offset：单实体的出边可以远超后端缺省上限
+	// （关系投影常见），「取全」类消费方（多跳遍历）按页翻到取尽，
+	// 不能拿缺省 100 冒充全量（issue #54）。
+	Offset int
 }
 
 // EpisodeStore 情节与周期摘要存取。

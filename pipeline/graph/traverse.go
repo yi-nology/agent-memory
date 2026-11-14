@@ -147,12 +147,11 @@ func (t *Traverser) Traverse(ctx context.Context, ns store.Namespace, from []str
 			// 后端的默认条数上限落在单实体出边集上，而不是整层前沿上——
 			// 前沿整体取数时，上限会**静默截断**（少了哪条边看不出来），
 			// 而那正是「关系少了」这类症状的来源。
-			edges, err := t.store.ListEdges(ctx, ns, store.EdgeFilter{
-				FromEntityIDs: []string{f.entityID},
-				Relations:     opts.Relations,
-				Scope:         opts.Scope,
-				At:            opts.At,
-			})
+			//
+			// 单实体仍可能超出后端缺省上限（100）：关系投影里一个枢纽实体
+			// 带几百条出边是常态。按页取尽（issue #54），否则按 created_at ASC
+			// 先丢的恰是**最新的边**——最新建的关系永不参与多跳，且无信号。
+			edges, err := t.listFrontierEdges(ctx, ns, f.entityID, opts)
 			if err != nil {
 				return nil, err
 			}
@@ -244,6 +243,41 @@ func (t *Traverser) Traverse(ctx context.Context, ns store.Namespace, from []str
 		out = out[:maxResults]
 	}
 	return out, nil
+}
+
+// edgeScanPage 单实体出边分页取全的单页大小。
+//
+// 取数序（created_at ASC, id ASC）与 LIMIT/OFFSET 同源，翻页不重不漏的
+// 前提是取数期间数据不动——遍历是先取尽、后判定。
+const edgeScanPage = 500
+
+// listFrontierEdges 分页取尽前沿上单个实体的出边（issue #54）。
+//
+// ListEdges 的缺省上限是 100（LIMIT 语义是「取前 N」）：
+// Traverse 按单实体取边但不给 Limit 的话，出边超 100 的实体会被
+// 按 created_at ASC 静默截断——丢的恰是**最新的边**，偏置方向固定
+// （丢新留旧），「某些关系搜不到」这种症状就是这么来的且难归因。
+// 故按页翻到取尽，不靠一个大常数冒充全量。
+func (t *Traverser) listFrontierEdges(ctx context.Context, ns store.Namespace,
+	entityID string, opts TraverseOptions) ([]*types.EntityEdge, error) {
+	var out []*types.EntityEdge
+	for offset := 0; ; offset += edgeScanPage {
+		batch, err := t.store.ListEdges(ctx, ns, store.EdgeFilter{
+			FromEntityIDs: []string{entityID},
+			Relations:     opts.Relations,
+			Scope:         opts.Scope,
+			At:            opts.At,
+			Limit:         edgeScanPage,
+			Offset:        offset,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, batch...)
+		if len(batch) < edgeScanPage {
+			return out, nil
+		}
+	}
 }
 
 // resolveDepth 归一跳数上限。

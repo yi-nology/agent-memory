@@ -197,45 +197,82 @@ func (c *Capturer) CaptureBatch(ctx context.Context, in []Input) ([]*Outcome, er
 
 // redactPayload 逐条处置载荷里的字符串值。
 //
-// 只下探一层 map + 一层 slice：更深的结构（如数组套数组套对象）在本仓的
-// 载荷面里不存在，而为一个假想结构写递归遍历，等于给「无界深度」开门。
-// 真需要更深时，宿主可以在进捕获之前先拍平。
+// 下探**map 与 slice 的组合形态**（redactValue 递归）：map 里套 map 早就是
+// 递归的，而 encoding/json 解码任何 JSON 数组得到的都是 []any（不是 []string）
+// ——漏掉它的后果是「数组元素里的凭据整段绕过脱敏落库」，且 Redacted
+// 审计位还是 false（载荷没变，正文也没变）——本包存在的唯一理由就是
+// 「落库前脱敏」，此为直穿（issue #52）。非容器的标量（数字、布尔、nil）
+// 原样透传：脱敏面只认文本。
 func redactPayload(ctx context.Context, r ports.Redactor, p map[string]any, ns, evID string) (map[string]any, error) {
 	if p == nil {
 		return nil, nil
 	}
 	out := make(map[string]any, len(p))
 	for k, v := range p {
-		switch tv := v.(type) {
-		case string:
-			s, err := r.Redact(ctx, ports.RedactRequest{
-				Surface: ports.SurfacePayload, Text: tv, Namespace: ns, EventID: evID,
+		rv, err := redactValue(ctx, r, v, ns, evID)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = rv
+	}
+	return out, nil
+}
+
+// redactValue 递归处置一个载荷值：容器下探，字符串打码，其余透传。
+//
+// 深度由载荷自身的结构决定（与 map 下探同款性质）；兜底是「不认识的类型
+// 原样出去」——脱敏漏掉一个标量的代价远小于把整个载荷写坏。
+func redactValue(ctx context.Context, r ports.Redactor, v any, ns, evID string) (any, error) {
+	switch tv := v.(type) {
+	case string:
+		return r.Redact(ctx, ports.RedactRequest{
+			Surface: ports.SurfacePayload, Text: tv, Namespace: ns, EventID: evID,
+		})
+	case map[string]any:
+		sub := make(map[string]any, len(tv))
+		for k, mv := range tv {
+			rv, err := redactValue(ctx, r, mv, ns, evID)
+			if err != nil {
+				return nil, err
+			}
+			sub[k] = rv
+		}
+		return sub, nil
+	case map[string]string:
+		sub := make(map[string]string, len(tv))
+		for k, sv := range tv {
+			rs, err := r.Redact(ctx, ports.RedactRequest{
+				Surface: ports.SurfacePayload, Text: sv, Namespace: ns, EventID: evID,
 			})
 			if err != nil {
 				return nil, err
 			}
-			out[k] = s
-		case map[string]any:
-			sub, err := redactPayload(ctx, r, tv, ns, evID)
+			sub[k] = rs
+		}
+		return sub, nil
+	case []string:
+		arr := make([]string, len(tv))
+		for i, s := range tv {
+			rs, err := r.Redact(ctx, ports.RedactRequest{
+				Surface: ports.SurfacePayload, Text: s, Namespace: ns, EventID: evID,
+			})
 			if err != nil {
 				return nil, err
 			}
-			out[k] = sub
-		case []string:
-			arr := make([]string, len(tv))
-			for i, s := range tv {
-				rs, err := r.Redact(ctx, ports.RedactRequest{
-					Surface: ports.SurfacePayload, Text: s, Namespace: ns, EventID: evID,
-				})
-				if err != nil {
-					return nil, err
-				}
-				arr[i] = rs
-			}
-			out[k] = arr
-		default:
-			out[k] = v
+			arr[i] = rs
 		}
+		return arr, nil
+	case []any:
+		arr := make([]any, len(tv))
+		for i, ev := range tv {
+			rv, err := redactValue(ctx, r, ev, ns, evID)
+			if err != nil {
+				return nil, err
+			}
+			arr[i] = rv
+		}
+		return arr, nil
+	default:
+		return v, nil
 	}
-	return out, nil
 }

@@ -173,9 +173,15 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 	//
 	// 重要度排序用 CASE 表达式（importanceOrderExpr）而不是字典序：
 	// importance 列是 TEXT，字典序下 'med' > 'low' > 'high'，最重要的会排最后。
+	//
+	// OFFSET 服务于「分页取全」的翻页（store.ListAllAtoms）：全量扫描类动作
+	// 不能用一个大 Limit 冒充全量（issue #59）。它与 LIMIT 同一份 ORDER BY，
+	// 翻页不重不漏的前提是取数期间数据不动——扫描是先取尽后处理。
+	// （与 SQLite 侧逐字同语义。）
 	q := `SELECT ` + atomCols + ` FROM atoms WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT $` + fmt.Sprint(len(args)+1)
-	args = append(args, limitOf(f.Limit, defaultFetchLimit))
+		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT $` +
+		fmt.Sprint(len(args)+1) + ` OFFSET $` + fmt.Sprint(len(args)+2)
+	args = append(args, limitOf(f.Limit, defaultFetchLimit), max(f.Offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
@@ -232,6 +238,14 @@ func atomConditions(f store.AtomFilter, start int) (string, []any) {
 			args = append(args, id)
 		}
 		start += len(f.IDs)
+	}
+	if f.GlobalReader {
+		// **全局读者**：只取全局事实（issue #53）。
+		//
+		// 空 Scope 作为过滤条件是「不隔离」，而空读者按 types.Scope.VisibleTo
+		// 只看得见全局卡——读者语义必须在这里生效（配额不能被别家占掉
+		// 再后置滤掉），故单独一根条件。置位时 Scope 不生效（见字段注释）。
+		where = append(where, "scope = ''")
 	}
 	if f.Scope != "" {
 		// 归属条件：**全局的 + 同归属的**，别家的不给。
@@ -311,15 +325,31 @@ func atomConditions(f store.AtomFilter, start int) (string, []any) {
 	return strings.Join(where, " AND "), args
 }
 
+// entityScanPage 实体名下取卡的单页大小（分页取尽，issue #59；
+// 与 SQLite 侧逐字同语义）。
+const entityScanPage = 500
+
 func (s *atomStore) ListAtomsByEntity(ctx context.Context, ns store.Namespace, entityID string) ([]*types.AtomCard, error) {
 	if entityID == "" {
 		return nil, nil
 	}
 	// 不按退役态过滤：实体合并要把名下**所有**卡（含已退役的）一起迁走。
-	return s.ListAtoms(ctx, ns, store.AtomFilter{
-		EntityIDs: []string{entityID},
-		Limit:     100000,
-	})
+	// 按**分页取尽**（issue #59）——理由见 SQLite 侧同处注释。
+	f := store.AtomFilter{EntityIDs: []string{entityID}}
+	out := make([]*types.AtomCard, 0, entityScanPage)
+	for offset := 0; ; offset += entityScanPage {
+		page := f
+		page.Limit = entityScanPage
+		page.Offset = offset
+		batch, err := s.ListAtoms(ctx, ns, page)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, batch...)
+		if len(batch) < entityScanPage {
+			return out, nil
+		}
+	}
 }
 
 func (s *atomStore) FindAtomBySignature(ctx context.Context, ns store.Namespace, signature string) (*types.AtomCard, error) {
@@ -418,6 +448,22 @@ func (s *atomStore) DeprecateAtom(ctx context.Context, ns store.Namespace, id st
 //
 // 退役**不删正文**：被推翻的事实仍然可以被搜到并看到「已被继任者取代」，
 // 因为「当初为什么这么判」是记忆系统必须能回答的问题。
+//
+// # 退役态只许单向置位（与 SaveAtom 同款 CASE 守卫，issue #48）
+//
+// 读改写本身挡不住两类失效（SaveAtom 注释点名的「并发取代互相抹链」
+// 在这条专职路径上原样存在）：
+//
+//  1. 二次退役改写既有退役态：DeprecateAtom 的 mutate 无条件把
+//     superseded_by 清空——对一张已被取代的卡调人工作废，会把既有取代链
+//     静默抹掉（继任指针丢失，卡还在退役态，但「当初为什么这么判」断链）；
+//  2. 两个并发 retire 同一张卡：READ COMMITTED 下两个事务都先读到
+//     未退役态，后提交者覆盖先提交者。
+//
+// 故 UPDATE 用与 SaveAtom 相同的 CASE：库里的行已退役（superseded_by 非空
+// 或 deprecated_at 已设）时，这两列保持库里的值，本次 mutate 的结果不落库。
+// 读视图在事务里拿到，但判定以**行上的现值**为准——它是两后端唯一可靠的
+// 仲裁点（与 SQLite 侧逐字同语义）。
 func (s *atomStore) retire(ctx context.Context, ns store.Namespace, id string, mutate func(*types.AtomCard) error) error {
 	// 读改写三步必须在同一个事务里，且用的是回调收到的 tx。
 	return s.Transaction(ctx, func(ctx context.Context, tx store.Store) error {
@@ -437,7 +483,12 @@ func (s *atomStore) retire(ctx context.Context, ns store.Namespace, id string, m
 			return fmt.Errorf("事务内拿到的不是本后端实现，退役无法落库: %T", tx)
 		}
 		_, err = tsStore.exec(ctx,
-			`UPDATE atoms SET superseded_by = $1, deprecated_at = $2, updated_at = $3
+			`UPDATE atoms SET
+				superseded_by = CASE WHEN superseded_by <> '' OR deprecated_at IS NOT NULL
+				                     THEN superseded_by ELSE $1 END,
+				deprecated_at = CASE WHEN superseded_by <> '' OR deprecated_at IS NOT NULL
+				                     THEN deprecated_at ELSE $2 END,
+				updated_at = $3
 			 WHERE namespace = $4 AND id = $5`,
 			a.SupersededBy, tsPtr(a.DeprecatedAt), ts(a.UpdatedAt), nsOf(ns), a.ID)
 		return err

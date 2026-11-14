@@ -276,7 +276,7 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			ThreadID  string   `json:"thread_id"`
 			Entities  []string `json:"entities"`
 			Limit     int      `json:"limit"`
-			// Scope 读者归属（空=不隔离）。
+			// Scope 读者归属（空=全局读者，只看全局事实）。
 			//
 			// 与 memory.search 同一个口径：注入面与检索面读的是同一批卡，
 			// 一处过滤一处不过滤，失效形态是「模型引用了别的组的事实」。
@@ -305,20 +305,25 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
 			Namespace string `json:"namespace"`
 			Query     string `json:"query"`
 			Limit     int    `json:"limit"`
-			// Scope 读者归属（空=不隔离）。
+			// Scope 读者归属（空=全局读者，只看全局事实）。
 			//
-			// 检索面与召回面**必须**用同一个归属口径：
-			// 两处读同一张表、同一个字段，一处过滤一处不过滤，
-			// 失效形态是「搜到了别的组的事实」而调用方看不出来。
+			// 检索面与召回面**必须**用同一个归属口径（issue #53）：
+			// 两处读同一张表、同一个字段，一处「不隔离」一处「只全局」的话，
+			// 失效形态是「召回挡住的、检索放进来」而调用方看不出来。
 			Scope string `json:"scope"`
 		}
 		if err := decodeParams(params, &p); err != nil {
 			return nil, err
 		}
-		atoms, err := s.svc.Search(ctx, store.Namespace(p.Namespace), p.Query, store.AtomFilter{
-			Limit: p.Limit,
-			Scope: types.Scope(p.Scope),
-		})
+		atoms, err := s.svc.Search(ctx, store.Namespace(p.Namespace), p.Query, func() store.AtomFilter {
+			f := store.AtomFilter{Limit: p.Limit}
+			if p.Scope == "" {
+				f.GlobalReader = true
+			} else {
+				f.Scope = types.Scope(p.Scope)
+			}
+			return f
+		}())
 		if err != nil {
 			return nil, err
 		}

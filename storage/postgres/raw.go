@@ -197,6 +197,26 @@ func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, scope types.
 	}
 	q += ` ORDER BY ts DESC, id DESC LIMIT $` + fmt.Sprint(len(args)+1) + ` OFFSET $` + fmt.Sprint(len(args)+2)
 	args = append(args, limitOf(p.Limit, defaultFetchLimit), p.Offset)
+	return s.queryRaws(ctx, q, args...)
+}
+
+// ListRawGlobal 以**全局读者**身份取原始事件：只取全局（scope = ”）的
+// （可选能力 GlobalRawReader 的实现，issue #53；与 SQLite 侧逐字同语义）。
+func (s *rawStore) ListRawGlobal(ctx context.Context, ns store.Namespace,
+	before time.Time, p store.Page) ([]*types.RawEvent, error) {
+	q := `SELECT ` + rawCols + ` FROM raw_events WHERE namespace = $1 AND scope = ''`
+	args := []any{nsOf(ns)}
+	if !before.IsZero() {
+		q += ` AND ts < $` + fmt.Sprint(len(args)+1)
+		args = append(args, ts(before))
+	}
+	q += ` ORDER BY ts DESC, id DESC LIMIT $` + fmt.Sprint(len(args)+1) + ` OFFSET $` + fmt.Sprint(len(args)+2)
+	args = append(args, limitOf(p.Limit, defaultFetchLimit), p.Offset)
+	return s.queryRaws(ctx, q, args...)
+}
+
+// queryRaws 跑一条原始事件查询并逐行扫描（游标关净再返回）。
+func (s *rawStore) queryRaws(ctx context.Context, q string, args ...any) ([]*types.RawEvent, error) {
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -327,6 +347,11 @@ func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, l
 		where += " AND " + extra
 		args = append(args, extraArgs...)
 	}
+	// 排序方言（issue #58）：本侧用 ts_rank(body_tsv, ...) DESC；
+	// SQLite 侧同一条检索语义用 FTS5 内建的 rank（bm25 口径）。
+	// **相对名次是已声明的方言差异**，不进跨后端断言（「哪条该进 prompt」
+	// 是召回层重排的职责，见 AGENTS.md「排序不是存储层的承诺」）；
+	// parity 钉的是**命中集合**同一口径（tAtomSearchTopKSet）。
 	rows, err := s.query(ctx,
 		`SELECT id FROM `+table+`
 		 WHERE `+where+`
