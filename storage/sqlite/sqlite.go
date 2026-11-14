@@ -123,6 +123,11 @@ type openOpts struct {
 // 是空操作）。存量库要迁移：停写 → DROP 三张 *_fts 虚表 → 重开库（按新
 // 分词器重建）→ 重灌（raw_events / candidates / atoms 的正文重插或按
 // 各自的回填路径补）——FTS 索引是派生物，真源表不丢。
+//
+// **存量库有信号**（issue #55）：显式指定本项打开一个分词器不一致的
+// 存量库时，Open **报错**（错误里带迁移步骤），不再静默落空——
+// 「配置了没生效」比「配置被拒」贵得多。不指定（缺省）时沿用库内现状：
+// trigram 库不带参数重开是常态操作。
 func WithFTSTokenize(tokenize string) Option {
 	return func(o *openOpts) { o.ftsTokenize = tokenize }
 }
@@ -154,6 +159,12 @@ func Open(dsn string, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("打开外键失败: %w", err)
 	}
 	if err := ensureSchema(context.Background(), db, ddl); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// 显式指定的分词器与库内既有虚表不一致 ⇒ 响亮失败（issue #55）：
+	// IF NOT EXISTS 对存量虚表是空操作，不校验的话「换分词器」静默落空。
+	if err := checkExistingFTSTokenize(context.Background(), db, o.ftsTokenize); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
