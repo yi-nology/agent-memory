@@ -587,15 +587,35 @@ func (p *Promoter) checkConflict(ctx context.Context, ns store.Namespace,
 	return nil, nil
 }
 
-// negationTokens 否定词表。
+// negationTokens 否定词表（中文族，按**子串**判）。
 //
 // 与 extractor 的防稀释提示**共用同一份词表**是硬约定：抽取器说「引用丢了否定」
 // 时，晋升器必须用同一个词族去检测「旧事实说 X，新候选说 非X」——两处词表
 // 一旦漂移，一条被悄悄反过来的事实就既抽不出来也查不出来。
+//
+// 中文按子串判是唯一可行的判法（中文没有词边界），且不会误伤——
+// 会误伤的是英文（见 negationEnglishWords）。
 var negationTokens = []string{
 	"不", "未", "没", "无", "非", "别", "勿", "尚未", "还没",
-	"not", "non", "un", "never", "no",
 }
+
+// negationEnglishWords 英文否定词（整词）与否定前缀（词元以它开头）。
+//
+// # 为什么英文不能按子串判（issue #56）
+//
+// 裸子串会让 un/no 命中 function/known/north 的**词内子串**——
+// 「The function returns the count」被判含否定，与不含否定词的相似断言
+// 进 XOR 矛盾判定后产生假矛盾，污染人审队列；判不判得中取决于拼写。
+// 故英文按词元判（连续字母数字段，word boundary 由切词保证）：
+//
+//   - not/never/no 整词；
+//   - non 整词或词元前缀（nonempty、non-zero 都是否定，且 non* 误伤面极小）；
+//   - un **只整词**（un- 连字形态切词后独立成词元即命中）——unhealthy 这类
+//     连写形态不判：unit/under/unless/union 这类非否定词全以 un 开头，
+//     前缀判的假阳性正是本单要修的病，比「un 连写否定漏检」贵
+//     （漏检方向是少送审，误检方向是污染人审队列）。
+var negationEnglishWords = []string{"not", "never", "no", "non", "un"}
+var negationEnglishPrefixes = []string{"non"}
 
 func negationDiffers(a, b string) bool {
 	return hasNegation(a) != hasNegation(b)
@@ -606,6 +626,22 @@ func hasNegation(s string) bool {
 	for _, t := range negationTokens {
 		if strings.Contains(lower, t) {
 			return true
+		}
+	}
+	// 英文按词元：连续的 ASCII 字母/数字算一个词元（CJK 不是词元也不是
+	// 分隔符，走上面的子串族）。词元整词或以否定前缀开头即含否定。
+	for _, w := range strings.FieldsFunc(lower, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	}) {
+		for _, t := range negationEnglishWords {
+			if w == t {
+				return true
+			}
+		}
+		for _, p := range negationEnglishPrefixes {
+			if strings.HasPrefix(w, p) {
+				return true
+			}
 		}
 	}
 	return false
