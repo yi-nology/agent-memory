@@ -3,6 +3,7 @@ package lifecycle_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -566,5 +567,30 @@ func TestJournalWriteFailureIsVisible(t *testing.T) {
 				t.Fatal("审计写失败必须以 error 可见：吞掉等于「留痕承诺」静默失效")
 			}
 		})
+	}
+}
+
+// 全量扫描必须**取尽**而不是拿大 Limit 冒充（issue #59）：
+// GC 的取数走 store.ListAllAtoms 分页——把单页大小（500）跨过去
+// （520 条），排在第一页之外的卡也必须被扫到并处置。
+// 修复前这里是 Limit: 100000：超限时按取数序截断、无信号，
+// 尾部（恰是最不重要的那批）永不回收。
+func TestGCPaginatesBeyondFirstPage(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+	const total = 520
+	for i := range total {
+		// 证据事件从不落库 ⇒ 每条事实的证据「全没了」，GC 应逐条退役。
+		if err := s.SaveAtom(ctx, ns, atom(fmt.Sprintf("a-pg-%03d", i), "ent1",
+			fmt.Sprintf("第 %d 条待回收事实", i), fmt.Sprintf("ev-missing-%03d", i), false)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := lifecycle.GC(ctx, s, ns, now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AtomsRetired != total {
+		t.Fatalf("跨页的 %d 条事实都应被 GC 扫到并退役，实得 %d", total, res.AtomsRetired)
 	}
 }

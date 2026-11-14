@@ -13,6 +13,14 @@ import (
 // 它是本函数的实现参数，不是契约。
 const defaultScanPage = 500
 
+// AtomLister 分页取全所需的取数面（消费者按需实现/裁剪）。
+//
+// 故意不是 AtomStore：生命周期面、召回装配面各自声明自己的窄接口，
+// 本函数不该逼它们长出全量事实卡存取面。
+type AtomLister interface {
+	ListAtoms(ctx context.Context, ns Namespace, f AtomFilter) ([]*types.AtomCard, error)
+}
+
 // ListAllAtoms 分页取尽事实卡：f 的条件原样生效，Limit/Offset 由本函数接管。
 //
 // # 为什么必须有它
@@ -27,7 +35,7 @@ const defaultScanPage = 500
 // 本函数按 defaultScanPage 翻页，直到某页不满一页（取尽）。
 // 翻页不重不漏的前提是**取数期间数据不动**：调用方应先取尽、后处理
 // （处理中途的写入不影响已取出的那份快照）。
-func ListAllAtoms(ctx context.Context, s AtomStore, ns Namespace, f AtomFilter, pageSize int) ([]*types.AtomCard, error) {
+func ListAllAtoms(ctx context.Context, s AtomLister, ns Namespace, f AtomFilter, pageSize int) ([]*types.AtomCard, error) {
 	if pageSize <= 0 {
 		pageSize = defaultScanPage
 	}

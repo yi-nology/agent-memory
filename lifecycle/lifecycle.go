@@ -124,7 +124,11 @@ func GC(ctx context.Context, s Store, ns store.Namespace, before time.Time, opt 
 	res := &GCResult{RawDeleted: n}
 
 	// 找出证据全被清掉的事实。
-	atoms, err := s.ListAtoms(ctx, ns, store.AtomFilter{ActiveOnly: true, Limit: 100000})
+	// 全量扫描按**分页取尽**（store.ListAllAtoms，issue #59）：
+	// Limit: 100000 冒充全量的失效形态是「单 namespace 超十万条时，
+	// 排在取数序尾部的卡永不被处理」——而尾部恰是最不重要的那批，
+	// GC/合并/保留期/过期对它们的失效是静默的。
+	atoms, err := store.ListAllAtoms(ctx, s, ns, store.AtomFilter{ActiveOnly: true}, 0)
 	if err != nil {
 		return res, err
 	}
@@ -189,7 +193,11 @@ func Consolidate(ctx context.Context, s Store, ns store.Namespace, opt ...Option
 	if s == nil {
 		return nil, errors.New("lifecycle: 存储未装配")
 	}
-	atoms, err := s.ListAtoms(ctx, ns, store.AtomFilter{ActiveOnly: true, Limit: 100000})
+	// 全量扫描按**分页取尽**（store.ListAllAtoms，issue #59）：
+	// Limit: 100000 冒充全量的失效形态是「单 namespace 超十万条时，
+	// 排在取数序尾部的卡永不被处理」——而尾部恰是最不重要的那批，
+	// GC/合并/保留期/过期对它们的失效是静默的。
+	atoms, err := store.ListAllAtoms(ctx, s, ns, store.AtomFilter{ActiveOnly: true}, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +281,11 @@ func Retention(ctx context.Context, s Store, ns store.Namespace, opt ...Option) 
 	if s == nil {
 		return nil, errors.New("lifecycle: 存储未装配")
 	}
-	atoms, err := s.ListAtoms(ctx, ns, store.AtomFilter{ActiveOnly: true, Limit: 100000})
+	// 全量扫描按**分页取尽**（store.ListAllAtoms，issue #59）：
+	// Limit: 100000 冒充全量的失效形态是「单 namespace 超十万条时，
+	// 排在取数序尾部的卡永不被处理」——而尾部恰是最不重要的那批，
+	// GC/合并/保留期/过期对它们的失效是静默的。
+	atoms, err := store.ListAllAtoms(ctx, s, ns, store.AtomFilter{ActiveOnly: true}, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +385,11 @@ func Expire(ctx context.Context, s Store, ns store.Namespace, opt ...Option) (*E
 	// 不是写入时刻：一条三天前发生、今天才记下来的事件，
 	// 它的「龄」是三天而不是零。
 	cutoff := o.now().Add(-o.eventRetention)
-	atoms, err := s.ListAtoms(ctx, ns, store.AtomFilter{ActiveOnly: true, Limit: 100000})
+	// 全量扫描按**分页取尽**（store.ListAllAtoms，issue #59）：
+	// Limit: 100000 冒充全量的失效形态是「单 namespace 超十万条时，
+	// 排在取数序尾部的卡永不被处理」——而尾部恰是最不重要的那批，
+	// GC/合并/保留期/过期对它们的失效是静默的。
+	atoms, err := store.ListAllAtoms(ctx, s, ns, store.AtomFilter{ActiveOnly: true}, 0)
 	if err != nil {
 		return nil, err
 	}

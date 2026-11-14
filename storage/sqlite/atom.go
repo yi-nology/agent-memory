@@ -349,15 +349,33 @@ func importanceOrderExpr() string {
 	return "CASE importance " + strings.Join(parts, " ") + " ELSE 0 END"
 }
 
+// entityScanPage 实体名下取卡的单页大小（分页取尽，issue #59）。
+const entityScanPage = 500
+
 func (s *atomStore) ListAtomsByEntity(ctx context.Context, ns store.Namespace, entityID string) ([]*types.AtomCard, error) {
 	if entityID == "" {
 		return nil, nil
 	}
 	// 不按退役态过滤：实体合并要把名下**所有**卡（含已退役的）一起迁走。
-	return s.ListAtoms(ctx, ns, store.AtomFilter{
-		EntityIDs: []string{entityID},
-		Limit:     100000,
-	})
+	//
+	// 按**分页取尽**（issue #59）：Limit: 100000 冒充全量的失效形态是
+	// 「名下卡片超限时按取数序静默截断」——合并漏一张卡，那张卡就永远
+	// 指向一个已不存在的实体（本契约存在理由里点名的那类失效）。
+	f := store.AtomFilter{EntityIDs: []string{entityID}}
+	out := make([]*types.AtomCard, 0, entityScanPage)
+	for offset := 0; ; offset += entityScanPage {
+		page := f
+		page.Limit = entityScanPage
+		page.Offset = offset
+		batch, err := s.ListAtoms(ctx, ns, page)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, batch...)
+		if len(batch) < entityScanPage {
+			return out, nil
+		}
+	}
 }
 
 func (s *atomStore) FindAtomBySignature(ctx context.Context, ns store.Namespace, signature string) (*types.AtomCard, error) {
