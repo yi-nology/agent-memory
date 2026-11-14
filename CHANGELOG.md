@@ -2,6 +2,53 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.15.0] — 2026-11-14
+
+### 修复(recall)：GlobalRawReader 降级路径配额损失按 DropDegradedScope 归因
+
+- ports/budget.go 的 Drops 通用表补 DropDegradedScope（degraded_scope）：
+  存储没实现 store.GlobalRawReader 时，全局读者的 raw 取数降级为
+  ListRaw(空 scope=不隔离) + 后置 VisibleTo 滤除——先取后滤，被滤掉的
+  条数就是被占掉的 TopK 配额，按本原因进 Result.Drops（与 #53 落的
+  Drops 通用表同构），observe 逐项打点 recall.dropped.degraded_scope
+- gather.listRawForReader 返回降级标志（仅「空读者 + 无全局读者能力」
+  的落点为真：非空读者的 ListRaw(scope) 本来就是读者语义，不计数）；
+  后置滤在降级下是主防线，滤除计数上交，非降级路径行为不变
+- 测试：降级宿主 Drops[DropDegradedScope]==被滤条数且指标同值、
+  正确性兜底（别归属事件不进 prompt）；实现可选能力的宿主零降级项；
+  非空读者不产生降级归因
+
+### 修复(recall)：语义路空读者显式只取全局，配额语义与 SQL/raw 路一致
+
+- ports 补两条可选能力（冻结面不动）：GlobalSemanticReader（语义面以
+  全局读者身份只取归属为空的命中）与 GlobalVectorSearcher（索引层落点，
+  「只取全局」只能在取数层生效）
+- 两条冻结契约的空 scope 语义（「不隔离」）原样保留；空值承载不了
+  「不过滤」与「只取全局」两种相反语义正是本单病根
+- VectorSemanticReader.SearchGlobal 探测索引：支持则透传；不支持则
+  声明降级（回落空 scope 检索，命中集合逐字同效不变坏）；MemIndex、
+  sqlite、pg 三处索引实现 SearchGlobal（scope='' 进取数）
+- recall.New 探测一次；collectSemantic 空读者走 SearchGlobal，未实现
+  维持原状（透传 + 过取兜底）；降级可观测：Result.SemanticGlobalUnavailable
+  + recall.semantic.global.unavailable 指标（口径同宽松路，缓存命中也计）
+- 测试：空读者走全局路且别家向量不进池、无能力时降级可观测、非空读者
+  不走全局路；MemIndex/VectorSemanticReader 的兑现与降级；向量索引
+  全局检索 parity 双后端断言
+
+### 修复(portable)：octop 导出改分页取尽，撤 Limit:1000000 冒充全量
+
+- 七张表的取数不再写死大 Limit：raw_events 走 ListRaw 的 Page.Offset 翻页、
+  atoms 复用 store.ListAllAtoms（#59 口径）；candidates/entities/entity_pages/
+  journal 四张表的冻结签名放不下 offset，落 store.PagedLister 可选能力
+  （独立小接口 + PagedListerOf 探测 + 明确降级路径），sqlite/pg 双后端实现
+- ExportOctop 入口探测能力：缺失时响亮报错、一句都不导——导出完整性是
+  前提不是增强，降级成单次大 Limit 硬取等于把静默截断换个名字留下
+- application.vectorStore（向量同步装饰器）逐方法转发该能力：内嵌 store.Store
+  接口的包装会把内层可选能力藏在外层探测之外，不转发即静默消失
+- ExportOptions.PageSize 暴露翻页粒度（0=缺省 500）；跨页取尽测试
+  （12 条/页宽 5，探针钉住翻页序列 0/5/10，导出-导入回环逐条相等）+
+  parity 双后端翻页语义断言 + 无能力宿主响亮失败测试
+
 ## [v0.14.0] — 2026-11-14
 
 ### 修复(lifecycle)：四个全量扫描改分页取尽(store.ListAllAtoms)——100000 不再冒充全量，ListAtomsByEntity 同修
