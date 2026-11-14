@@ -13,12 +13,17 @@ func (s *entityStore) SaveEntity(ctx context.Context, ns store.Namespace, e *typ
 	if e.ID == "" {
 		return errors.New("实体 ID 不能为空")
 	}
+	// **整实体语义**：冲突分支同样更新 atom_count 与 last_promoted_at
+	// （理由见 SQLite 侧同处注释，issue #51——Merge 的「终态清 0」
+	// 失败恢复故事押在这条 upsert 上；与 SQLite 逐字同语义）。
 	_, err := s.exec(ctx, `INSERT INTO entities
 		(namespace, id, entity_type, canonical_name, atom_count, created_at, last_promoted_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)
 		ON CONFLICT(namespace, id) DO UPDATE SET
 			entity_type = excluded.entity_type,
-			canonical_name = excluded.canonical_name`,
+			canonical_name = excluded.canonical_name,
+			atom_count = excluded.atom_count,
+			last_promoted_at = excluded.last_promoted_at`,
 		nsOf(ns), e.ID, string(e.EntityType), e.CanonicalName, e.AtomCount,
 		ts(e.CreatedAt), tsPtr(e.LastPromotedAt))
 	return err

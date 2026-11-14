@@ -54,8 +54,13 @@ func (f *fakeStore) ListEntities(context.Context, store.Namespace, types.EntityT
 	return out, nil
 }
 
+// SaveEntity 复刻真后端的 ON CONFLICT 语义（issue #51 的教训）：
+// 真后端（storage/{sqlite,postgres}）是**整实体** upsert——冲突分支
+// 同样更新 atom_count 与 last_promoted_at。fake 曾是整实体覆盖而真后端
+// 不是，「终态清 0」这条不变量靠 fake 绿着、在真库上是 no-op——
+// 夹具替实现背书。两侧语义必须同漂移：真后端改口径时这里要跟着改。
 func (f *fakeStore) SaveEntity(_ context.Context, _ store.Namespace, e *types.Entity) error {
-	f.ents[e.ID] = e
+	f.ents[e.ID] = e // 整实体覆盖 = ON CONFLICT 全列更新（同真后端）
 	return nil
 }
 

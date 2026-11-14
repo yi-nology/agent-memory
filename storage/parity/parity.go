@@ -109,6 +109,7 @@ func Run(t *testing.T, open OpenFn) {
 		{"候选：归属往返", tCandidateScopeRoundTrip},
 		{"实体：规范名与别名两条路径都能查到", tEntityLookupBothPaths},
 		{"实体：计数钳到 0 不报错", tEntityCountClamp},
+		{"实体：SaveEntity 整实体语义（终态清 0 可落库）", tEntitySaveEntityWholeRow},
 		{"活跃实体栈：钉住项不参与淘汰", tActiveEntityPin},
 		{"活跃实体栈：按最近提及排序", tActiveEntityOrder},
 		{"活跃实体栈：钉住项不改变读取顺序", tActiveEntityPinnedKeepsOrder},

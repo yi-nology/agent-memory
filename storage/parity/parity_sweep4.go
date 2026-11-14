@@ -1,6 +1,7 @@
 package parity
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -108,5 +109,105 @@ func tAtomRetireOneWay(t *testing.T, s store.Store) {
 	}
 	if got.SupersededBy != winner {
 		t.Fatalf("第三次取代抹掉了先到者的取代链: 期望 %s 实得 %s", winner, got.SupersededBy)
+	}
+}
+
+// ── 实体：SaveEntity 的整实体语义（#51）──
+
+// Merge 的失败恢复故事押在「最后一步 SaveEntity 把 from 计数清 0」上：
+// SaveEntity 的 ON CONFLICT 只更新 entity_type/canonical_name 的话，
+// 清零是 no-op，中途失败的 Bump 差量留下的幽灵计数永久留在库里
+// （ListEntities 还按 atom_count DESC 把它排最前）。
+// 本用例在**真后端**上走「迁移半途失败（一次 Bump 差量丢失）→ 重跑同一条
+// Merge」的完整序列，断言终态 from 计数为 0——钉的是 SQL 语义，
+// 不是 fake 的语义（整实体覆盖的 fake 恰好会替坏实现背书）。
+func tEntitySaveEntityWholeRow(t *testing.T, s store.Store) {
+	const total = 5
+	_ = s.SaveEntity(bg(), nsA, &types.Entity{
+		ID: "e-to", EntityType: "机器", CanonicalName: "目标机器", CreatedAt: base,
+	})
+	_ = s.SaveEntity(bg(), nsA, &types.Entity{
+		ID: "e-from", EntityType: "机器", CanonicalName: "来源机器",
+		CreatedAt: base, AtomCount: total, LastPromotedAt: base,
+	})
+	// 5 张卡挂在 from 名下（计数与卡数一致）。
+	for i := range total {
+		a := atom(fmt.Sprintf("atom-mv-%d", i), "e-from",
+			fmt.Sprintf("迁移用例事实 %d 号", i), fmt.Sprintf("ev-mv-%d", i), types.ImportanceMed)
+		if err := s.SaveAtom(bg(), nsA, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 迁移一步 = 卡改归属 + 双向 Bump（entity.Merge 的机械迁移）。
+	move := func(id string) {
+		t.Helper()
+		a, err := s.GetAtom(bg(), nsA, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.EntityID = "e-to"
+		if err := s.SaveAtom(bg(), nsA, a); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.BumpEntityAtomCount(bg(), nsA, "e-to", 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.BumpEntityAtomCount(bg(), nsA, "e-from", -1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moveAtomOnly := func(id string) {
+		// 只搬卡、不记账：Merge 在「SaveAtom 与 Bump 之间」失败的样子——
+		// 这正是它声称被终态抹平的「中途失败的 Bump 差量」。
+		t.Helper()
+		a, err := s.GetAtom(bg(), nsA, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.EntityID = "e-to"
+		if err := s.SaveAtom(bg(), nsA, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 第一轮：完整迁走 atom-0，迁 atom-1 时**卡搬了、计数没记**就失败，
+	// 终态的 SaveEntity(from, 0) 也没跑。
+	move("atom-mv-0")
+	moveAtomOnly("atom-mv-1")
+
+	// 重跑同一条 Merge：ListAtomsByEntity(from) 只剩没搬走的 3 张，
+	// 逐张迁移，最后 from 退役（计数清 0、晋升时刻清空）。
+	move("atom-mv-2")
+	move("atom-mv-3")
+	move("atom-mv-4")
+	from, err := s.GetEntity(bg(), nsA, "e-from")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from.AtomCount = 0
+	from.LastPromotedAt = time.Time{}
+	if err := s.SaveEntity(bg(), nsA, from); err != nil {
+		t.Fatal(err)
+	}
+
+	gotFrom, err := s.GetEntity(bg(), nsA, "e-from")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFrom.AtomCount != 0 {
+		t.Fatalf("重跑收敛后 from 计数应为 0（脏差量被终态抹平），实得 %d", gotFrom.AtomCount)
+	}
+	if !gotFrom.LastPromotedAt.IsZero() {
+		t.Fatalf("重跑收敛后 from 的 LastPromotedAt 应已清空: %v", gotFrom.LastPromotedAt)
+	}
+	// to 计数带一次永久丢失的 Bump 差量（4 而非 5）：契约只承诺
+	// 「from 的计数误差被终态抹平」，to 侧那次丢失的差量不在承诺内。
+	// 没有这条断言的话，move 换成纯 Bump 也能凑出 from=0（假绿）。
+	gotTo, err := s.GetEntity(bg(), nsA, "e-to")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTo.AtomCount != total-1 {
+		t.Fatalf("to 计数应为 %d（含一次丢失的 Bump 差量），实得 %d", total-1, gotTo.AtomCount)
 	}
 }

@@ -17,12 +17,27 @@ func (s *entityStore) SaveEntity(ctx context.Context, ns store.Namespace, e *typ
 	if !e.LastPromotedAt.IsZero() {
 		last = sql.NullInt64{Int64: ts(e.LastPromotedAt), Valid: true}
 	}
+	// **整实体语义**：冲突分支同样更新 atom_count 与 last_promoted_at。
+	//
+	// 修掉的分叉（issue #51）：冲突分支此前只更新 entity_type/canonical_name，
+	// 计数与最近晋升时刻是 INSERT-only——而 entity.Merge 的失败恢复故事
+	// 恰好押在「最后一步 SaveEntity 把 from 计数清 0」上：中途失败的 Bump
+	// 差量让计数短暂为脏，重跑 Merge 时终态清 0 抹平脏数。ON CONFLICT
+	// 不写这两列的话，清零是 no-op，幽灵计数永久留在 ListEntities 里
+	// （还按 atom_count DESC 排在最前面）。单测里的 fake 是整实体覆盖，
+	// 恰好掩盖了这条分叉——夹具替实现背书。
+	//
+	// 计数的**增量维护**仍走 BumpEntityAtomCount（晋升/退役的 ±1），
+	// SaveEntity 的计数是**终态写入**（新建、合并退役、迁移导入），
+	// 两条路各管各的口径。
 	_, err := s.exec(ctx, `INSERT INTO entities
 		(namespace, id, entity_type, canonical_name, atom_count, created_at, last_promoted_at)
 		VALUES (?,?,?,?,?,?,?)
 		ON CONFLICT(namespace, id) DO UPDATE SET
 			entity_type = excluded.entity_type,
-			canonical_name = excluded.canonical_name`,
+			canonical_name = excluded.canonical_name,
+			atom_count = excluded.atom_count,
+			last_promoted_at = excluded.last_promoted_at`,
 		nsOf(ns), e.ID, string(e.EntityType), e.CanonicalName, e.AtomCount, ts(e.CreatedAt), last)
 	return err
 }
