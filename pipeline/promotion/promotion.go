@@ -703,9 +703,8 @@ func hasNegation(s string) bool {
 	}
 	// 英文按词元：连续的 ASCII 字母/数字算一个词元（CJK 不是词元也不是
 	// 分隔符，走上面的子串族）。词元整词或以否定前缀开头即含否定。
-	for _, w := range strings.FieldsFunc(lower, func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
-	}) {
+	isAlnum := func(r rune) bool { return r >= 'a' && r <= 'z' || r >= '0' && r <= '9' }
+	for _, w := range strings.FieldsFunc(lower, func(r rune) bool { return !isAlnum(r) }) {
 		for _, t := range negationEnglishWords {
 			if w == t {
 				return true

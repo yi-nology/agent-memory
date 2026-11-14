@@ -147,7 +147,7 @@ func FTSRebuilder(v any) (FTSIndexRebuilder, bool) {
 // ListRaw 的 scope 参数空值是「不隔离」（导出与库管理面靠它取**全量**，
 // 该语义已随冻结接口发布），而**全局读者**按 types.Scope.VisibleTo
 // 只看得见全局事件——同一个空值承载了两种相反的语义，ListRaw 又已冻结
-// 不能加参数，故这条取数形态单独开一个可选口子：只取 scope = '' 的事件。
+// 不能加参数，故这条取数形态单独开一个可选口子：只取 scope = ” 的事件。
 //
 // # 为什么是可选能力
 //

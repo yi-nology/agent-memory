@@ -308,7 +308,7 @@ func TestReindexDefaultsToUnlimited(t *testing.T) {
 	for i := range 12 {
 		if err := st.SaveAtom(context.Background(), store.Namespace("t"), &types.AtomCard{
 			ID: fmt.Sprintf("a-%02d", i), EntityID: "e1",
-			Assertion: fmt.Sprintf("存量事实第 %d 条：磁盘偏小", i),
+			Assertion:    fmt.Sprintf("存量事实第 %d 条：磁盘偏小", i),
 			QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
 			Importance: types.ImportanceMed, Confidence: types.ConfidenceMed,
 			OccurredAt: now, CreatedAt: now, UpdatedAt: now,

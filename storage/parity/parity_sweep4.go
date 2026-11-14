@@ -394,7 +394,7 @@ func tEdgePaginationToExhaustion(t *testing.T, s store.Store) {
 func tAtomSearchTopKSet(t *testing.T, s store.Store) {
 	hits := []string{"tk-1", "tk-2", "tk-3", "tk-4"}
 	for i, id := range hits {
-		a := atom(id, "e1", fmt.Sprintf("磁盘巡检结论第 %d 号：状态正常", i+1), "ev-"+id, types.ImportanceMed)
+		a := atom(id, "e1", fmt.Sprintf("磁盘检查结论第 %d 号：状态正常", i+1), "ev-"+id, types.ImportanceMed)
 		if err := s.SaveAtom(bg(), nsA, a); err != nil {
 			t.Fatal(err)
 		}

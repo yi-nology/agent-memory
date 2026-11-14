@@ -192,7 +192,7 @@ func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, scope types.
 	return s.queryRaws(ctx, q, args...)
 }
 
-// ListRawGlobal 以**全局读者**身份取原始事件：只取全局（scope = ''）的。
+// ListRawGlobal 以**全局读者**身份取原始事件：只取全局（scope = ”）的。
 //
 // 可选能力 GlobalRawReader 的实现（issue #53）：ListRaw 的空 scope 是
 // 「不隔离」（导出/管理面靠它取全量），全局读者不能共用那个空值——

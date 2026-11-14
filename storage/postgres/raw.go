@@ -200,7 +200,7 @@ func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, scope types.
 	return s.queryRaws(ctx, q, args...)
 }
 
-// ListRawGlobal 以**全局读者**身份取原始事件：只取全局（scope = ''）的
+// ListRawGlobal 以**全局读者**身份取原始事件：只取全局（scope = ”）的
 // （可选能力 GlobalRawReader 的实现，issue #53；与 SQLite 侧逐字同语义）。
 func (s *rawStore) ListRawGlobal(ctx context.Context, ns store.Namespace,
 	before time.Time, p store.Page) ([]*types.RawEvent, error) {

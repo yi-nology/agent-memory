@@ -457,14 +457,12 @@ func TestReindexLimitZeroTakesAllAndSkipsRetired(t *testing.T) {
 			Provenance: types.Provenance{Origin: types.OriginOperator},
 		}
 	}
-	var active []string
 	for i := range activeN {
 		id := fmt.Sprintf("atom-live-%03d", i)
 		// 断言彼此不同：签名去重不拦，检索词不互相干扰（正文只是载体）。
-		if err := s.SaveAtom(ctx, ns, mk(id, fmt.Sprintf("机器甲的巡检结论第 %d 号：状态正常", i))); err != nil {
+		if err := s.SaveAtom(ctx, ns, mk(id, fmt.Sprintf("机器甲的检查结论第 %d 号：状态正常", i))); err != nil {
 			t.Fatal(err)
 		}
-		active = append(active, id)
 	}
 	retired := map[string]string{
 		"atom-dead-sup": "被推翻的旧结论：磁盘已满",
