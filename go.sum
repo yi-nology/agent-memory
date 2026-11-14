@@ -14,10 +14,16 @@ github.com/ncruces/go-strftime v1.1.0 h1:vtPmPWMkb539RGV9WpWT9EwJGvrOCKvMNI4obWL
 github.com/ncruces/go-strftime v1.1.0/go.mod h1:yVaq7iwCN09vHRrKBrrflXT0M9tTMG2KmZ9Fj7xeG/g=
 github.com/oagentkit/guardx v0.8.2 h1:iQNL7xL/d/3pLACUvvYf2IIXSYDc+HCWIovnvN3WmHc=
 github.com/oagentkit/guardx v0.8.2/go.mod h1:9HvYhp4TouXv02XBRM3zA2X9s6eHITXrJUWvtLaOjwY=
+github.com/oagentkit/guardx v0.26.0 h1:S3JJ5LQpvObC1EJkh5Gj/XGGmQghy0bZYnr3fMpeKow=
+github.com/oagentkit/guardx v0.26.0/go.mod h1:+l42QXyyFusJhazgbnULrNxbDIjeVJxN4+annwoIC0c=
 github.com/oagentkit/textx v0.10.7 h1:A5KLkSl0tPXaIydUZIv2Cg+b8yKfnog8oQpNk4QoSWI=
 github.com/oagentkit/textx v0.10.7/go.mod h1:0I5r+hmpb19b3EWk6J+3TbFbQSnnv/s1iRE8kZ4OYG4=
+github.com/oagentkit/textx v0.12.0 h1:ZYHicFv6zwE1X3K1jzvXPWxx763qpZaFvKTaRrzndug=
+github.com/oagentkit/textx v0.12.0/go.mod h1:nWJ0r8+OfNBhy877JtjWbtbIFYmGcrNXffpZSX9qvLI=
 github.com/oekit/pkg v0.42.0 h1:2h2kBA3j9cTfqtjVjRftT8G/q3X8ALjw3nQy5Xmpqds=
 github.com/oekit/pkg v0.42.0/go.mod h1:sVeOtmG1sLY2aSnzFIbUAF2Qoh7G8R5vnWtWmLCv8NM=
+github.com/oekit/pkg v0.48.0 h1:3j1j8ZyAxX7B4i41Gf0IEHHaTXjC+WAxEYXhW+ZkC+g=
+github.com/oekit/pkg v0.48.0/go.mod h1:Cr6sJpBX2a0gAIgLa32+NY69h/UZtuN6L1ZdXtP9upo=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 golang.org/x/mod v0.42.0 h1:ICeL3t2L30ljSPHHxDnR4fqVcBt/zR2zJAb9juavmQg=
