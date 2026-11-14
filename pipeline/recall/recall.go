@@ -505,7 +505,7 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 		limit = p.cfg.TopK
 	}
 
-	cands, err := p.gather(ctx, eff, limit, plan)
+	cands, degradedScopeDrops, err := p.gather(ctx, eff, limit, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -542,6 +542,11 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 	// 按原因上报进同一张表——「为什么少了」要在**一处**看全。
 	budget.Drop(ports.DropDiversity, droppedByDiversity)
 	budget.Drop(ports.DropDuplicate, droppedByDuplicate)
+	// 降级路径的后置滤除损失同理（issue #63）：全局读者的 raw 取数降级时
+	// （存储没实现 store.GlobalRawReader），先取后滤，被滤掉的条数就是
+	// 被占掉的 TopK 配额——按 DropDegradedScope 归因，宿主才能区分
+	// 「真 TopK」与「降级后置滤」（非降级路径恒为 0，不产生表项）。
+	budget.Drop(ports.DropDegradedScope, degradedScopeDrops)
 	drops := budget.Dropped()
 	res := &Result{
 		Snippets: kept,

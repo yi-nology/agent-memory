@@ -35,6 +35,15 @@ const (
 	DropDuplicate DropReason = "duplicate"
 	// DropDiversity 单一来源超额而丢弃（多样性裁剪）。
 	DropDiversity DropReason = "diversity"
+	// DropDegradedScope 降级路径的后置滤除而丢弃（issue #63）。
+	//
+	// 存储没实现 store.GlobalRawReader（可选能力）时，全局读者的 raw 取数
+	// 降级为 ListRaw(空 scope=不隔离) + 后置 VisibleTo 滤除：先取后滤，
+	// 被滤掉的条目已经花掉了 TopK 配额——那段配额损失按本原因归因。
+	// 它 > 0 意味着「raw 源的 TopK 不是真的 TopK」，处置是实现那个可选能力
+	//（与能力缺失类字段的差别：这里丢的是**已取出的内容**，故落 Drops 表；
+	// 能力缺失本身走 Result 的专用布尔字段）。
+	DropDegradedScope DropReason = "degraded_scope"
 )
 
 // Budget 分桶配额与丢弃计数。
