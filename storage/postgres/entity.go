@@ -135,6 +135,16 @@ func (s *entityStore) withAliases(ctx context.Context, ns store.Namespace, e *ty
 }
 
 func (s *entityStore) ListEntities(ctx context.Context, ns store.Namespace, entityType types.EntityType, limit int) ([]*types.Entity, error) {
+	return s.ListEntitiesPaged(ctx, ns, entityType, 0, limit)
+}
+
+// ListEntitiesPaged 按页取实体：offset 跳过的条数，limit 单页条数（0=后端默认）。
+//
+// 语义同 ListEntities（过滤条件逐字一致），差别只在翻页参数——
+// 服务于「分页取全」的翻页（operations/portable 的 PagedSource，issue #61）：
+// 全量导出不能用一个大 Limit 冒充，超限的行会按取数序静默截断。
+// 取数序带 canonical_name 全序兜底键（与 SQLite 侧同款），翻页不重不漏。
+func (s *entityStore) ListEntitiesPaged(ctx context.Context, ns store.Namespace, entityType types.EntityType, offset, limit int) ([]*types.Entity, error) {
 	q := `SELECT id, entity_type, canonical_name, atom_count, created_at, last_promoted_at
 		FROM entities WHERE namespace = $1`
 	args := []any{nsOf(ns)}
@@ -142,8 +152,9 @@ func (s *entityStore) ListEntities(ctx context.Context, ns store.Namespace, enti
 		q += ` AND entity_type = $2`
 		args = append(args, string(entityType))
 	}
-	q += ` ORDER BY atom_count DESC, canonical_name ASC LIMIT $` + itoa(len(args)+1)
-	args = append(args, limitOf(limit, defaultFetchLimit))
+	q += ` ORDER BY atom_count DESC, canonical_name ASC LIMIT $` + itoa(len(args)+1) +
+		` OFFSET $` + itoa(len(args)+2)
+	args = append(args, limitOf(limit, defaultFetchLimit), max(offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {

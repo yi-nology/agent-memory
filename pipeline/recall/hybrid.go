@@ -54,7 +54,19 @@ func (p *Pipeline) collectSemantic(ctx context.Context, req Request, limit int) 
 	if scope != nil && len(scope) == 0 {
 		return nil, nil
 	}
-	hits, err := p.cfg.Semantic.Search(ctx, string(req.Namespace), req.Query, string(req.Scope), limit)
+	// 空读者（全局读者）与 SQL/raw 路同一判据（issue #62）：
+	// 空 scope 在语义面的冻结语义里是「不隔离」，直接透传的话 TopK 配额
+	// 先被别家的向量占满，再被本层 VisibleTo 后置滤掉。语义面实现了
+	// ports.GlobalSemanticReader 时**显式只取全局**（过滤在语义面的取数层）；
+	// 没实现则维持原状（透传 + 过取兜底）——降级可观测
+	// （Result.SemanticGlobalUnavailable + 指标，见 markDegraded）。
+	var hits []ports.SemanticHit
+	var err error
+	if req.Scope == "" && p.semGlobal != nil {
+		hits, err = p.semGlobal.SearchGlobal(ctx, string(req.Namespace), req.Query, limit)
+	} else {
+		hits, err = p.cfg.Semantic.Search(ctx, string(req.Namespace), req.Query, string(req.Scope), limit)
+	}
 	if err != nil {
 		// 语义面失败**上抛**：静默忽略的话，混合检索悄悄退化成纯词面，
 		// 而宿主以为自己在用语义轨——症状是「召回质量莫名下降」，

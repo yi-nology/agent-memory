@@ -88,6 +88,15 @@ type Result struct {
 	// 它是**能力缺失**，不是**丢弃**：与 Drops 不是一回事，
 	// 故单独一个字段（不塞进 DropReason——那会让「少召回」与「能力没有」混在一起）。
 	LooseSearchUnavailable bool
+	// SemanticGlobalUnavailable 语义路的全局读者检索**不可用**，且本轮是
+	// **空读者**（scope 为空）——语义面没实现 ports.GlobalSemanticReader，
+	// 空读者的语义 TopK 维持旧形态（空 scope 透传），可能被别家的向量占掉
+	// 一部分配额（issue #62）。
+	//
+	// 存在的理由与 LooseSearchUnavailable 同一条：降级不可见 ⇒ 症状是
+	// 「空读者的语义召回偏少」，看着像没有全局事实，而病因是
+	// 「语义后端缺那个可选能力」。非空读者恒为 false（无降级可言）。
+	SemanticGlobalUnavailable bool
 }
 
 // Empty 结果是否为空。

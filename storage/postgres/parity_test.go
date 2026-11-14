@@ -30,6 +30,17 @@ func TestParity(t *testing.T) {
 	parity.Run(t, openPG)
 }
 
+// TestParityPaged 分页取全（导出面的可选能力）的跨后端共享断言。
+//
+// 与 TestParity 同一份数据语义：两个后端的翻页必须同序、不重不漏
+// （issue #61 的 octop 导出靠它拿全量）。PG 侧同样只对着真实服务器跑。
+func TestParityPaged(t *testing.T) {
+	if !postgres.Configured() {
+		t.Skipf("未配置 %s：PG 行为一致性**未验证**（skipped 用例不证明兼容）", postgres.DsnEnv)
+	}
+	parity.RunPaged(t, openPG)
+}
+
 // openPG 每个用例开一份**干净库**。
 //
 // 为什么不是「同一个库清空表」：清表要按外键顺序删，漏一张就会留下残数据，

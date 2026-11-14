@@ -129,6 +129,17 @@ func (s *candidateStore) FindDuplicateCandidate(ctx context.Context, ns store.Na
 }
 
 func (s *candidateStore) ListCandidates(ctx context.Context, ns store.Namespace, f store.CandidateFilter) ([]*types.Candidate, error) {
+	return s.ListCandidatesPaged(ctx, ns, f, 0, f.Limit)
+}
+
+// ListCandidatesPaged 按页取候选：offset 跳过的条数，limit 单页条数（0=后端默认）。
+//
+// 语义同 ListCandidates（过滤条件逐字一致），差别只在翻页参数——
+// 它服务于「分页取全」的翻页（operations/portable 的 PagedSource，issue #61）：
+// 全量导出不能用一个大 Limit 冒充，超限的行会按取数序静默截断。
+// 它与 LIMIT 同一份 ORDER BY（取数序全序，翻页不重不漏的前提），
+// 取数期间数据不动 ⇒ 先取尽后处理。
+func (s *candidateStore) ListCandidatesPaged(ctx context.Context, ns store.Namespace, f store.CandidateFilter, offset, limit int) ([]*types.Candidate, error) {
 	var (
 		where = []string{"namespace = ?"}
 		args  = []any{nsOf(ns)}
@@ -148,8 +159,9 @@ func (s *candidateStore) ListCandidates(ctx context.Context, ns store.Namespace,
 		// 同一时刻建的候选先后不定 ⇒ 导出出来的包逐次不同 ✓
 		// ⇒ 跨仓对账用的黄金样本就没法固定 ✓。
 		// 兜底键与 ListRaw 的 `ts DESC, id DESC` 同款 ✓。
-		` ORDER BY created_at DESC, id DESC LIMIT ?`
-	args = append(args, limitOf(f.Limit, defaultFetchLimit))
+		// OFFSET 服务于「分页取全」的翻页（PagedSource，issue #61）。
+		` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+	args = append(args, limitOf(limit, defaultFetchLimit), max(offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {

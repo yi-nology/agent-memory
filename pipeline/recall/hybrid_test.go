@@ -572,3 +572,145 @@ func TestFuseSnippetFailurePropagates(t *testing.T) {
 type failingEstimator struct{ err error }
 
 func (e *failingEstimator) Estimate(context.Context, string) (int, error) { return 0, e.err }
+
+// fakeGlobalSemantic 带全局读者能力的假语义面：两条路各自记调用与收到的参数。
+//
+// 它实现 ports.GlobalSemanticReader（可选能力）——探测与降级语义见该接口的注释。
+type fakeGlobalSemantic struct {
+	// searchIDs 空 scope 透传路（Search）返回的命中：**掺了别家的向量**，
+	// 模拟「语义索引层把空 scope 当不过滤」的现状。
+	searchIDs []string
+	// globalIDs 全局读者路（SearchGlobal）返回的命中：只有全局事实。
+	globalIDs []string
+	err       error
+	// called / globalCall / sawScope 调用记账（断言「走的是哪条路」）。
+	called     int
+	globalCall int
+	sawScope   string
+}
+
+func (s *fakeGlobalSemantic) Search(_ context.Context, _, _, scope string, _ int) ([]ports.SemanticHit, error) {
+	s.called++
+	s.sawScope = scope
+	if s.err != nil {
+		return nil, s.err
+	}
+	return semanticHits(s.searchIDs), nil
+}
+
+func (s *fakeGlobalSemantic) SearchGlobal(_ context.Context, _, _ string, _ int) ([]ports.SemanticHit, error) {
+	s.globalCall++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return semanticHits(s.globalIDs), nil
+}
+
+func semanticHits(ids []string) []ports.SemanticHit {
+	out := make([]ports.SemanticHit, 0, len(ids))
+	for i, id := range ids {
+		out = append(out, ports.SemanticHit{ID: id, Score: float64(len(ids) - i)})
+	}
+	return out
+}
+
+// 空读者走语义路必须**显式只取全局**（issue #62）：
+// SearchGlobal 被调用、空 scope 透传路不被调用，别家的向量进不了语义路。
+func TestSemanticGlobalReaderUsedForEmptyScope(t *testing.T) {
+	g1 := atom("g1", "eg", "磁盘全局事实", types.ImportanceMed)
+	foreign := atom("a2", "e2", "无关事实", types.ImportanceMed)
+	foreign.Scope = "team-b"
+	f := &fakeReader{atoms: []*types.AtomCard{g1, foreign}}
+	// 透传路掺着别家的命中——真被调用的话 a2 就会进候选池。
+	sem := &fakeGlobalSemantic{searchIDs: []string{"a2", "g1"}, globalIDs: []string{"g1"}}
+	cfg := recall.DefaultConfig()
+	cfg.Semantic = sem
+	p := newPipe(t, f, cfg)
+
+	res, err := p.Recall(context.Background(), recall.Request{Namespace: ns, Query: "磁盘", Scope: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sem.globalCall != 1 {
+		t.Fatalf("空读者应走 SearchGlobal，实得 %d 次", sem.globalCall)
+	}
+	if sem.called != 0 {
+		t.Fatalf("空读者不该走空 scope 透传路（其冻结语义是「不隔离」），实得 %d 次", sem.called)
+	}
+	if res.SemanticGlobalUnavailable {
+		t.Fatal("实现了全局读者能力的语义面不应标降级")
+	}
+	for _, s := range res.Snippets {
+		if s.RefID == "a2" {
+			t.Fatalf("别家的向量不该进候选池: %+v", res.Snippets)
+		}
+	}
+}
+
+// 语义面没实现全局读者能力 ⇒ 维持原状（空 scope 透传 + 后置滤兜底），
+// 但降级**必须可观测**（issue #62 与宽松路同一条纪律）。
+func TestSemanticGlobalDegradedWithoutCapability(t *testing.T) {
+	g1 := atom("g1", "eg", "磁盘全局事实", types.ImportanceMed)
+	foreign := atom("a2", "e2", "无关事实", types.ImportanceMed)
+	foreign.Scope = "team-b"
+	f := &fakeReader{atoms: []*types.AtomCard{g1, foreign}}
+	// 透传路掺着别家的命中——候选池里会有它，靠 VisibleTo 复查滤除
+	//（正确性不变，配额让步，与修复前一致）。
+	// fakeSemantic 只实现 Search：即「没实现可选能力」的语义面。
+	sem := &fakeSemantic{ids: []string{"a2", "g1"}}
+	cfg := recall.DefaultConfig()
+	cfg.Semantic = sem
+	met := ports.NewMemMetrics()
+	cfg.Metrics = met
+	p := newPipe(t, f, cfg)
+
+	res, err := p.Recall(context.Background(), recall.Request{Namespace: ns, Query: "磁盘", Scope: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sem.called != 1 || sem.sawScope != "" {
+		t.Fatalf("降级路径应走空 scope 透传，实得 called=%d sawScope=%q", sem.called, sem.sawScope)
+	}
+	if !res.SemanticGlobalUnavailable {
+		t.Fatal("降级必须写进 Result：空读者看不出配额被占时，病因是语义后端缺能力")
+	}
+	if got := met.Snapshot().Counts["recall.semantic.global.unavailable"]; got != 1 {
+		t.Fatalf("降级指标应记 1 次，实得 %v", got)
+	}
+	// 可见性复查兜着：别家的命中被滤出 prompt，全局事实照常进。
+	found := false
+	for _, s := range res.Snippets {
+		if s.RefID == "a2" {
+			t.Fatalf("后置滤必须挡住别家的命中: %+v", res.Snippets)
+		}
+		if s.RefID == "g1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("全局事实应照常进候选池: %+v", res.Snippets)
+	}
+}
+
+// 非空读者不走全局读者路（「全局 + 同归属」是语义面的冻结语义，本来就支持）。
+func TestSemanticGlobalNotUsedForScopedReader(t *testing.T) {
+	f := &fakeReader{atoms: []*types.AtomCard{atom("a1", "e1", "磁盘长期偏小", types.ImportanceHigh)}}
+	sem := &fakeGlobalSemantic{searchIDs: []string{"a1"}, globalIDs: []string{"a1"}}
+	cfg := recall.DefaultConfig()
+	cfg.Semantic = sem
+	p := newPipe(t, f, cfg)
+
+	res, err := p.Recall(context.Background(), recall.Request{Namespace: ns, Query: "磁盘", Scope: "team-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sem.globalCall != 0 {
+		t.Fatalf("非空读者不该走 SearchGlobal，实得 %d 次", sem.globalCall)
+	}
+	if sem.called != 1 || sem.sawScope != "team-a" {
+		t.Fatalf("非空读者应带归属走 Search，实得 called=%d sawScope=%q", sem.called, sem.sawScope)
+	}
+	if res.SemanticGlobalUnavailable {
+		t.Fatal("非空读者无降级可言，不应置位")
+	}
+}

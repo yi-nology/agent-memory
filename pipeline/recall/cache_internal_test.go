@@ -35,12 +35,13 @@ func TestCloneResultCopiesEveryField(t *testing.T) {
 			Source: SourceAtom, RefID: "r-1", EntityID: "e-1",
 			Role: "记忆", Body: "body-1", Importance: types.ImportanceHigh, Tokens: 11,
 		}},
-		Dropped:                1,
-		Drops:                  map[ports.DropReason]int{ports.DropBudget: 5, ports.DropQuota: 6},
-		Buckets:                map[ports.BucketID]int{"atom": 7, "quote": 8},
-		FromCache:              true,
-		Entities:               []string{"e-1", "e-2"},
-		LooseSearchUnavailable: true,
+		Dropped:                   1,
+		Drops:                     map[ports.DropReason]int{ports.DropBudget: 5, ports.DropQuota: 6},
+		Buckets:                   map[ports.BucketID]int{"atom": 7, "quote": 8},
+		FromCache:                 true,
+		Entities:                  []string{"e-1", "e-2"},
+		LooseSearchUnavailable:    true,
+		SemanticGlobalUnavailable: true,
 	}
 
 	cp := cloneResult(src)

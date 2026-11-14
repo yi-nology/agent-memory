@@ -353,11 +353,19 @@ type Pipeline struct {
 	//
 	// 探测在 New 里做一次：能力不会中途长出来，而每次召回都断言一次
 	// 是白花的开销（还会在指标里灌重复的计数）。
-	loose  store.AtomLooseSearcher
-	est    ports.TokenEstimator
-	bander ports.Bander
-	cache  *cache.LocalCache[Result]
-	now    func() time.Time
+	loose store.AtomLooseSearcher
+	// semGlobal 全局读者语义检索能力（nil = 语义面没实现，见 ports.GlobalSemanticReader）。
+	//
+	// 探测在 New 里做一次（与 loose 同款）：空读者走它在**取数层**只取
+	// 全局事实的命中（issue #62，与 SQL/raw 路的 GlobalReader 同判据）；
+	// 没实现则维持原状——空 scope 透传给语义面（其冻结语义是「不隔离」），
+	// 命中集合不变，代价只是 TopK 配额可能被别家占掉一部分。
+	// 降级可观测：Result.SemanticGlobalUnavailable + 指标（见 markDegraded）。
+	semGlobal ports.GlobalSemanticReader
+	est       ports.TokenEstimator
+	bander    ports.Bander
+	cache     *cache.LocalCache[Result]
+	now       func() time.Time
 }
 
 // New 造召回流水线。
@@ -406,8 +414,13 @@ func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*
 	// （否则症状只是「多话题查询打不中」，看着像内容不够）。
 	// 接线与降级见 loose.go。
 	loose := probeLooseSearcher(s)
+	// 全局读者语义检索同为**可选能力**（issue #62）：有就用，
+	// 没有就维持原状（空 scope 透传）——同为增强，不报错；
+	// 降级可观测（见 markDegraded 与 Result.SemanticGlobalUnavailable）。
+	semGlobal, _ := ports.GlobalSemanticReaderOf(cfg.Semantic)
 	p := &Pipeline{
-		cfg: norm, store: s, raw: raw, rawGlobal: rawGlobal, loose: loose, est: est, bander: bander,
+		cfg: norm, store: s, raw: raw, rawGlobal: rawGlobal, loose: loose,
+		semGlobal: semGlobal, est: est, bander: bander,
 		now: func() time.Time { return time.Now().UTC() },
 	}
 	// 缓存用流水线自己的时钟：两处时间不一致时，「缓存过期」这条行为
@@ -480,7 +493,7 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 			p.metrics().Incr(MetricCacheHit, 1)
 			// 缓存命中的那次召回**也是**降级的（端出来的就是降级结果），
 			// 故降级计数在这条路径上也要记——口径是「降级过的召回次数」。
-			p.markDegraded()
+			p.markDegraded(eff)
 			p.metrics().Observe(MetricRecallDuration, p.now().Sub(started))
 			return hit, nil
 		}
@@ -492,7 +505,7 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 		limit = p.cfg.TopK
 	}
 
-	cands, err := p.gather(ctx, eff, limit, plan)
+	cands, degradedScopeDrops, err := p.gather(ctx, eff, limit, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -529,6 +542,11 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 	// 按原因上报进同一张表——「为什么少了」要在**一处**看全。
 	budget.Drop(ports.DropDiversity, droppedByDiversity)
 	budget.Drop(ports.DropDuplicate, droppedByDuplicate)
+	// 降级路径的后置滤除损失同理（issue #63）：全局读者的 raw 取数降级时
+	// （存储没实现 store.GlobalRawReader），先取后滤，被滤掉的条数就是
+	// 被占掉的 TopK 配额——按 DropDegradedScope 归因，宿主才能区分
+	// 「真 TopK」与「降级后置滤」（非降级路径恒为 0，不产生表项）。
+	budget.Drop(ports.DropDegradedScope, degradedScopeDrops)
 	drops := budget.Dropped()
 	res := &Result{
 		Snippets: kept,
@@ -538,9 +556,14 @@ func (p *Pipeline) Recall(ctx context.Context, req Request) (*Result, error) {
 		Buckets:  budget.Kept(),
 		// 能力缺失也要说清：降级不可见 ⇒ 宿主以为自己在用宽松路。
 		LooseSearchUnavailable: p.loose == nil,
+		// 语义路的全局读者能力缺失同理（issue #62）：空读者的语义 TopK
+		// 可能被别家占掉，宿主要能看见这是「语义后端缺能力」而不是
+		//「没有全局事实」。只对**空读者**置位——非空读者走「全局 +
+		// 同归属」，语义面本来就支持，无所谓降级。
+		SemanticGlobalUnavailable: p.semanticGlobalDegraded(eff.Scope),
 	}
 	p.observe(res, budget, p.now().Sub(started))
-	p.markDegraded()
+	p.markDegraded(eff)
 	if p.cache != nil {
 		// 写入时也存副本：调用方随后改写 res 不得污染缓存里那份
 		// （旧实现是 put 时手工拷贝一份）。
@@ -654,6 +677,13 @@ const (
 	//
 	// 口径：每次**发生降级**的召回记一次（不是每次探测）。
 	MetricLooseSearchUnavailable = "recall.loose.unavailable"
+	// MetricSemanticGlobalUnavailable 语义路的全局读者检索不可用
+	//（语义面没实现 ports.GlobalSemanticReader）且本轮是**空读者**的召回次数。
+	//
+	// 口径同 MetricLooseSearchUnavailable：每次发生降级的召回记一次
+	// （缓存命中也算——它端出来的就是降级结果）。非空读者不记：
+	// 它走「全局 + 同归属」，语义面的冻结语义本来就覆盖。
+	MetricSemanticGlobalUnavailable = "recall.semantic.global.unavailable"
 )
 
 // cacheKey 缓存键。

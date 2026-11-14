@@ -147,41 +147,57 @@ type OctopManifest struct {
 // octop 有 8 张表，本仓有 9 类 —— 本仓多的两类（episodes 情节、digests 周期摘要）
 // 在 octop 那边**没有对应表** ⇒ 导出时跳过 ✓（并在文档里写明 ✓），
 // 反过来读 octop 的包时这两类自然为空 ✓。
+//
+// # 取数一律**分页取尽**（issue #61）
+//
+// 七张表的取数没有一张允许「写死一个大 Limit 冒充全量」（那是 #61 撤掉的形态：
+// 超过上限的行按取数序静默截断，导出的包残缺且零信号）。三套取法：
+//
+//   - raw_events：ListRaw 的 Page 自带 Offset（冻结面发布时就带了），
+//     按页翻到取尽；
+//   - atoms：直接复用 store.ListAllAtoms（#59 落的分页取全，Source.ListAtoms
+//     的形状与 store.AtomLister 逐字一致）；
+//   - 其余四张：签名只收 limit，翻页参数放不下 ⇒ 走 PagedSource 可选能力
+//     （见 paging.go；ExportOctop 入口探过，到这里必有）。
 var octopTableNames = []struct {
 	Go     string
 	Octop  string
-	Export func(ctx context.Context, src Source, ns store.Namespace) ([]any, error)
+	Export func(ctx context.Context, src Source, paged PagedSource, ns store.Namespace, pageSize int) ([]any, error)
 }{
-	{"raw_events", "raw_events", func(ctx context.Context, src Source, ns store.Namespace) ([]any, error) {
-		evs, err := src.ListRaw(ctx, ns, "", time.Time{}, store.Page{Limit: 1000000})
+	{"raw_events", "raw_events", func(ctx context.Context, src Source, paged PagedSource, ns store.Namespace, pageSize int) ([]any, error) {
+		evs, err := pageAll(pageSize, func(offset, limit int) ([]*types.RawEvent, error) {
+			return src.ListRaw(ctx, ns, "", time.Time{}, store.Page{Offset: offset, Limit: limit})
+		})
 		if err != nil {
 			return nil, err
 		}
 		return toAny(evs), nil
 	}},
-	{"candidates", "candidates", func(ctx context.Context, src Source, ns store.Namespace) ([]any, error) {
-		cs, err := src.ListCandidates(ctx, ns, store.CandidateFilter{Limit: 1000000})
+	{"candidates", "candidates", func(ctx context.Context, src Source, paged PagedSource, ns store.Namespace, pageSize int) ([]any, error) {
+		cs, err := pageAll(pageSize, func(offset, limit int) ([]*types.Candidate, error) {
+			return paged.ListCandidatesPaged(ctx, ns, store.CandidateFilter{}, offset, limit)
+		})
 		if err != nil {
 			return nil, err
 		}
 		return toAny(cs), nil
 	}},
-	{"entities", "entities", func(ctx context.Context, src Source, ns store.Namespace) ([]any, error) {
-		es, err := src.ListEntities(ctx, ns, "", 1000000)
+	{"entities", "entities", func(ctx context.Context, src Source, paged PagedSource, ns store.Namespace, pageSize int) ([]any, error) {
+		es, err := listAllEntities(ctx, paged, ns, pageSize)
 		if err != nil {
 			return nil, err
 		}
 		return toAny(es), nil
 	}},
-	{"atoms", "atoms", func(ctx context.Context, src Source, ns store.Namespace) ([]any, error) {
-		as, err := src.ListAtoms(ctx, ns, store.AtomFilter{Limit: 1000000})
+	{"atoms", "atoms", func(ctx context.Context, src Source, paged PagedSource, ns store.Namespace, pageSize int) ([]any, error) {
+		as, err := store.ListAllAtoms(ctx, src, ns, store.AtomFilter{}, pageSize)
 		if err != nil {
 			return nil, err
 		}
 		return toAny(as), nil
 	}},
-	{"aliases", "aliases", func(ctx context.Context, src Source, ns store.Namespace) ([]any, error) {
-		es, err := src.ListEntities(ctx, ns, "", 1000000)
+	{"aliases", "aliases", func(ctx context.Context, src Source, paged PagedSource, ns store.Namespace, pageSize int) ([]any, error) {
+		es, err := listAllEntities(ctx, paged, ns, pageSize)
 		if err != nil {
 			return nil, err
 		}
@@ -195,15 +211,19 @@ var octopTableNames = []struct {
 		}
 		return out, nil
 	}},
-	{"entity_pages", "entity_pages", func(ctx context.Context, src Source, ns store.Namespace) ([]any, error) {
-		ps, err := src.ListEntityPages(ctx, ns, 1000000)
+	{"entity_pages", "entity_pages", func(ctx context.Context, src Source, paged PagedSource, ns store.Namespace, pageSize int) ([]any, error) {
+		ps, err := pageAll(pageSize, func(offset, limit int) ([]*types.EntityPage, error) {
+			return paged.ListEntityPagesPaged(ctx, ns, offset, limit)
+		})
 		if err != nil {
 			return nil, err
 		}
 		return toAny(ps), nil
 	}},
-	{"journal", "journal", func(ctx context.Context, src Source, ns store.Namespace) ([]any, error) {
-		js, err := src.ListJournal(ctx, ns, "", 1000000)
+	{"journal", "journal", func(ctx context.Context, src Source, paged PagedSource, ns store.Namespace, pageSize int) ([]any, error) {
+		js, err := pageAll(pageSize, func(offset, limit int) ([]*types.JournalEntry, error) {
+			return paged.ListJournalPaged(ctx, ns, "", offset, limit)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -223,10 +243,22 @@ func toAny[T any](items []*T) []any {
 // ExportOctop 按 **octop 的布局**导出一个包（对方零改动即可读）。
 //
 // 返回的是 octop 形状的清单 ✓。
+//
+// # 取数前提：分页取全（issue #61）
+//
+// 全量导出不能拿写死的大 Limit 冒充——超过上限的行静默截断，
+// 而迁移正是最容不得「少了几条」的环节。candidates/entities/entity_pages/journal
+// 四张表的翻页参数在冻结面上放不下，故取数走 PagedSource 可选能力：
+// **入口探一次，没有就报错、一句都不导**（导出完整性是前提不是增强，
+// 降级成单次大 Limit 硬取等于把静默截断换个名字留下——见 paging.go）。
 func ExportOctop(ctx context.Context, src Source, ns store.Namespace, w io.Writer,
 	opt ExportOptions) (*OctopManifest, error) {
 	if src == nil {
 		return nil, fmt.Errorf("portable: 源为空")
+	}
+	paged, ok := store.PagedListerOf(src)
+	if !ok {
+		return nil, errNoPagedSource(src)
 	}
 	zw := zip.NewWriter(w)
 	defer func() { _ = zw.Close() }()
@@ -241,7 +273,7 @@ func ExportOctop(ctx context.Context, src Source, ns store.Namespace, w io.Write
 	total := 0
 	skippedScoped := 0
 	for _, t := range octopTableNames {
-		rows, err := t.Export(ctx, src, ns)
+		rows, err := t.Export(ctx, src, paged, ns, opt.PageSize)
 		if err != nil {
 			return nil, err
 		}

@@ -52,19 +52,25 @@ func withoutSource(list []Source, drop Source) []Source {
 //
 // 关键：**ActiveOnly 恒置位**。漏掉它意味着已退役与已作废的事实照进 prompt，
 // 而那种失效在数据上完全看不出来（内容看着是对的，只是过时了）。
-func (p *Pipeline) gather(ctx context.Context, req Request, limit int, plan types.QueryPlan) ([]*candidate, error) {
+//
+// 第二个返回值是降级路径的后置滤除计数（issue #63）：raw 源降级时
+// （存储没实现 store.GlobalRawReader，全局读者回落 ListRaw + 后置滤），
+// 被滤掉的条数就是被占掉的 TopK 配额——交给调用方进 Drops 表归因，
+// 「真 TopK」与「降级后置滤」才能区分。非降级路径恒为 0。
+func (p *Pipeline) gather(ctx context.Context, req Request, limit int, plan types.QueryPlan) ([]*candidate, int, error) {
 	var out []*candidate
+	degradedScopeDrops := 0
 
 	if hasSource(p.cfg.Sources, SourceAtom) {
 		atoms, err := p.collectAtoms(ctx, req, limit)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		for _, a := range atoms {
 			c, ok, err := p.snippet(ctx, SourceAtom, a.ID, a.EntityID, "记忆", a.Assertion,
 				a.Importance, a.OccurredAt)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			if !ok {
 				continue // 空白断言：没有可注入的内容，跳过而不是崩掉
@@ -76,21 +82,31 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int, plan type
 	}
 
 	if hasSource(p.cfg.Sources, SourceRaw) && p.raw != nil {
-		raws, err := p.listRawForReader(ctx, req)
+		raws, degraded, err := p.listRawForReader(ctx, req)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		for _, e := range raws {
 			// 归属复查（纵深防御）：存储层已经按归属过滤了原始事件，
 			// 这里再挡一道——原始事件是**对话原文**，漏一条就是
 			// 把别人说过的话塞进当前 prompt。
+			//
+			// ⚠️ 降级路径（degraded）下这一滤不是纵深防御而是**主防线**：
+			// 存储给回来的是全部归属的事件，被滤掉的条数就是被占掉的
+			// TopK 配额——静默的话症状只是「raw 源召回变少」而查不出原因，
+			// 故按 ports.DropDegradedScope 计数上交（issue #63）。
+			// 非降级路径这只是纵深防御（存储层已滤，通常滤不到东西），
+			// 不计数、行为不变。
 			if !e.Scope.VisibleTo(req.Scope) {
+				if degraded {
+					degradedScopeDrops++
+				}
 				continue
 			}
 			c, ok, err := p.snippet(ctx, SourceRaw, e.ID, "", "历史", e.Content,
 				types.ImportanceLow, e.Timestamp)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			if !ok {
 				continue // 空白正文：没有可注入的内容
@@ -114,7 +130,7 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int, plan type
 		for _, id := range pageEnts {
 			page, err := p.pageOf(ctx, req, id)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			if page == nil || page.Headline == "" {
 				continue
@@ -122,7 +138,7 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int, plan type
 			c, ok, err := p.snippet(ctx, SourcePageHeadline, id, id, "画像", page.Headline,
 				types.ImportanceMed, page.UpdatedAt)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			if !ok {
 				continue // 空白画像：实体还没有实质画像
@@ -133,7 +149,7 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int, plan type
 		}
 	}
 
-	return out, nil
+	return out, degradedScopeDrops, nil
 }
 
 // pageOf 取某个实体的画像（按读者的归属视角）。
@@ -242,19 +258,28 @@ func (p *Pipeline) atomFilter(req Request, limit int) store.AtomFilter {
 
 // listRawForReader 按读者归属取原始事件（raw 源的取数入口）。
 //
+// 第二个返回值是**是否处在降级形态**（issue #63）：仅当空读者落到了
+// ListRaw(空 scope) ——即存储没实现 store.GlobalRawReader 可选能力——
+// 才为真。此时后置滤除是**主防线**（不是纵深防御），被滤掉的条数
+// 以 ports.DropDegradedScope 归因（见 gather）。
+//
 //   - 非空读者：ListRaw 的「全局 + 同归属」本来就是读者语义，直取；
 //   - 空读者（全局读者）：实现了 store.GlobalRawReader 时在**取数层**
 //     只取全局事件（配额不被别家的事件占掉，与 atoms 侧同判据）；
 //     没实现则**降级** ListRaw(空 scope) + 调用方的 VisibleTo 后置滤除
 //     ——正确性由滤除兜着（绝不进别家的事件），代价只是 MaxRaw 配额
-//     可能被占掉一部分（与修复前的行为一致）。
-func (p *Pipeline) listRawForReader(ctx context.Context, req Request) ([]*types.RawEvent, error) {
+//     可能被占掉一部分（与修复前的行为一致；损失可观测，issue #63）。
+func (p *Pipeline) listRawForReader(ctx context.Context, req Request) ([]*types.RawEvent, bool, error) {
 	if req.Scope == "" && p.rawGlobal != nil {
-		return p.rawGlobal.ListRawGlobal(ctx, req.Namespace, time.Time{},
+		raws, err := p.rawGlobal.ListRawGlobal(ctx, req.Namespace, time.Time{},
 			store.Page{Limit: p.cfg.MaxRaw})
+		return raws, false, err
 	}
-	return p.raw.ListRaw(ctx, req.Namespace, req.Scope, time.Time{},
+	raws, err := p.raw.ListRaw(ctx, req.Namespace, req.Scope, time.Time{},
 		store.Page{Limit: p.cfg.MaxRaw})
+	// 只有「空读者 + 没有全局读者能力」的落点才是降级：非空读者的
+	// ListRaw(scope) 本来就是读者语义，不是降级。
+	return raws, req.Scope == "", err
 }
 
 func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]*types.AtomCard, error) {

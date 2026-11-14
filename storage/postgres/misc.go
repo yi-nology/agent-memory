@@ -1,16 +1,13 @@
 package postgres
 
 import (
-	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 
-	"github.com/yi-nology/agent-memory/ports"
 	"github.com/yi-nology/agent-memory/store"
 	"github.com/yi-nology/agent-memory/types"
 )
@@ -141,9 +138,19 @@ func (s *pageStore) ListDirtyEntityPages(ctx context.Context, ns store.Namespace
 // **跨视角全列**：导包要的是这个命名空间的全部记忆，
 // 只导一个视角等于导出时把别家的画像悄悄丢了（而导入方看不出来）。
 func (s *Store) ListEntityPages(ctx context.Context, ns store.Namespace, limit int) ([]*types.EntityPage, error) {
+	return s.ListEntityPagesPaged(ctx, ns, 0, limit)
+}
+
+// ListEntityPagesPaged 按页取实体页面：offset 跳过的条数，limit 单页条数（0=后端默认）。
+//
+// 语义同 ListEntityPages（跨视角全列，逐字一致），差别只在翻页参数——
+// 服务于「分页取全」的翻页（operations/portable 的 PagedSource，issue #61）：
+// 全量导出不能用一个大 Limit 冒充，超限的行会按取数序静默截断。
+// 取数序 (entity_id, scope) 是全序，翻页不重不漏。
+func (s *Store) ListEntityPagesPaged(ctx context.Context, ns store.Namespace, offset, limit int) ([]*types.EntityPage, error) {
 	rows, err := s.query(ctx,
-		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = $1 ORDER BY entity_id, scope LIMIT $2`,
-		nsOf(ns), limitOf(limit, 1000))
+		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = $1 ORDER BY entity_id, scope LIMIT $2 OFFSET $3`,
+		nsOf(ns), limitOf(limit, 1000), max(offset, 0))
 	if err != nil {
 		return nil, err
 	}
@@ -581,14 +588,25 @@ func (s *journalStore) AppendJournal(ctx context.Context, ns store.Namespace, e 
 }
 
 func (s *journalStore) ListJournal(ctx context.Context, ns store.Namespace, subject string, limit int) ([]*types.JournalEntry, error) {
+	return s.ListJournalPaged(ctx, ns, subject, 0, limit)
+}
+
+// ListJournalPaged 按页取审计条目：offset 跳过的条数，limit 单页条数（0=后端默认）。
+//
+// 语义同 ListJournal（过滤条件逐字一致），差别只在翻页参数——
+// 服务于「分页取全」的翻页（operations/portable 的 PagedSource，issue #61）：
+// 全量导出不能用一个大 Limit 冒充，超限的行会按取数序静默截断。
+// 取数序带 id 全序兜底键（与 SQLite 侧同款），翻页不重不漏。
+func (s *journalStore) ListJournalPaged(ctx context.Context, ns store.Namespace, subject string, offset, limit int) ([]*types.JournalEntry, error) {
 	q := `SELECT id, at, kind, subject, actor, summary, detail FROM journal WHERE namespace = $1`
 	args := []any{nsOf(ns)}
 	if subject != "" {
 		q += ` AND subject = $2`
 		args = append(args, subject)
 	}
-	q += ` ORDER BY at DESC, id DESC LIMIT $` + itoa(len(args)+1)
-	args = append(args, limitOf(limit, defaultFetchLimit))
+	q += ` ORDER BY at DESC, id DESC LIMIT $` + itoa(len(args)+1) +
+		` OFFSET $` + itoa(len(args)+2)
+	args = append(args, limitOf(limit, defaultFetchLimit), max(offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
@@ -627,147 +645,5 @@ func (s *metaStore) SetMeta(ctx context.Context, ns store.Namespace, key, value 
 		`INSERT INTO meta (namespace, key, value) VALUES ($1, $2, $3)
 		 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value`,
 		nsOf(ns), key, value)
-	return err
-}
-
-// ── 向量索引 ──
-//
-// 向量是**派生物**：真源是事实卡（向量是事实的函数），
-// 索引丢了可以从事实卡重算，事实卡丢了索引救不回来。
-// 故这一面只有「落向量与读向量」，没有任何改写事实的入口。
-
-// vectorStore 向量索引存取（**派生物**）。
-//
-// 刻意单列一个窄结构而不是平铺在 Store 上：
-// 仓里「每张表一个内嵌窄结构」那条纪律的兑现——
-// 平铺会让 Store 的方法数往上走，而门禁的阈值就是按「一个类型几个方法」判的。
-type vectorStore struct{ *Store }
-
-// Upsert 写入或更新一条向量（scope 是这条向量的归属）。
-func (s *vectorStore) Upsert(ctx context.Context, namespace, id, scope string, vec []float32) error {
-	if id == "" {
-		return errors.New("向量标识不能为空")
-	}
-	if len(vec) == 0 {
-		return errors.New("向量不能为空")
-	}
-	// 同一个命名空间只许一种维度：维度不同的两条向量没法比余弦，
-	// 而「比不出来」若被静默吞掉，症状是「语义召回像是没生效」。
-	if err := s.checkVecDim(ctx, namespace, len(vec)); err != nil {
-		return err
-	}
-	_, err := s.exec(ctx, `INSERT INTO atom_vectors (namespace, id, scope, dim, vec, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6)
-		ON CONFLICT(namespace, id) DO UPDATE SET
-			scope = excluded.scope, dim = excluded.dim, vec = excluded.vec,
-			updated_at = excluded.updated_at`,
-		namespace, id, scope, len(vec), encodeVec(vec), ts(time.Now().UTC()))
-	return err
-}
-
-// checkVecDim 校验命名空间里的维度与给定维度一致。
-//
-// 维度不一致时报 ports.ErrDimensionMismatch 而不是各算各的：
-// 静默「比不出来」的失效形态是「语义召回永远空」，而调用方看不出是维度错了。
-func (s *vectorStore) checkVecDim(ctx context.Context, namespace string, dim int) error {
-	rows, err := s.query(ctx, `SELECT DISTINCT dim FROM atom_vectors WHERE namespace = $1`, namespace)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var d int
-		if err := rows.Scan(&d); err != nil {
-			return err
-		}
-		if d != dim {
-			return ports.ErrDimensionMismatch
-		}
-	}
-	return rows.Err()
-}
-
-// Search 返回最相似的若干条。
-//
-// # 归属过滤**进 SQL**
-//
-// scope 非空时取「全局的 + 同归属的」，别家的一条都不进候选池。
-// 放在调用方后置的话，被别家占掉的 topK 槽位已经花掉了——
-// 于是「该给我的那条」根本没进候选池，而症状只是「语义召回像是没生效」。
-// scope 为空 = **不隔离**（与 store.AtomFilter.Scope 同一条语义）。
-//
-// # 暴力扫描的适用面
-//
-// 这是「把该命名空间的向量取回来、在 Go 里算余弦」的暴力实现：
-// 它是**小库够用**的那一档——零外部依赖、跟着记忆库一起活（跨进程可用）。
-// 大规模部署的宿主应注入自己的向量库（Chroma / Qdrant / PG 的向量扩展……），
-// 本仓不替宿主选向量技术（核心不引向量库 SDK，见 architecture-policy.yaml）。
-func (s *vectorStore) Search(ctx context.Context, namespace, scope string, vec []float32,
-	topK int) ([]ports.VectorHit, error) {
-	if len(vec) == 0 {
-		return nil, errors.New("查询向量不能为空")
-	}
-	// 维度先对齐：库里是 3 维、查询给 4 维时**必须报错**，
-	// 静默返回空集的失效形态是「语义召回永远空」，而调用方看不出是维度错了。
-	if err := s.checkVecDim(ctx, namespace, len(vec)); err != nil {
-		return nil, err
-	}
-	q := `SELECT id, vec FROM atom_vectors WHERE namespace = $1`
-	args := []any{namespace}
-	if scope != "" {
-		q += ` AND (scope = '' OR scope = $2)`
-		args = append(args, scope)
-	}
-	rows, err := s.query(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var hits []ports.VectorHit
-	for rows.Next() {
-		var (
-			id  string
-			raw []byte
-		)
-		if err := rows.Scan(&id, &raw); err != nil {
-			return nil, err
-		}
-		score, ok := cosineScore(decodeVec(raw), vec)
-		if !ok {
-			// 零向量没有方向，无从比较（跳过，不当命中）。
-			continue
-		}
-		hits = append(hits, ports.VectorHit{ID: id, Score: float32(score)})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	sortHits(hits)
-	if topK > 0 && len(hits) > topK {
-		hits = hits[:topK]
-	}
-	return hits, nil
-}
-
-// sortHits 按分数倒序排；同分按标识升序。
-//
-// 同分时的标识序是**可复现性**的一部分：没有它，同样的查询每次返回的
-// 次序可能不同，而融合层按名次算分——于是「召回结果不可复现」。
-func sortHits(hits []ports.VectorHit) {
-	slices.SortFunc(hits, func(a, b ports.VectorHit) int {
-		if c := cmp.Compare(b.Score, a.Score); c != 0 {
-			return c
-		}
-		return strings.Compare(a.ID, b.ID)
-	})
-}
-
-// Delete 删一条向量。
-//
-// 删不到不报错：删索引是清理动作，同一条被清两次是常态
-// （事实卡被推翻两次、清理流程重跑），报错只会让清理路径变脆。
-func (s *vectorStore) Delete(ctx context.Context, namespace, id string) error {
-	_, err := s.exec(ctx, `DELETE FROM atom_vectors WHERE namespace = $1 AND id = $2`,
-		namespace, id)
 	return err
 }

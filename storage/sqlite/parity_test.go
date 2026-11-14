@@ -17,6 +17,14 @@ func TestParity(t *testing.T) {
 	parity.Run(t, openFresh)
 }
 
+// TestParityPaged 分页取全（导出面的可选能力）的跨后端共享断言。
+//
+// 与 TestParity 同一份数据语义：两个后端的翻页必须同序、不重不漏
+// （issue #61 的 octop 导出靠它拿全量）。
+func TestParityPaged(t *testing.T) {
+	parity.RunPaged(t, openFresh)
+}
+
 func openFresh(t *testing.T) store.Store {
 	t.Helper()
 	s, err := sqlite.OpenMemory(t.Name())
