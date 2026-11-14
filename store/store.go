@@ -153,6 +153,16 @@ type (
 		OccurredTo   time.Time
 		// Limit 条数上限（0=后端默认）。
 		Limit int
+		// Offset 跳过的条数（0=从头；分页取全的翻页用）。
+		//
+		// 存在的理由：「全量扫描」类动作（向量补算、生命周期四件套）不能
+		// 用一个写死的大 Limit 冒充全量——单 namespace 超过那个数时，排在
+		// 取数序尾部的卡静默落选，且落选的恰是最不重要的那批（issue #59）。
+		// 带上 Offset，调用方就能按页翻到取尽（见 store.ListAllAtoms）。
+		//
+		// 它与 LIMIT 同源同序（同一份 ORDER BY），翻页不重不漏的前提是
+		// **翻页期间数据不动**——维护类扫描是先取尽后处理，取数阶段只有读。
+		Offset int
 	}
 	// CandidateFilter 候选过滤条件。
 	CandidateFilter struct {

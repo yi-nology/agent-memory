@@ -173,9 +173,15 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 	//
 	// 重要度排序用 CASE 表达式（importanceOrderExpr）而不是字典序：
 	// importance 列是 TEXT，字典序下 'med' > 'low' > 'high'，最重要的会排最后。
+	//
+	// OFFSET 服务于「分页取全」的翻页（store.ListAllAtoms）：全量扫描类动作
+	// 不能用一个大 Limit 冒充全量（issue #59）。它与 LIMIT 同一份 ORDER BY，
+	// 翻页不重不漏的前提是取数期间数据不动——扫描是先取尽后处理。
+	// （与 SQLite 侧逐字同语义。）
 	q := `SELECT ` + atomCols + ` FROM atoms WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT $` + fmt.Sprint(len(args)+1)
-	args = append(args, limitOf(f.Limit, defaultFetchLimit))
+		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT $` +
+		fmt.Sprint(len(args)+1) + ` OFFSET $` + fmt.Sprint(len(args)+2)
+	args = append(args, limitOf(f.Limit, defaultFetchLimit), max(f.Offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {

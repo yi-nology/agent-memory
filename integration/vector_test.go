@@ -3,6 +3,7 @@ package integration_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -418,4 +419,155 @@ func TestReindexRequiresEmbedderAndIndex(t *testing.T) {
 	// 「缺索引」分支在 sqlite 后端测不出来：New 会对 nil VectorIndex 自动
 	// 类型断言存储自身（sqlite.Store 实现 ports.VectorIndex）。该分支由
 	// 使用无索引后端的宿主命中，属装配面契约，此处不强造后端。
+}
+
+// TestReindexLimitZeroTakesAllAndSkipsRetired 两条契约一起钉（issue #49 / #50）：
+//
+//  1. limit<=0 是**不限量**——取尽全库，而不是把 0 交给存储层兜成缺省 50
+//     （那样宿主拿到成功回执但只补了前 50 条，低重要度存量事实永无向量）；
+//  2. 退役卡（被取代 / 人工作废）不回写索引——补算不得让退役时删掉的
+//     死向量复活，否则语义路的 TopK 配额被死事实占掉。
+//
+// 夹具刻意越过存储层缺省 50：60 张活跃卡 + 2 张退役卡，
+// 用小页大小翻页（走 store.ListAllAtoms 的真实翻页路径）。
+func TestReindexLimitZeroTakesAllAndSkipsRetired(t *testing.T) {
+	ctx := context.Background()
+	s := openFresh(t)
+	ix := ports.NewMemIndex()
+	svc, err := application.New(
+		application.Config{Namespace: ns, Host: "it"},
+		application.Deps{
+			Store: s, Redactor: ports.PatternRedactor{}, Bander: ports.MemoryBand{},
+			Embedder: synonymEmbedder{}, VectorIndex: ix,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const activeN = 60
+	base := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	mk := func(id, assertion string) *types.AtomCard {
+		return &types.AtomCard{
+			ID: id, EntityID: "e1", CandidateID: "c-" + id, RawEventIDs: []string{"ev-" + id},
+			Assertion: assertion, VerbatimQuote: "「" + assertion + "」",
+			QuoteEventID: "ev-" + id, SearchTerms: []string{"事实"},
+			OccurredAt: base, Confidence: types.ConfidenceHigh, Importance: types.ImportanceMed,
+			CreatedAt: base, UpdatedAt: base,
+			Provenance: types.Provenance{Origin: types.OriginOperator},
+		}
+	}
+	var active []string
+	for i := range activeN {
+		id := fmt.Sprintf("atom-live-%03d", i)
+		// 断言彼此不同：签名去重不拦，检索词不互相干扰（正文只是载体）。
+		if err := s.SaveAtom(ctx, ns, mk(id, fmt.Sprintf("机器甲的巡检结论第 %d 号：状态正常", i))); err != nil {
+			t.Fatal(err)
+		}
+		active = append(active, id)
+	}
+	retired := map[string]string{
+		"atom-dead-sup": "被推翻的旧结论：磁盘已满",
+		"atom-dead-dep": "人工作废的结论：内存泄漏",
+	}
+	for id, assertion := range retired {
+		card := mk(id, assertion)
+		if err := s.SaveAtom(ctx, ns, card); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SupersedeAtom(ctx, ns, id, "atom-live-000"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 第二张走人工作废（另一种退役态也要盖到）。
+	if err := s.DeprecateAtom(ctx, ns, "atom-dead-dep", base); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := svc.Reindex(ctx, ns, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != activeN {
+		t.Fatalf("limit=0 应取尽全库：期望补算 %d 条（活跃卡全量），实得 %d", activeN, n)
+	}
+	if got := ix.Count(string(ns)); got != activeN {
+		t.Fatalf("索引里应有 %d 条向量，实得 %d", activeN, got)
+	}
+	// 退役卡不在索引里：拿它自己的向量去搜（若在，必是最高分命中）。
+	emb := synonymEmbedder{}
+	for id, assertion := range retired {
+		vec, err := emb.Embed(ctx, assertion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hits, err := ix.Search(ctx, string(ns), "", vec, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range hits {
+			if h.ID == id {
+				t.Fatalf("退役卡的向量被 Reindex 写回了索引: %s", id)
+			}
+		}
+	}
+	// 显式 limit 仍然限条：limit=3 只补 3 条（索引因此只有那 3 张新卡）。
+	ix2 := ports.NewMemIndex()
+	svc2, err := application.New(
+		application.Config{Namespace: ns, Host: "it"},
+		application.Deps{
+			Store: s, Redactor: ports.PatternRedactor{}, Bander: ports.MemoryBand{},
+			Embedder: synonymEmbedder{}, VectorIndex: ix2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err = svc2.Reindex(ctx, ns, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("limit=3 应只补 3 条，实得 %d", n)
+	}
+}
+
+// 翻页本身也要钉住：ListAllAtoms 以小页大小取同一批数据，
+// 页与页拼起来必须恰好等于全库活跃卡（不重不漏、不超过）。
+// 62 张活跃卡 ÷ 每页 7 条 = 9 页，真实的跨页路径。
+func TestListAllAtomsPaginatesToExhaustion(t *testing.T) {
+	ctx := context.Background()
+	s := openFresh(t)
+	base := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	const total = 62
+	for i := range total {
+		a := &types.AtomCard{
+			ID: fmt.Sprintf("atom-page-%03d", i), EntityID: "e1", CandidateID: "c-x",
+			RawEventIDs: []string{"ev-x"},
+			Assertion:   fmt.Sprintf("翻页用例第 %d 条事实", i), VerbatimQuote: "「翻页」",
+			QuoteEventID: "ev-x", SearchTerms: []string{"翻页"},
+			OccurredAt: base, Confidence: types.ConfidenceMed, Importance: types.ImportanceMed,
+			CreatedAt: base, UpdatedAt: base,
+			Provenance: types.Provenance{Origin: types.OriginOperator},
+		}
+		if err := s.SaveAtom(ctx, ns, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := store.ListAllAtoms(ctx, s, ns, store.AtomFilter{ActiveOnly: true}, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != total {
+		t.Fatalf("分页取全应得 %d 条，实得 %d", total, len(got))
+	}
+	seen := map[string]int{}
+	for _, a := range got {
+		seen[a.ID]++
+	}
+	for id, c := range seen {
+		if c != 1 {
+			t.Fatalf("分页取全出现重复: %s 出现 %d 次", id, c)
+		}
+	}
 }

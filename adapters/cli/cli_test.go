@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -288,5 +289,41 @@ func TestExportInOctopFormat(t *testing.T) {
 	}
 	if !ok {
 		t.Fatal("导出的包应被识别为 octop 布局")
+	}
+}
+
+// reindex 不带 --limit 必须**取尽全库**（issue #49）。
+//
+// 共享 FlagSet 的 --limit 缺省 10 对补算是错的：宿主不带参跑，
+// 只补前 10 条还拿到成功回执。钉法：入库 12 条存量事实（超过 10），
+// 不带 --limit 跑 reindex，输出必须报 12——缺省 10 在场时这条红。
+func TestReindexDefaultsToUnlimited(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "m.sqlite")
+	st, err := sqlite.OpenFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := range 12 {
+		if err := st.SaveAtom(context.Background(), store.Namespace("t"), &types.AtomCard{
+			ID: fmt.Sprintf("a-%02d", i), EntityID: "e1",
+			Assertion: fmt.Sprintf("存量事实第 %d 条：磁盘偏小", i),
+			QuoteEventID: "ev1", RawEventIDs: []string{"ev1"},
+			Importance: types.ImportanceMed, Confidence: types.ConfidenceMed,
+			OccurredAt: now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errb := run(t, "reindex", "--db", db, "--namespace", "t")
+	if code != 0 {
+		t.Fatalf("reindex 失败: %s %s", out, errb)
+	}
+	if !strings.Contains(out, "已补算 12") {
+		t.Fatalf("不带 --limit 的 reindex 应取尽全库（12 条），实得: %q", out)
 	}
 }

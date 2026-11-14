@@ -189,9 +189,13 @@ func (s *atomStore) ListAtoms(ctx context.Context, ns store.Namespace, f store.A
 	// 没有它时返回顺序不确定——而「同签名合并时保留哪一张」正是由这个顺序
 	// 决定的，于是合并结果会随机变。同一类 bug 在原始事件面上修过一次
 	// （时间存纳秒 + id 次序），这里是同一课的第二处。
+	//
+	// OFFSET 服务于「分页取全」的翻页（store.ListAllAtoms）：全量扫描类动作
+	// 不能用一个大 Limit 冒充全量（issue #59）。它与 LIMIT 同一份 ORDER BY，
+	// 翻页不重不漏的前提是取数期间数据不动——扫描是先取尽后处理。
 	q := `SELECT ` + atomCols + ` FROM atoms WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT ?`
-	args = append(args, limitOf(f.Limit, defaultFetchLimit))
+		` ORDER BY ` + importanceOrderExpr() + ` DESC, occurred_at DESC, id ASC LIMIT ? OFFSET ?`
+	args = append(args, limitOf(f.Limit, defaultFetchLimit), max(f.Offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
