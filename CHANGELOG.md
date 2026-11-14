@@ -2,6 +2,37 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.16.0] — 2026-11-15
+
+### 修复(portable)：原生 Export Limit=0 分页取尽——撤 100000 静默截断
+
+- Limit>0: 单次取的显式 cap(调用方主动要的,语义不变)
+- Limit=0: 分页取尽,与 ExportOctop 同三套取法——raw 走 Page.Offset、
+  atoms 走 store.ListAllAtoms、candidates/entities/entity_pages/journal
+  走 PagedLister 可选能力(缺能力响亮失败 errNoPagedSource,不降级成
+  大 Limit 硬取);episodes/digests 冻结面无翻页口,传 MaxInt(limitOf
+  仅 <=0 回落缺省,MaxInt 不可被行数超过 ⇒ 无静默截断),缺口注释在案
+- 此前 0 兜成 100000:超十万条按取数序静默截断,与 doc「0=不限」相反
+  (与 #61 撤掉的形态同族)
+- 别名 N+1 缺口评估注释:维持现状(基数=实体数有界,补列全口要先定
+  命名空间别名计数索引)
+- 回归:跨页取尽(12 条/页宽 5,翻页序列 0/5/10 探针断言)+ 显式 cap
+  不变 + 缺能力报错点名 PagedSource(真 SQLite 内存库)
+
+- 杂务(deps)：三依赖抬到最新地板——pkg v0.48.0 / textx v0.12.0 / guardx v0.26.0
+
+阶梯集成车道（pkg→textx→guardx 一次抬平，全量 build+test+make check 背书）：
+- oekit/pkg v0.42.0→v0.48.0：跨 v0.45.0 删 Errorf 断雷面——仓内无 .Errorf
+  消费点（grep 实测零命中），直接通过；
+- oagentkit/textx v0.10.7→v0.12.0：textutil 新增面零冲突；
+- oagentkit/guardx v0.8.2→v0.26.0：跨 compat purge + permgate/logredact
+  多轮语义演进。唯一断点：logredact v0.26 credential-kv 行尾变体（#177）
+  会把本仓掩码 «kind:****» 里 kind 名撞上凭证词表的形态再掩一次，吃掉
+  收尾 »（括号不配对）——ports/redact.go 增 repairMaskClose 适配层归一化
+  回填（上游为外来掩码加保护后本层自然空转）；
+  TestRedactorOutputHasNoNestedMask 括号配对断言即本层的回归门。
+
+
 ## [v0.15.0] — 2026-11-14
 
 ### 修复(recall)：GlobalRawReader 降级路径配额损失按 DropDegradedScope 归因
