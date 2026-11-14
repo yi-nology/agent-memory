@@ -418,6 +418,22 @@ func (s *atomStore) DeprecateAtom(ctx context.Context, ns store.Namespace, id st
 //
 // 退役**不删正文**：被推翻的事实仍然可以被搜到并看到「已被继任者取代」，
 // 因为「当初为什么这么判」是记忆系统必须能回答的问题。
+//
+// # 退役态只许单向置位（与 SaveAtom 同款 CASE 守卫，issue #48）
+//
+// 读改写本身挡不住两类失效（SaveAtom 注释点名的「并发取代互相抹链」
+// 在这条专职路径上原样存在）：
+//
+//  1. 二次退役改写既有退役态：DeprecateAtom 的 mutate 无条件把
+//     superseded_by 清空——对一张已被取代的卡调人工作废，会把既有取代链
+//     静默抹掉（继任指针丢失，卡还在退役态，但「当初为什么这么判」断链）；
+//  2. 两个并发 retire 同一张卡：READ COMMITTED 下两个事务都先读到
+//     未退役态，后提交者覆盖先提交者。
+//
+// 故 UPDATE 用与 SaveAtom 相同的 CASE：库里的行已退役（superseded_by 非空
+// 或 deprecated_at 已设）时，这两列保持库里的值，本次 mutate 的结果不落库。
+// 读视图在事务里拿到，但判定以**行上的现值**为准——它是两后端唯一可靠的
+// 仲裁点（与 SQLite 侧逐字同语义）。
 func (s *atomStore) retire(ctx context.Context, ns store.Namespace, id string, mutate func(*types.AtomCard) error) error {
 	// 读改写三步必须在同一个事务里，且用的是回调收到的 tx。
 	return s.Transaction(ctx, func(ctx context.Context, tx store.Store) error {
@@ -437,7 +453,12 @@ func (s *atomStore) retire(ctx context.Context, ns store.Namespace, id string, m
 			return fmt.Errorf("事务内拿到的不是本后端实现，退役无法落库: %T", tx)
 		}
 		_, err = tsStore.exec(ctx,
-			`UPDATE atoms SET superseded_by = $1, deprecated_at = $2, updated_at = $3
+			`UPDATE atoms SET
+				superseded_by = CASE WHEN superseded_by <> '' OR deprecated_at IS NOT NULL
+				                     THEN superseded_by ELSE $1 END,
+				deprecated_at = CASE WHEN superseded_by <> '' OR deprecated_at IS NOT NULL
+				                     THEN deprecated_at ELSE $2 END,
+				updated_at = $3
 			 WHERE namespace = $4 AND id = $5`,
 			a.SupersededBy, tsPtr(a.DeprecatedAt), ts(a.UpdatedAt), nsOf(ns), a.ID)
 		return err

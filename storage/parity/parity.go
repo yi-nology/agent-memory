@@ -99,6 +99,7 @@ func Run(t *testing.T, open OpenFn) {
 		{"事实卡：宽松检索命中任一词且过滤条件一条不少", tAtomSearchLooseMatchesAnyWord},
 		{"事实卡：按标识集合取（多路召回融合后一次取回）", tAtomByIDs},
 		{"事实卡：陈旧 SaveAtom 不得复活退役卡", tAtomStaleSaveCannotReviveRetired},
+		{"事实卡：retire 本体的退役态单向守卫", tAtomRetireOneWay},
 		{"事实卡：created_at 首建即定格", tAtomCreatedAtStable},
 		{"关系边：归属隔离", tEdgeScopeIsolation},
 		{"关系边：按时刻过滤", tEdgeAtFilter},
