@@ -50,20 +50,21 @@ type Request struct {
 	ThreadID string
 	// Entities 宿主已解析出的实体 ID；非空时补 page_headline 源。
 	Entities []string
-	// Scope 读者归属（空=不隔离）。
+	// Scope 读者归属。
 	//
 	// 非空时只召回「全局事实 + 同归属事实」：归属为空的卡是全局的，
 	// 人人都该看到；归属非空且不等于本值的卡**一条都不进 prompt**。
+	// **空值 = 全局读者**：只召回全局事实——这正是 types.Scope.VisibleTo
+	// 的判据（全局的谁都看得见，非全局的只有同归属看得见）在空读者上的
+	// 自然结果（issue #53；此前的取数把空值当成「不隔离」传下去，
+	// 与判据逐字相反，配额先被别家占满再被后置滤掉）。
 	//
 	// # 过滤在**取数层**生效，这里是给它的那个值
 	//
 	// 归属条件进存储层的查询，与 TopK 配额同一次求值——
 	// 交给调用方后置过滤的话，被滤掉的条目已经占掉了配额，
 	// 于是「该给我的那条」根本没进候选池，而症状只是「召回变少了」。
-	//
-	// ⚠️ 空值 = **不隔离**（不是「只看全局」）：这条语义与
-	// store.AtomFilter.Scope 一致，两边必须一致，否则「传了没用」。
-	// 不隔离是**显式选择**：宿主在调用点写不写得出这一栏，代码里看得见。
+	// 空读者同理：非全局的事实不该占掉它的配额。
 	Scope types.Scope
 	// Limit 条数上限（0=用配置）。
 	Limit int
@@ -326,9 +327,14 @@ type Reader interface {
 type RawReader interface {
 	// ListRaw 按时间倒序列出原始事件。
 	//
-	// scope 是读者归属（空=不隔离）：原始事件也是召回的兜底源，
-	// 一次就取 MaxRaw 条，被别家占掉之后就没有自己的了——
+	// scope 非空时是读者归属：只取「全局 + 同归属」的事件——原始事件也是
+	// 召回的兜底源，一次就取 MaxRaw 条，被别家占掉之后就没有自己的了，
 	// 故归属过滤必须在这一层生效。
+	//
+	// scope 为空（全局读者）时本方法表达不了「只取全局」——空值在存储层
+	// 是「不隔离」（导出/管理面靠它取全量）。空读者走 store.GlobalRawReader
+	// 可选能力（ListRawGlobal）；没实现时降级用本方法 + 后置 VisibleTo 滤除
+	// （见 gather.listRawForReader）。
 	ListRaw(ctx context.Context, ns store.Namespace, scope types.Scope, before time.Time, p store.Page) ([]*types.RawEvent, error)
 }
 
@@ -337,6 +343,12 @@ type Pipeline struct {
 	cfg   Config
 	store Reader
 	raw   RawReader // nil = 宿主没有捕获面
+	// rawGlobal 全局读者取原始事件的能力（nil = 宿主没实现，见 store.GlobalRawReader）。
+	//
+	// 探测在 New 里做一次（与 loose 同款）：空读者走它在**取数层**只取
+	// 全局事件；没实现则降级 ListRaw(空 scope) + 后置滤除（正确性不变，
+	// 代价是配额，见 gather.listRawForReader）。
+	rawGlobal store.GlobalRawReader
 	// loose 宽松词面检索能力（nil = 宿主没实现，召回回落到严格路）。
 	//
 	// 探测在 New 里做一次：能力不会中途长出来，而每次召回都断言一次
@@ -375,12 +387,16 @@ func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*
 		return nil, err
 	}
 	var raw RawReader
+	var rawGlobal store.GlobalRawReader
 	if hasSource(norm.Sources, SourceRaw) {
 		r, ok := s.(RawReader)
 		if !ok {
 			return nil, errNoRawSource
 		}
 		raw = r
+		// 全局读者取原始事件是**可选能力**：没实现就降级（见 listRawForReader），
+		// 不报错——正确性由后置滤除兜着。
+		rawGlobal, _ = store.GlobalRawReaderOf(s)
 	}
 	// 宽松词面检索是**可选能力**：有就用，没有就回落到严格路。
 	//
@@ -391,7 +407,7 @@ func New(cfg Config, s Reader, est ports.TokenEstimator, bander ports.Bander) (*
 	// 接线与降级见 loose.go。
 	loose := probeLooseSearcher(s)
 	p := &Pipeline{
-		cfg: norm, store: s, raw: raw, loose: loose, est: est, bander: bander,
+		cfg: norm, store: s, raw: raw, rawGlobal: rawGlobal, loose: loose, est: est, bander: bander,
 		now: func() time.Time { return time.Now().UTC() },
 	}
 	// 缓存用流水线自己的时钟：两处时间不一致时，「缓存过期」这条行为

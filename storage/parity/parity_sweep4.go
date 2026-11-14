@@ -211,3 +211,118 @@ func tEntitySaveEntityWholeRow(t *testing.T, s store.Store) {
 		t.Fatalf("to 计数应为 %d（含一次丢失的 Bump 差量），实得 %d", total-1, gotTo.AtomCount)
 	}
 }
+
+// ── 归属：空读者（全局读者）在取数层只见全局（#53）──
+
+// 同一个「空」在两条判据上必须同口径：
+//   - 作为**过滤条件**（AtomFilter.Scope 空）= 不隔离——导出/扫描取全量；
+//   - 作为**读者**（GlobalReader 置位）= 只见全局——types.Scope.VisibleTo
+//     在空读者上的自然结果。
+//
+// 修复前 SQL 层没有「空读者」的表达（两个 scope 字段都把空当「不用这条」），
+// 召回层只好先取全量再后置滤除——TopK 配额先被别家的高分条目占满，
+// 全局读者自己的全局事实根本没进候选池。
+//
+// 配额断言用 ListAtoms（重要度序是**钉死**的 parity 断言，可确定性构造
+// 「别家排前面」）；检索路只断言「一条别组的都没有」（名次跨后端不钉，
+// 见 AGENTS.md「排序不是存储层的承诺」）。
+func tAtomGlobalReaderSeesGlobalOnly(t *testing.T, s store.Store) {
+	// 别家的卡重要度更高：不隔离的列表路里它们排前面。
+	other1 := atomInScope("gr-b1", "e1", "scope-b", "别组的高价值事实甲", "ev1", types.ImportanceHigh)
+	other2 := atomInScope("gr-b2", "e1", "scope-b", "别组的高价值事实乙", "ev2", types.ImportanceHigh)
+	g1 := atomInScope("gr-g1", "e1", "", "全局事实甲：内核版本", "ev3", types.ImportanceMed)
+	g2 := atomInScope("gr-g2", "e1", "", "全局事实乙：磁盘清理", "ev4", types.ImportanceMed)
+	for _, a := range []*types.AtomCard{other1, other2, g1, g2} {
+		if err := s.SaveAtom(bg(), nsA, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 列表路 + LIMIT 2：别家的两条按重要度排在前面——
+	// 后置滤除的实现会返回「2 条别组卡被滤掉后的空集/残集」；
+	// 取数层过滤的实现必得 2 条全局卡。
+	got, err := s.ListAtoms(bg(), nsA, store.AtomFilter{GlobalReader: true, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("全局读者 LIMIT 2 应得 2 条全局卡（配额不被别家占掉），实得 %d: %v",
+			len(got), atomIDs(got))
+	}
+	ids := atomIDs(got)
+	if !hasAtom(ids, "gr-g1") || !hasAtom(ids, "gr-g2") {
+		t.Fatalf("全局读者应得全局卡，实得 %v", ids)
+	}
+
+	// 检索路：命中集里一条别组的都不能有（纵深防御口径不变）。
+	hits, err := s.SearchAtoms(bg(), nsA, "事实", store.AtomFilter{GlobalReader: true, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hits {
+		if h.Scope != "" {
+			t.Fatalf("全局读者的检索结果混进了别家的卡: %+v", h)
+		}
+	}
+	// GlobalReader 与 Scope 同时置位时以 GlobalReader 为准（不叠加、不报错）。
+	got, err = s.ListAtoms(bg(), nsA, store.AtomFilter{GlobalReader: true, Scope: "scope-b", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range got {
+		if a.Scope != "" {
+			t.Fatalf("GlobalReader 置位时 Scope 应让位（仍只见全局），实得 %q", a.Scope)
+		}
+	}
+	// 反向对照：同样的卡，不隔离的列表路 4 条都在（该语义保持不变）。
+	all, err := s.ListAtoms(bg(), nsA, store.AtomFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("不隔离取全量应得 4 条，实得 %d", len(all))
+	}
+}
+
+// 原始事件的全局读者取数（store.GlobalRawReader）：只取全局事件，
+// 且配额不被别家**更新的事件**占掉。
+func tRawGlobalReaderSeesGlobalOnly(t *testing.T, s store.Store) {
+	g, ok := store.GlobalRawReaderOf(s)
+	if !ok {
+		t.Skip("后端未实现 GlobalRawReader（降级路径在 recall 层）")
+	}
+	mk := func(id string, scope types.Scope, content string, at time.Time) *types.RawEvent {
+		return &types.RawEvent{
+			ID: id, Host: "h", SessionID: "s1", Scope: scope, Timestamp: at,
+			Type: types.EventExternal, Content: content,
+		}
+	}
+	baseT := base
+	// 别家的事件**更新**：按时间倒序它们排前面。
+	ev := []*types.RawEvent{
+		mk("gr-raw-o1", "scope-b", "别组事件：更新", baseT.Add(3*time.Hour)),
+		mk("gr-raw-o2", "scope-b", "别组事件：次新", baseT.Add(2*time.Hour)),
+		mk("gr-raw-g1", "", "全局事件：较旧", baseT.Add(time.Hour)),
+		mk("gr-raw-g2", "", "全局事件：最旧", baseT),
+	}
+	for _, e := range ev {
+		if err := s.SaveRaw(bg(), nsA, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := g.ListRawGlobal(bg(), nsA, time.Time{}, store.Page{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("全局读者 LIMIT 2 应得 2 条全局事件（配额不被别家占掉），实得 %d", len(got))
+	}
+	for _, e := range got {
+		if e.Scope != "" {
+			t.Fatalf("全局读者取到了别家的事件: %+v", e)
+		}
+	}
+	if got[0].ID != "gr-raw-g1" || got[1].ID != "gr-raw-g2" {
+		t.Fatalf("全局事件应按时间倒序: %v", []string{got[0].ID, got[1].ID})
+	}
+}

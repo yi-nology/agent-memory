@@ -76,8 +76,7 @@ func (p *Pipeline) gather(ctx context.Context, req Request, limit int, plan type
 	}
 
 	if hasSource(p.cfg.Sources, SourceRaw) && p.raw != nil {
-		raws, err := p.raw.ListRaw(ctx, req.Namespace, req.Scope, time.Time{},
-			store.Page{Limit: p.cfg.MaxRaw})
+		raws, err := p.listRawForReader(ctx, req)
 		if err != nil {
 			return nil, err
 		}
@@ -216,7 +215,6 @@ func (p *Pipeline) pageOf(ctx context.Context, req Request, entityID string) (*t
 // 三路逐字一致。
 func (p *Pipeline) atomFilter(req Request, limit int) store.AtomFilter {
 	f := store.AtomFilter{
-		Scope:        req.Scope,
 		ActiveOnly:   true,
 		OccurredFrom: req.OccurredFrom,
 		OccurredTo:   req.OccurredTo,
@@ -224,10 +222,39 @@ func (p *Pipeline) atomFilter(req Request, limit int) store.AtomFilter {
 		EventSince:   p.eventSince(req),
 		Limit:        limit,
 	}
+	// 归属是**读者语义**，且必须在取数层生效（issue #53）：
+	//   - 非空读者 →「全局 + 同归属」（AtomFilter.Scope）；
+	//   - 空读者（全局读者）→ **只取全局**（AtomFilter.GlobalReader），
+	//     与 types.Scope.VisibleTo 同判据。空值不能照传——存储层把它
+	//     读成「不隔离」，TopK 配额先被别家占满，再被本层 VisibleTo
+	//     后置滤掉，全局读者召回骤减甚至为零。
+	// 三路（严格词面 / 宽松词面 / 语义）共用本函数，一处改三处生效。
+	if req.Scope == "" {
+		f.GlobalReader = true
+	} else {
+		f.Scope = req.Scope
+	}
 	if p.cfg.RestrictAtomsToEntities {
 		f.EntityIDs = req.Entities
 	}
 	return f
+}
+
+// listRawForReader 按读者归属取原始事件（raw 源的取数入口）。
+//
+//   - 非空读者：ListRaw 的「全局 + 同归属」本来就是读者语义，直取；
+//   - 空读者（全局读者）：实现了 store.GlobalRawReader 时在**取数层**
+//     只取全局事件（配额不被别家的事件占掉，与 atoms 侧同判据）；
+//     没实现则**降级** ListRaw(空 scope) + 调用方的 VisibleTo 后置滤除
+//     ——正确性由滤除兜着（绝不进别家的事件），代价只是 MaxRaw 配额
+//     可能被占掉一部分（与修复前的行为一致）。
+func (p *Pipeline) listRawForReader(ctx context.Context, req Request) ([]*types.RawEvent, error) {
+	if req.Scope == "" && p.rawGlobal != nil {
+		return p.rawGlobal.ListRawGlobal(ctx, req.Namespace, time.Time{},
+			store.Page{Limit: p.cfg.MaxRaw})
+	}
+	return p.raw.ListRaw(ctx, req.Namespace, req.Scope, time.Time{},
+		store.Page{Limit: p.cfg.MaxRaw})
 }
 
 func (p *Pipeline) collectAtoms(ctx context.Context, req Request, limit int) ([]*types.AtomCard, error) {

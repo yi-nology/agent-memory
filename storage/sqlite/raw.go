@@ -189,6 +189,29 @@ func (s *rawStore) ListRaw(ctx context.Context, ns store.Namespace, scope types.
 	}
 	q += ` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`
 	args = append(args, limitOf(p.Limit, defaultFetchLimit), p.Offset)
+	return s.queryRaws(ctx, q, args...)
+}
+
+// ListRawGlobal 以**全局读者**身份取原始事件：只取全局（scope = ''）的。
+//
+// 可选能力 GlobalRawReader 的实现（issue #53）：ListRaw 的空 scope 是
+// 「不隔离」（导出/管理面靠它取全量），全局读者不能共用那个空值——
+// 否则 TopK 配额被别家的事件占掉，再被后置滤除，全局事件根本没进候选池。
+func (s *rawStore) ListRawGlobal(ctx context.Context, ns store.Namespace,
+	before time.Time, p store.Page) ([]*types.RawEvent, error) {
+	q := `SELECT ` + rawCols + ` FROM raw_events WHERE namespace = ? AND scope = ''`
+	args := []any{nsOf(ns)}
+	if !before.IsZero() {
+		q += ` AND ts < ?`
+		args = append(args, ts(before))
+	}
+	q += ` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`
+	args = append(args, limitOf(p.Limit, defaultFetchLimit), p.Offset)
+	return s.queryRaws(ctx, q, args...)
+}
+
+// queryRaws 跑一条原始事件查询并逐行扫描（游标关净再返回）。
+func (s *rawStore) queryRaws(ctx context.Context, q string, args ...any) ([]*types.RawEvent, error) {
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
 		return nil, err

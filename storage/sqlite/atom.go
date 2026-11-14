@@ -251,6 +251,14 @@ func atomConditions(f store.AtomFilter) (string, []any) {
 			args = append(args, id)
 		}
 	}
+	if f.GlobalReader {
+		// **全局读者**：只取全局事实（issue #53）。
+		//
+		// 空 Scope 作为过滤条件是「不隔离」，而空读者按 types.Scope.VisibleTo
+		// 只看得见全局卡——读者语义必须在这里生效（配额不能被别家占掉
+		// 再后置滤掉），故单独一根条件。置位时 Scope 不生效（见字段注释）。
+		where = append(where, "scope = ''")
+	}
 	if f.Scope != "" {
 		// 归属条件：**全局的 + 同归属的**，别家的不给。
 		//

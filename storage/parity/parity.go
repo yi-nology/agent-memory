@@ -86,6 +86,8 @@ func Run(t *testing.T, open OpenFn) {
 		{"事实卡：按实体取全部（含已退役）", tAtomListByEntity},
 		{"事实卡：带向量的卡不入库（后端不落向量）", tAtomVectorNotStored},
 		{"事实卡：归属隔离（全局 + 同归属）", tAtomScopeIsolation},
+		{"事实卡：空读者在取数层只见全局（issue 53）", tAtomGlobalReaderSeesGlobalOnly},
+		{"捕获事件：全局读者取数只取全局（issue 53）", tRawGlobalReaderSeesGlobalOnly},
 		{"事实卡：检索路也按归属隔离", tAtomScopeSearchIsolation},
 		{"事实卡：归属过滤在取数层（配额不被别家吃掉）", tAtomScopeSearchQuota},
 		{"事实卡：归属严格等于在取数层（配额不被全局吃掉）", tAtomScopeExactFiltersAtFetch},

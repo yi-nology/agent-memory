@@ -56,7 +56,7 @@ func toolSpecs() []toolSpec {
 			InputSchema: objectSchema(map[string]any{
 				"query": stringProp("检索词。"),
 				"limit": intProp("返回条数上限（0=后端默认）。"),
-				"scope": stringProp("读者归属（空=不隔离）。"),
+				"scope": stringProp("读者归属（空=全局读者，只看全局事实）。"),
 			}, "query"),
 			run: runSearch,
 		},
@@ -68,7 +68,7 @@ func toolSpecs() []toolSpec {
 				"session_id": stringProp("当前会话标识。用于防回声：本会话的原始事件不进提示词。"),
 				"thread_id":  stringProp("当前线程标识。"),
 				"entities":   arrayProp("宿主已解析出的实体标识。"),
-				"scope":      stringProp("读者归属（空=不隔离）。"),
+				"scope":      stringProp("读者归属（空=全局读者，只看全局事实）。"),
 				"limit":      intProp("条数上限（0=用配置）。"),
 			}, "query"),
 			run: runRecall,
@@ -152,15 +152,26 @@ func runSearch(ctx context.Context, s *Server, args json.RawMessage) (string, er
 	if p.Limit < 0 {
 		return "", &rpcError{Code: CodeInvalidParams, Message: "limit 不能为负"}
 	}
-	atoms, err := s.svc.Search(ctx, s.svc.Namespace(), p.Query, store.AtomFilter{
-		Limit: p.Limit,
-		Scope: types.Scope(p.Scope),
-		// 只要**现在还成立**的事实：一条被推翻或作废的卡，
-		// 调用方从返回内容里分辨不出来（投影里没有「这条已退役」这一栏），
-		// 于是它会被当成当前事实用——而那在结果里完全看不出异常。
-		// 追问「当初为什么这么判」是审计面的事，不走这个工具。
-		ActiveOnly: true,
-	})
+	// 归属是**读者语义**，与 memory.recall 同一口径（issue #53）：
+	// 空读者（全局读者）只看全局事实——检索与召回必须同判据，
+	// 一处「不隔离」一处「只全局」的话，失效形态是「召回挡住的、
+	// 检索放进来」而调用方看不出来。
+	atoms, err := s.svc.Search(ctx, s.svc.Namespace(), p.Query, func() store.AtomFilter {
+		f := store.AtomFilter{
+			Limit: p.Limit,
+			// 只要**现在还成立**的事实：一条被推翻或作废的卡，
+			// 调用方从返回内容里分辨不出来（投影里没有「这条已退役」这一栏），
+			// 于是它会被当成当前事实用——而那在结果里完全看不出异常。
+			// 追问「当初为什么这么判」是审计面的事，不走这个工具。
+			ActiveOnly: true,
+		}
+		if p.Scope == "" {
+			f.GlobalReader = true
+		} else {
+			f.Scope = types.Scope(p.Scope)
+		}
+		return f
+	}())
 	if err != nil {
 		return "", err
 	}

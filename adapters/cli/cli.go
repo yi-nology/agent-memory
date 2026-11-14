@@ -608,10 +608,17 @@ func cmdSearch(ctx context.Context, opt Options, stdout, stderr io.Writer, query
 	}
 	defer func() { _ = st.Close() }()
 
-	atoms, err := svc.Search(ctx, store.Namespace(opt.Namespace), query, store.AtomFilter{
-		Limit: limit,
-		Scope: opt.Scope,
-	})
+	// 归属是**读者语义**（与 recall 同判据，issue #53）：--scope 空=全局读者，
+	// 只看全局事实（用法文案里的「读=我要看谁的，空=全局」）。
+	atoms, err := svc.Search(ctx, store.Namespace(opt.Namespace), query, func() store.AtomFilter {
+		f := store.AtomFilter{Limit: limit}
+		if opt.Scope == "" {
+			f.GlobalReader = true
+		} else {
+			f.Scope = opt.Scope
+		}
+		return f
+	}())
 	if err != nil {
 		fmt.Fprintln(stderr, "检索失败:", err)
 		return 1

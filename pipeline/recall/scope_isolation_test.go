@@ -92,6 +92,38 @@ func TestRecallPassesScopeDownToStore(t *testing.T) {
 	}
 }
 
+// 空读者（Scope 空）的归属同样必须**下推到存储层**，且形态是
+// GlobalReader（只取全局）而不是空 Scope（不隔离）——issue #53：
+// 后者的失效形态是 TopK 配额先被别家占满、再被召回层的 VisibleTo
+// 滤除，全局读者召回骤减甚至为零。
+func TestRecallEmptyScopeMeansGlobalReader(t *testing.T) {
+	f := &scopeReader{fakeReader: &fakeReader{}}
+	f.atoms = []*types.AtomCard{scopedAtom("a1", "", "磁盘长期偏小")}
+	p := newPipe(t, f, recall.DefaultConfig())
+
+	if _, err := p.Recall(context.Background(), recall.Request{
+		Namespace: ns, Query: "磁盘",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.listFilters) == 0 || len(f.searchFilters) == 0 {
+		t.Fatal("召回没取过事实卡")
+	}
+	for _, flt := range f.listFilters {
+		if !flt.GlobalReader {
+			t.Fatalf("列表路没把空读者标成 GlobalReader: %+v", flt)
+		}
+		if flt.Scope != "" {
+			t.Fatalf("GlobalReader 置位时 Scope 应让位: %+v", flt)
+		}
+	}
+	for _, flt := range f.searchFilters {
+		if !flt.GlobalReader {
+			t.Fatalf("检索路没把空读者标成 GlobalReader: %+v", flt)
+		}
+	}
+}
+
 // 纵深防御：存储层漏了归属过滤时，别组的卡也不许进 prompt。
 //
 // 这是**泄漏**与「少取」的分界：漏了它，别人环境里的事实会以
