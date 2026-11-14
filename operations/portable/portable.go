@@ -53,6 +53,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"slices"
@@ -153,46 +154,110 @@ type ExportOptions struct {
 }
 
 // Export 把一个记忆库导出成包。
+//
+// # Limit 语义（agent-memory#66）
+//
+//   - >0：单类条数上限——调用方**主动要的 cap**，单次取；
+//   - 0：**不限**——分页取尽，与 ExportOctop 同三套取法（raw 走
+//     Page.Offset、atoms 走 store.ListAllAtoms、candidates/entities/
+//     entity_pages/journal 走 PagedLister 可选能力，缺能力响亮失败，
+//     不降级成大 Limit 硬取——见 paging.go 的前提说明）。
+//
+// 此前 0 被兜成 100000：超过十万条的行按取数序**静默截断**，与
+// ExportOptions.Limit「0=不限」的 doc 相反（迁移正是最容不得「少了几条」
+// 的环节，与 #61 撤掉的形态同族）。
 func Export(ctx context.Context, src Source, ns store.Namespace, w io.Writer, opt ExportOptions) (*Manifest, error) {
-	limit := opt.Limit
-	if limit <= 0 {
-		limit = 100000
+	var (
+		raws    []*types.RawEvent
+		cands   []*types.Candidate
+		atoms   []*types.AtomCard
+		ents    []*types.Entity
+		pages   []*types.EntityPage
+		eps     []*types.Episode
+		digests []*types.DigestRecord
+		journal []*types.JournalEntry
+		err     error
+	)
+	if opt.Limit > 0 {
+		// 显式上限：单次取（cap 是调用方主动要的，不是实现兜的）。
+		if raws, err = src.ListRaw(ctx, ns, "", time.Time{}, store.Page{Limit: opt.Limit}); err != nil {
+			return nil, err
+		}
+		if cands, err = src.ListCandidates(ctx, ns, store.CandidateFilter{Limit: opt.Limit}); err != nil {
+			return nil, err
+		}
+		if atoms, err = src.ListAtoms(ctx, ns, store.AtomFilter{Limit: opt.Limit}); err != nil {
+			return nil, err
+		}
+		if ents, err = src.ListEntities(ctx, ns, "", opt.Limit); err != nil {
+			return nil, err
+		}
+		if pages, err = src.ListEntityPages(ctx, ns, opt.Limit); err != nil {
+			return nil, err
+		}
+		if eps, err = src.ListEpisodes(ctx, ns, "", opt.Limit); err != nil {
+			return nil, err
+		}
+		if digests, err = src.ListDigests(ctx, ns, opt.Limit); err != nil {
+			return nil, err
+		}
+		if journal, err = src.ListJournal(ctx, ns, "", opt.Limit); err != nil {
+			return nil, err
+		}
+	} else {
+		// 0=不限（#66）：分页取尽——与 ExportOctop 同三套取法。
+		pageSize := opt.PageSize
+		if pageSize <= 0 {
+			pageSize = octopScanPage
+		}
+		paged, ok := store.PagedListerOf(src)
+		if !ok {
+			return nil, errNoPagedSource(src)
+		}
+		if raws, err = pageAll(pageSize, func(offset, limit int) ([]*types.RawEvent, error) {
+			return src.ListRaw(ctx, ns, "", time.Time{}, store.Page{Offset: offset, Limit: limit})
+		}); err != nil {
+			return nil, err
+		}
+		if cands, err = pageAll(pageSize, func(offset, limit int) ([]*types.Candidate, error) {
+			return paged.ListCandidatesPaged(ctx, ns, store.CandidateFilter{}, offset, limit)
+		}); err != nil {
+			return nil, err
+		}
+		if atoms, err = store.ListAllAtoms(ctx, src, ns, store.AtomFilter{}, pageSize); err != nil {
+			return nil, err
+		}
+		if ents, err = listAllEntities(ctx, paged, ns, pageSize); err != nil {
+			return nil, err
+		}
+		if pages, err = pageAll(pageSize, func(offset, limit int) ([]*types.EntityPage, error) {
+			return paged.ListEntityPagesPaged(ctx, ns, offset, limit)
+		}); err != nil {
+			return nil, err
+		}
+		if journal, err = pageAll(pageSize, func(offset, limit int) ([]*types.JournalEntry, error) {
+			return paged.ListJournalPaged(ctx, ns, "", offset, limit)
+		}); err != nil {
+			return nil, err
+		}
+		// episodes/digests：冻结面只收 limit、无翻页能力面（#66 记录的缺口）。
+		// 传 MaxInt——limitOf 仅在 <=0 时回落缺省，MaxInt 不可被行数超过 ⇒
+		// 不存在「可被超过的静默截断」（本单要撤的正是 100000 那种上限）；
+		// 两表基数受设计约束（每 session 情节 / 每 period+key 摘要），单次
+		// 全量读可接受。基数若日后证明需要翻页，按 PagedLister 同款加可选
+		// 能力面（勿改冻结签名）。
+		if eps, err = src.ListEpisodes(ctx, ns, "", math.MaxInt); err != nil {
+			return nil, err
+		}
+		if digests, err = src.ListDigests(ctx, ns, math.MaxInt); err != nil {
+			return nil, err
+		}
 	}
 
-	raws, err := src.ListRaw(ctx, ns, "", time.Time{}, store.Page{Limit: limit})
-	if err != nil {
-		return nil, err
-	}
-	cands, err := src.ListCandidates(ctx, ns, store.CandidateFilter{Limit: limit})
-	if err != nil {
-		return nil, err
-	}
-	atoms, err := src.ListAtoms(ctx, ns, store.AtomFilter{Limit: limit})
-	if err != nil {
-		return nil, err
-	}
-	ents, err := src.ListEntities(ctx, ns, "", limit)
-	if err != nil {
-		return nil, err
-	}
-	pages, err := src.ListEntityPages(ctx, ns, limit)
-	if err != nil {
-		return nil, err
-	}
-	eps, err := src.ListEpisodes(ctx, ns, "", limit)
-	if err != nil {
-		return nil, err
-	}
-	digests, err := src.ListDigests(ctx, ns, limit)
-	if err != nil {
-		return nil, err
-	}
-	journal, err := src.ListJournal(ctx, ns, "", limit)
-	if err != nil {
-		return nil, err
-	}
-
-	// 别名要按实体逐个取（别名表没有「全部列出」的口子）——这是**已知缺口**：
+	// 别名要按实体逐个取（别名表没有「全部列出」的口子）——这是**已知缺口**
+	//（agent-memory#66 评估：维持现状——别名基数=实体数，N 次查询有界；
+	// 补「列出全部别名」前要先定「一个命名空间里有多少别名」的索引，
+	// 见下段；分页取尽不改变该缺口的形态）：
 	// 实体很多时这里是 N 次查询。M4 补了 ListEntityPages 等读口，
 	// 但别名表没有「列出全部」的口子，因为别名表的查询面本来就只有两个：
 	// 「按别名查实体」与「按实体列出别名」。补它时要一并想清楚
