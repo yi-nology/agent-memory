@@ -41,9 +41,9 @@ go 1.27
 // 掩码断言跟进后再升——脱敏是安全面，升级必须有测试背书，不许静默跟升。
 require (
 	github.com/lib/pq v1.12.3
-	github.com/oagentkit/guardx v0.8.2
-	github.com/oagentkit/textx v0.10.7
-	github.com/oekit/pkg v0.42.0
+	github.com/oagentkit/guardx v0.26.0
+	github.com/oagentkit/textx v0.12.0
+	github.com/oekit/pkg v0.48.0
 	modernc.org/sqlite v1.62.0
 )
 

@@ -209,10 +209,35 @@ type PatternRedactor struct{}
 // Redact 逐条形态匹配并替换。
 //
 // 先跑本仓的 5 条形态规则（stringx.Masker），再跑上游 guardx/logredact
-// 的规则表（取并集）。顺序理由见 PatternRedactor 的类型注释。
+// 的规则表（取并集），最后过掩码修复适配层（见 repairMaskClose）。
+// 顺序理由见 PatternRedactor 的类型注释。
 func (PatternRedactor) Redact(_ context.Context, req RedactRequest) (string, error) {
-	return logredact.Redact(structuralMasker.Mask(req.Text)), nil
+	return repairMaskClose(logredact.Redact(structuralMasker.Mask(req.Text))), nil
 }
+
+// repairMaskClose 掩码修复适配层（guardx v0.26.0 kv 行尾变体的跨仓适配）。
+//
+// 上游 logredact 的 credential-kv 规则（#177 行尾变体：凭证词键的未引号值
+// 吃满行尾）会把本仓 stringx.Masker 掩码 `«kind:****»` 里 **kind 名撞上
+// 凭证词表**的形态再掩一次——kind 名（secret-assignment / private-key-block /
+// known-token-prefix）按 v0.26 的 credentialSuffixGeneral 词表（secrets?/keys?/
+// token 等）恰是合法键，掩码自身的 `:` 分隔与 `****` 值恰是 kv 形态，
+// bareValueLine 吃到行尾把收尾 **»** 一起吞掉：`«kind:****»` → `«kind:****`
+// ——掩码括号不配对，下游按掩码形态做的统计/还原全部失配。
+//
+// 本层把被吞的收尾补回（`«kind:****` 且后随非 » → 补 `»`）。掩码形态
+// （kind 名字符集 + 恒定 `****`）是本仓单源，适配层据此识别、只补不删；
+// 上游若为外来掩码形态加保护（凭证词表不再命中掩码内部），本层自然空转。
+// TestRedactorOutputHasNoNestedMask 的括号配对断言就是本层的回归门。
+func repairMaskClose(s string) string {
+	return maskCloseRe.ReplaceAllString(s, "«$1»")
+}
+
+// maskCloseRe 归一化匹配掩码形态（RE2 无负向前瞻，用可选捕获统一回填）：
+// `«kind:****»?` 的 » 捕获为空即被吞形态，回填后完好掩码幂等不变。kind
+// 字符集与 stringx.Masker 的标签面一致（字母数字与短横线），值恒为 ****；
+// 上游自产的 «Tn» 令牌（无冒号无星号）不会命中。
+var maskCloseRe = regexp.MustCompile(`«([a-zA-Z0-9][a-zA-Z0-9-]*:\*{4})»?`)
 
 // maskPlaceholder 是掩码主体。
 //
