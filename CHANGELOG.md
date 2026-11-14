@@ -2,28 +2,73 @@
 
 > 本文件由 `matrix-tools/scripts/gen_changelogs.py` 从 git 历史生成，按 tag 切段、取每段内的 conventional commit 渲染。
 
+## [v0.14.0] — 2026-11-14
+
+### 修复(lifecycle)：四个全量扫描改分页取尽(store.ListAllAtoms)——100000 不再冒充全量，ListAtomsByEntity 同修
+
+- 7a60a80
+
+### 修复(storage)：词面检索名次声明为方言差异，parity 钉 TopK 命中集合同口径
+
+- e188cb9
+
+### 修复(promotion)：判定(LLM/宿主回调)挪出 DB 事务——事务只做四步写，写前按签名复核
+
+- d465881
+
+### 修复(promotion)：英文否定改词元级判定——un/no 不再命中 function/known/north 词内子串
+
+- 7b636e1
+
+### 修复(sqlite)：WithFTSTokenize 与存量虚表分词器不一致时 Open 显式报错——不再静默落空
+
+- 04c513e
+
+### 修复(graph)：Traverse 按页取尽单实体出边——EdgeFilter 补 Offset，不再按缺省 100 截断
+
+- 967d213
+
+### 修复(recall)：空读者单源语义=只看全局——取数层 GlobalReader 落 SQL，raw 走可选能力，检索面同口径
+
+- 75977a3
+
+### 修复(capture)：redactPayload 补 []any 与 map[string]string——JSON 数组形态凭据不再直穿
+
+- 4f21f44
+
+### 修复(store)：SaveEntity 冲突分支补 atom_count/last_promoted_at——Merge 终态清 0 在真后端成立
+
+- dcc7707
+
+### 修复(application)：Reindex 限三条全打通——limit<=0 分页取尽、只补活跃卡、CLI 缺省改全量(#49,#50)
+
+- ec7743e
+
+### 修复(store)：retire 本体补退役态单向 CASE 守卫——二次退役/并发取代不再抹链
+
+- e5d6535
+
+- 杂务：过 archcheck 行数/域词门禁——cmdReindex 迁出 cli.go、测试夹具措辞中性化、gofmt；顺手消本批引入的 2 条 lint
+
 ## [v0.13.0] — 2026-11-13
 
-- 重构（**BREAKING**）：删 `recall.Result` 三条旧丢弃字段——归因只留 `Drops` 通用表
+### 重构：删 Result 三条旧丢弃字段——归因只留 Drops 通用表
 
-**下游要做什么：**
-- 读 `res.DroppedByBudget`（预算装不下）→ `res.Drops[ports.DropBudget]+res.Drops[ports.DropQuota]`
-- 读 `res.DroppedByDiversity`（单实体超额）→ `res.Drops[ports.DropDiversity]`
-- 读 `res.DroppedByDuplicate`（内容重复）→ `res.Drops[ports.DropDuplicate]`
-- memory.recall 工具（bridge）返回 JSON：`dropped_by_budget` / `dropped_by_diversity` /
-  `dropped_by_duplicate` 三键移除，改读 `drops` 表（按 `ports.DropReason` 分路，键为
-  budget/quota/low_score/expired/duplicate/diversity）+ `dropped` 合计；`count`/`entities`/
-  `rendered` 不变
-- CLI `recall` 命令 stderr 统计口径不变（仍打印 预算/多样性/重复 三路）
+DroppedByBudget / DroppedByDiversity / DroppedByDuplicate 是 ports.Budget
+通用表在 Result 上的历史投影（v0.12.0 引入 Drops 时刻意保留的兼容面）。
+两张口径并存一个版本周期后清掉旧面，归因入口收敛到 Drops 单源：
+- pipeline/recall: 删三字段与构造处投影回填；Dropped 合计保留
+- adapters/bridge: memory.recall 工具返回改给 drops 表
+  （dropped_by_budget/diversity/duplicate 三键移除，破坏性 schema 变更）
+- adapters/cli: recall 命令 stderr 统计改读 Drops
+- cache: cloneResult 同步删三行手抄；AGENTS.md 丢弃观测条款改写
+- 测试: 分路断言改读 Drops，保留「合计=通用表之和」不变量
+**BREAKING**：宿主读 res.DroppedByBudget 等三字段的代码改为
+res.Drops[ports.DropBudget]+res.Drops[ports.DropQuota]（预算）/
+res.Drops[ports.DropDiversity] / res.Drops[ports.DropDuplicate]；
+bridge 工具消费方改读 drops 键。
 
-细节：`DroppedByBudget/DroppedByDiversity/DroppedByDuplicate` 是 v0.12.0 引入
-`Drops`（ports.Budget 通用表）时刻意保留的投影兼容面，两张口径并存一个版本周期后
-清掉旧面，归因入口收敛到单源。仓内消费方（recall 构造处、cloneResult、bridge、cli）
-全部改读 `Drops`；测试保留「合计=通用表之和」不变量并钉住分路可定位。
-`Period` / `CaptureInput` 包内简写别名系架构简写非历史兼容，保留不动。
-验证=make check 全绿（fmt/vet/test/architecture-check/tidy-check）。
-
-## [v0.12.1] — 2026-11-12
+## [v0.12.1] — 2026-11-13
 
 - 杂务：高版本 Go 现代化——sort→slices/cmp、range-over-int、builtin min（零行为变更）
 
@@ -591,7 +636,7 @@ P2 的第一笔（契约先行）：事实分三类——短期事件 / 有效�
 此前只有一条窄缝（SemanticReader：宿主给「最像的 topK」），
 宿主得自己写「算向量 + 搜索引 + 归属过取」那一层胶水；
 胶水每家写一遍就会各写一遍（漏了归属过取的那家，语义路的配额会被别家吃掉）。
-这一笔让 `ports.Embedder` / `ports.VectorIndex` 这两个**原本「零消费者」的预留口**
+这��笔让 `ports.Embedder` / `ports.VectorIndex` 这两个**原本「零消费者」的预留口**
 真正有消费点：写路径（晋升成事实后写向量）、读路径（召回时算查询向量 →
 搜索引 → 与词面路 RRF 融合）、删路径（事实退役时删向量）。
 **分工不变**：语义**强度**归宿主（内核不引模型 SDK——核心一旦引了 SDK，
