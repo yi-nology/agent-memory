@@ -191,6 +191,30 @@ func (m *MemIndex) Upsert(_ context.Context, namespace, id, scope string, vec []
 // 对不上时报错（ErrDimensionMismatch）而不是返回空集：
 // 「空集」的失效形态是「语义召回永远空」，而调用方看不出是维度错了。
 func (m *MemIndex) Search(_ context.Context, namespace, scope string, vec []float32, topK int) ([]VectorHit, error) {
+	return m.search(namespace, func(itemScope string) bool {
+		// 归属过滤在**索引这一层**（不是调用方后置）：
+		// 后置的话被别家占掉的 topK 槽位已经花掉了。
+		// 空 scope = 不隔离（冻结语义）。
+		return scope == "" || itemScope == "" || itemScope == scope
+	}, vec, topK)
+}
+
+// SearchGlobal 以全局读者身份检索：只返回**归属为空**（全局）的向量。
+//
+// GlobalVectorSearcher 的实现（issue #62）：Search 的空 scope 是「不隔离」
+// （冻结语义），全局读者不能共用那个空值——否则 TopK 配额先被别家的
+// 向量占满，再被后置滤除，全局的那条根本没进候选池。
+// 过滤同样在本层生效（与 TopK 同一次求值）。
+func (m *MemIndex) SearchGlobal(_ context.Context, namespace string, vec []float32, topK int) ([]VectorHit, error) {
+	return m.search(namespace, func(itemScope string) bool { return itemScope == "" }, vec, topK)
+}
+
+// search 余弦检索的公共骨架：keep 决定哪一条**进候选池**。
+//
+// 把「谁配进池」单独抽出来，是因为空 scope 在冻结面上只能表达「不隔离」，
+// 而全局读者要「只取全局」——两种判据共用同一套算分与排序。
+func (m *MemIndex) search(namespace string, keep func(itemScope string) bool,
+	vec []float32, topK int) ([]VectorHit, error) {
 	if len(vec) == 0 {
 		return nil, errors.New("ports: 查询向量不能为空")
 	}
@@ -209,9 +233,7 @@ func (m *MemIndex) Search(_ context.Context, namespace, scope string, vec []floa
 	qnorm = math.Sqrt(qnorm)
 	hits := make([]VectorHit, 0, len(m.vecs[namespace]))
 	for id, item := range m.vecs[namespace] {
-		// 归属过滤在**索引这一层**（不是调用方后置）：
-		// 后置的话被别家占掉的 topK 槽位已经花掉了。
-		if scope != "" && item.scope != "" && item.scope != scope {
+		if !keep(item.scope) {
 			continue
 		}
 		stored := item.vec
@@ -311,6 +333,57 @@ func (r VectorSemanticReader) Search(ctx context.Context, namespace, query, scop
 	}
 	fetch := limit * over
 	hits, err := r.Index.Search(ctx, namespace, scope, vec, fetch)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SemanticHit, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, SemanticHit{ID: h.ID, Score: float64(h.Score)})
+	}
+	return out, nil
+}
+
+// SearchGlobal 以全局读者身份检索：只返回**归属为空**（全局）的事实卡。
+//
+// GlobalSemanticReader 的实现（issue #62）：Search 的空 scope 是「不隔离」
+// （冻结语义），全局读者不能共用那个空值——否则 TopK 配额先被别家的
+// 向量占满，再被后置滤除，全局的那条根本没进候选池。
+//
+// # 「只取全局」只能在索引层生效，故能力探测在索引层
+//
+// 本件探测自己的索引有没有 GlobalVectorSearcher：
+//   - 有：透传（全局语义由索引在取数层落实，与 TopK 同一次求值）；
+//   - 没有：回落空 scope 检索——**声明的降级路径**：返回的命中集合与
+//     Search(ctx, ns, query, "", limit) 逐字同效（不变坏），代价只是全局
+//     读者的 TopK 可能被别家占掉一部分（与修复前的行为一致）。
+//     不报错：召回链把语义面错误当致命（上抛），而这里缺的是「增强语义」，
+//     报错等于把可选写成了必需。
+func (r VectorSemanticReader) SearchGlobal(ctx context.Context, namespace, query string,
+	limit int) ([]SemanticHit, error) {
+	if r.Embedder == nil || r.Index == nil {
+		// 没装配向量面 = 不启用语义路（不是错误）。
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	vec, err := r.Embedder.Embed(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	over := r.OverFetch
+	if over <= 0 {
+		over = DefaultSemanticOverFetch
+	}
+	fetch := limit * over
+	var hits []VectorHit
+	if g, ok := GlobalVectorSearcherOf(r.Index); ok {
+		hits, err = g.SearchGlobal(ctx, namespace, vec, fetch)
+	} else {
+		// 降级：索引表达不了「只取全局」⇒ 空 scope（不隔离）取回，
+		// 非全局的命中由召回链的可见性复查滤除（命中集合不变，配额让步）。
+		hits, err = r.Index.Search(ctx, namespace, "", vec, fetch)
+	}
 	if err != nil {
 		return nil, err
 	}

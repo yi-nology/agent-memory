@@ -52,6 +52,44 @@ type SemanticReader interface {
 	Search(ctx context.Context, namespace, query, scope string, limit int) ([]SemanticHit, error)
 }
 
+// GlobalSemanticReader 全局读者语义检索能力（issue #62）。
+//
+// # 它是什么
+//
+// 以**全局读者**身份检索：只返回**归属为空**（全局）的事实卡的命中，
+// 归属过滤与 TopK 同一次求值（取数层生效，不许后置滤）。
+//
+// # 为什么是可选能力
+//
+// Search 的 scope 空值语义已在冻结面上发布为「**不隔离**」（宿主实现着
+// 这个接口，改空值语义或加参数 = 隐式 breaking）——而**全局读者**按
+// types.Scope.VisibleTo 只看得见全局卡。同一个空值承载不了两种相反的
+// 语义（这正是 #62 的病根：空读者的语义 TopK 被别家的向量占掉，
+// 只靠过取 + 后置滤兜着，配额损失不修自愈）。
+// 故按可选能力三要件单独立面：支持「只取全局」的语义后端实现本面；
+// 召回链运行时探测（GlobalSemanticReaderOf），没实现时维持原状
+// （空 scope 透传——命中集合不变，代价只是配额可能被占，
+// 降级可观测：Result.SemanticGlobalUnavailable 与
+// recall.semantic.global.unavailable 指标）。
+type GlobalSemanticReader interface {
+	// SearchGlobal 返回与查询最像的若干条**全局**事实卡。
+	//
+	// namespace 与 limit 语义同 Search。实现方承诺：返回的每一条的
+	// 归属都为空（全局卡人人都看得见，故无需读者归属做参数），
+	// 且过滤发生在取数层（与 TopK 同一次求值）。
+	SearchGlobal(ctx context.Context, namespace, query string, limit int) ([]SemanticHit, error)
+}
+
+// GlobalSemanticReaderOf 探测一个语义面有没有全局读者检索能力
+// （语义同 store 的探测约定：探测语义只有一个地方定义）。
+//
+// 返回 ok=false 时调用方走**声明的降级路径**（空 scope 透传），
+// 不许当它不存在地继续——也不许把缺失当致命错误（语义面是可选增强）。
+func GlobalSemanticReaderOf(v any) (GlobalSemanticReader, bool) {
+	g, ok := v.(GlobalSemanticReader)
+	return g, ok
+}
+
 // NoopSemanticReader 未注入语义面时的占位实现。
 type NoopSemanticReader struct{}
 

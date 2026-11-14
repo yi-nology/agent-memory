@@ -276,3 +276,95 @@ func tVectorNamespaceIsolation(t *testing.T, idx VectorIndex) {
 		t.Fatalf("另一个命名空间的向量不该被搜到: %+v", hits)
 	}
 }
+
+// GlobalVectorSearcher 全局读者检索面（形状与 ports.GlobalVectorSearcher 一致，
+// 理由同 VectorIndex 那份：本包不 import ports）。
+type GlobalVectorSearcher interface {
+	// SearchGlobal 返回最相似的若干条**全局**（归属为空）的向量。
+	SearchGlobal(ctx context.Context, namespace string, vec []float32, topK int) ([]VectorHit, error)
+}
+
+// globalSearcher 命中类型待定的全局检索面（AdaptGlobal 的约束）。
+type globalSearcher[H any] interface {
+	SearchGlobal(ctx context.Context, namespace string, vec []float32, topK int) ([]H, error)
+}
+
+// globalAdapter AdaptGlobal 的实现（只做形状翻译，不加任何判断）。
+type globalAdapter[H any] struct {
+	idx  globalSearcher[H]
+	conv func(H) VectorHit
+}
+
+// AdaptGlobal 把「命中类型待定」的全局检索面翻成本包的面（语义同 Adapt）。
+//
+// 这一行同样是**契约钉子**：ports.GlobalVectorSearcher 改了形状，
+// 后端测试文件里的传参立刻编译不过。
+func AdaptGlobal[H any, S globalSearcher[H]](idx S, conv func(H) VectorHit) GlobalVectorSearcher {
+	return &globalAdapter[H]{idx: idx, conv: conv}
+}
+
+// SearchGlobal 检索全局向量并翻成本包的形状。
+func (a *globalAdapter[H]) SearchGlobal(ctx context.Context, namespace string, vec []float32,
+	topK int) ([]VectorHit, error) {
+	hits, err := a.idx.SearchGlobal(ctx, namespace, vec, topK)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]VectorHit, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, a.conv(h))
+	}
+	return out, nil
+}
+
+// RunVectorGlobal 跑全局读者检索这一组共享断言。
+//
+// 与 RunVector 分开两个入口，是因为全局检索是**可选能力**
+// （ports.GlobalVectorSearcher，issue #62）：没实现的后端不该被
+// RunVector 的主断言打红。断言本体仍然只有这一份。
+//
+// newIndex 每个用例给一份**干净的**索引与它的全局检索面（同一份底层存储）。
+func RunVectorGlobal(t *testing.T, open func(t *testing.T) (VectorIndex, GlobalVectorSearcher)) {
+	t.Helper()
+	t.Run("向量索引：全局读者只取全局", func(t *testing.T) {
+		base, global := open(t)
+		tVectorGlobalOnly(t, base, global)
+	})
+}
+
+// tVectorGlobalOnly 全局读者检索只回**归属为空**的向量。
+//
+// 对照断言钉住两条判据的差别：Search 的空 scope 是「不隔离」（三条全回），
+// SearchGlobal 是「只取全局」（只有全局那条）。空值承载不了两种相反的
+// 语义——这正是 #62 病根所在。
+func tVectorGlobalOnly(t *testing.T, base VectorIndex, global GlobalVectorSearcher) {
+	vec := []float32{1, 0}
+	for _, v := range []struct {
+		id, scope string
+	}{
+		{"g", ""},        // 全局
+		{"a", "scope-a"}, // 本归属
+		{"b", "scope-b"}, // 别归属
+	} {
+		if err := base.Upsert(bg(), string(nsA), v.id, v.scope, vec); err != nil {
+			t.Fatalf("写向量失败(%s): %v", v.id, err)
+		}
+	}
+
+	got, err := global.SearchGlobal(bg(), string(nsA), vec, 10)
+	if err != nil {
+		t.Fatalf("全局检索失败: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "g" {
+		t.Fatalf("全局检索应只命中 g: %+v", got)
+	}
+
+	// 对照：空 scope = 不隔离（既有语义不变，三条全回）。
+	all, err := base.Search(bg(), string(nsA), "", vec, 10)
+	if err != nil {
+		t.Fatalf("检索失败: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("不隔离应得 3 条，实得 %d: %+v", len(all), all)
+	}
+}

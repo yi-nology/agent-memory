@@ -198,3 +198,89 @@ func cosine(a, b []float32) float64 {
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
+
+// SearchGlobal 只返回**归属为空**（全局）的向量——全局读者不能共用
+// Search 的空 scope（冻结语义是「不隔离」，issue #62）。
+func TestMemIndexSearchGlobalOnly(t *testing.T) {
+	ctx := context.Background()
+	ix := ports.NewMemIndex()
+	vec := []float32{1, 0}
+	for _, v := range []struct {
+		id, scope string
+	}{
+		{"g", ""},       // 全局
+		{"a", "team-a"}, // 本归属
+		{"b", "team-b"}, // 别归属
+	} {
+		if err := ix.Upsert(ctx, "ns", v.id, v.scope, vec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := ix.SearchGlobal(ctx, "ns", vec, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "g" {
+		t.Fatalf("SearchGlobal 应只命中全局的 g: %+v", got)
+	}
+	// 对照：Search 的空 scope 是「不隔离」——三个全回来。
+	// 两者不同判据正是 #62 的病根（空值承载不了两种相反的语义）。
+	all, err := ix.Search(ctx, "ns", "", vec, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("空 scope（不隔离）应命中全部 3 条: %+v", all)
+	}
+}
+
+// plainIndex 不实现 GlobalVectorSearcher 的最小组索引：只够跑 Search。
+type plainIndex struct {
+	hits []ports.VectorHit
+}
+
+func (p *plainIndex) Search(context.Context, string, string, []float32, int) ([]ports.VectorHit, error) {
+	return p.hits, nil
+}
+func (p *plainIndex) Upsert(context.Context, string, string, string, []float32) error {
+	return nil
+}
+func (p *plainIndex) Delete(context.Context, string, string) error { return nil }
+
+// VectorSemanticReader.SearchGlobal：
+//   - 索引实现了全局读者检索 ⇒ 透传，只回全局命中；
+//   - 索引没实现 ⇒ 声明的降级路径：回落空 scope 检索（命中集合与
+//     Search(ctx, ns, query, "", limit) 逐字同效——不变坏），不是报错。
+func TestVectorSemanticReaderSearchGlobal(t *testing.T) {
+	ctx := context.Background()
+	emb := ports.HashEmbedder{}
+
+	// ① 能力在索引层落实：MemIndex 实现了 SearchGlobal。
+	ix := ports.NewMemIndex()
+	vec, err := emb.Embed(ctx, "磁盘")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ix.Upsert(ctx, "ns", "g", "", vec)
+	_ = ix.Upsert(ctx, "ns", "a", "team-a", vec)
+	r := ports.VectorSemanticReader{Embedder: emb, Index: ix}
+	got, err := r.SearchGlobal(ctx, "ns", "磁盘", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "g" {
+		t.Fatalf("SearchGlobal 应只回全局的 g: %+v", got)
+	}
+
+	// ② 索引没实现 ⇒ 降级回落空 scope（命中集合不变坏）。
+	plain := &plainIndex{hits: []ports.VectorHit{{ID: "x", Score: 0.9}}}
+	r2 := ports.VectorSemanticReader{Embedder: emb, Index: plain}
+	got2, err := r2.SearchGlobal(ctx, "ns", "磁盘", 10)
+	if err != nil {
+		t.Fatalf("降级不是错误（召回链把语义面错误当致命）: %v", err)
+	}
+	if len(got2) != 1 || got2[0].ID != "x" {
+		t.Fatalf("降级应与空 scope 检索同效: %+v", got2)
+	}
+}

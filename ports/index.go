@@ -101,6 +101,37 @@ type VectorIndex interface {
 	Delete(ctx context.Context, namespace, id string) error
 }
 
+// GlobalVectorSearcher 全局读者向量检索能力（issue #62）。
+//
+// # 它是什么
+//
+// 以**全局读者**身份检索：只返回**归属为空**的向量。归属过滤与 TopK
+// 同一次求值（取数层生效），语义同 GlobalSemanticReader 在索引层的落点。
+//
+// # 为什么是可选能力
+//
+// Search 的 scope 空值语义已在冻结面上发布为「不隔离」（改空值语义
+// 或加参数 = 隐式 breaking），而全局读者需要「只取全局」——同一空值
+// 承载不了两种相反的语义。支持的后端实现本面；消费方运行时探测
+// （GlobalVectorSearcherOf），没实现时回落空 scope 检索（命中集合不变，
+// 代价只是配额可能被占，与修复前行为一致）。
+type GlobalVectorSearcher interface {
+	// SearchGlobal 返回与向量最相似的若干条**全局**（归属为空）的向量。
+	//
+	// namespace、vec、topK 语义同 Search。
+	SearchGlobal(ctx context.Context, namespace string, vec []float32, topK int) ([]VectorHit, error)
+}
+
+// GlobalVectorSearcherOf 探测一个索引有没有全局读者检索能力
+// （语义同 GlobalSemanticReaderOf：探测语义只有一个地方定义）。
+//
+// 返回 ok=false 时调用方走**声明的降级路径**（空 scope 检索），
+// 不许当它不存在地继续。
+func GlobalVectorSearcherOf(v any) (GlobalVectorSearcher, bool) {
+	g, ok := v.(GlobalVectorSearcher)
+	return g, ok
+}
+
 // NoopIndex 未注入时的占位实现。
 type NoopIndex struct{}
 

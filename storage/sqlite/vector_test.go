@@ -33,6 +33,25 @@ import (
 // 否则「召回结果可复现」这条承诺（评测面靠它成立）就破了。
 // 而「逐位相同」这件事只有真正读过库里的字节才验得了——
 // 检索面拿到的是解出来的 float32，它可以是「差不多」而不是「一模一样」。
+// TestVectorGlobalParity 全局读者检索（可选能力）的跨后端共享断言。
+//
+// 与 TestVectorParity 同一份底层存储、同一组翻译（issue #62：
+// 全局读者不能共用 Search 的空 scope——那是「不隔离」）。
+func TestVectorGlobalParity(t *testing.T) {
+	parity.RunVectorGlobal(t, func(t *testing.T) (parity.VectorIndex, parity.GlobalVectorSearcher) {
+		s, err := OpenMemory("vector-global-parity-" + t.Name())
+		if err != nil {
+			t.Fatalf("开内存库失败: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		// 这一行是**契约钉子**：端口那边改了命中类型或签名，它立刻编译不过。
+		conv := func(h ports.VectorHit) parity.VectorHit {
+			return parity.VectorHit{ID: h.ID, Score: h.Score}
+		}
+		return parity.Adapt(s, conv), parity.AdaptGlobal(s, conv)
+	})
+}
+
 func TestVectorParity(t *testing.T) {
 	parity.RunVector(t, func(t *testing.T) parity.VectorIndex {
 		s, err := OpenMemory("vector-parity-" + t.Name())

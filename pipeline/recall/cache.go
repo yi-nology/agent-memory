@@ -88,13 +88,14 @@ func cloneResult(r *Result) *Result {
 		return nil
 	}
 	cp := &Result{
-		Snippets:               append([]Snippet(nil), r.Snippets...),
-		Dropped:                r.Dropped,
-		Drops:                  copyDropReasons(r.Drops),
-		Buckets:                copyBuckets(r.Buckets),
-		FromCache:              r.FromCache,
-		Entities:               append([]string(nil), r.Entities...),
-		LooseSearchUnavailable: r.LooseSearchUnavailable,
+		Snippets:                  append([]Snippet(nil), r.Snippets...),
+		Dropped:                   r.Dropped,
+		Drops:                     copyDropReasons(r.Drops),
+		Buckets:                   copyBuckets(r.Buckets),
+		FromCache:                 r.FromCache,
+		Entities:                  append([]string(nil), r.Entities...),
+		LooseSearchUnavailable:    r.LooseSearchUnavailable,
+		SemanticGlobalUnavailable: r.SemanticGlobalUnavailable,
 	}
 	return cp
 }
