@@ -316,9 +316,12 @@ func (s *edgeStore) ListEdges(ctx context.Context, ns store.Namespace, f store.E
 		where = append(where, cond)
 		args = append(args, condArgs...)
 	}
+	// OFFSET 服务于「分页取全」的翻页（多跳遍历按页取尽单实体出边，
+	// issue #54）：缺省 100 对关系投影常见的稠密实体是**静默截断**，
+	// 且按 created_at ASC 先丢的恰是最新的边。与 LIMIT 同一份 ORDER BY。
 	q := `SELECT ` + edgeCols + ` FROM entity_edges WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY created_at ASC, id ASC LIMIT ?`
-	args = append(args, limitOf(f.Limit, 100))
+		` ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?`
+	args = append(args, limitOf(f.Limit, 100), max(f.Offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {

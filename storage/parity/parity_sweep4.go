@@ -326,3 +326,58 @@ func tRawGlobalReaderSeesGlobalOnly(t *testing.T, s store.Store) {
 		t.Fatalf("全局事件应按时间倒序: %v", []string{got[0].ID, got[1].ID})
 	}
 }
+
+// ── 关系边：分页取全（#54）──
+
+// 单实体出边可以远超 ListEdges 的缺省上限（100）：多跳遍历按页取尽，
+// 不能拿缺省冒充全量。钉两层：缺省截断的存在（100 条）与
+// Offset 翻页取尽（150 条一条不少、不重）。
+func tEdgePaginationToExhaustion(t *testing.T, s store.Store) {
+	es := edgeStoreOf(t, s)
+	const total = 150
+	for i := range total {
+		e := &types.EntityEdge{
+			ID:           fmt.Sprintf("edge-pg-%03d", i),
+			FromEntityID: "hub", ToEntityID: fmt.Sprintf("to-%03d", i),
+			Relation: "依赖", CreatedAt: base.Add(time.Duration(i) * time.Minute),
+		}
+		if err := es.UpsertEdge(bg(), nsA, e); err != nil {
+			t.Fatalf("写边失败(%s): %v", e.ID, err)
+		}
+	}
+	// 缺省（Limit 0）= 前 100 条：截断是**已知语义**，这里顺带钉住它，
+	// 让「缺省是 100」这件事显形而不是靠猜。
+	def, err := es.ListEdges(bg(), nsA, store.EdgeFilter{FromEntityIDs: []string{"hub"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(def) != 100 {
+		t.Fatalf("缺省上限应取前 100 条，实得 %d", len(def))
+	}
+	// 分页取全：每页 60 条翻页，拼起来恰是 150 条、无重复。
+	var (
+		all  []*types.EntityEdge
+		seen = map[string]bool{}
+	)
+	for offset := 0; ; offset += 60 {
+		batch, err := es.ListEdges(bg(), nsA, store.EdgeFilter{
+			FromEntityIDs: []string{"hub"}, Limit: 60, Offset: offset,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range batch {
+			if seen[e.ID] {
+				t.Fatalf("翻页出现重复: %s", e.ID)
+			}
+			seen[e.ID] = true
+		}
+		all = append(all, batch...)
+		if len(batch) < 60 {
+			break
+		}
+	}
+	if len(all) != total {
+		t.Fatalf("分页取全应得 %d 条，实得 %d", total, len(all))
+	}
+}

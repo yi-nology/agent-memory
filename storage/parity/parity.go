@@ -107,6 +107,7 @@ func Run(t *testing.T, open OpenFn) {
 		{"关系边：按时刻过滤", tEdgeAtFilter},
 		{"关系边：按来源清理", tEdgeDeleteBySource},
 		{"关系边：多跳取边的两端都在", tEdgeEndpointsFilter},
+		{"关系边：Offset 分页取尽单实体出边（issue 54）", tEdgePaginationToExhaustion},
 		{"捕获事件：归属隔离", tRawScopeIsolation},
 		{"候选：归属往返", tCandidateScopeRoundTrip},
 		{"实体：规范名与别名两条路径都能查到", tEntityLookupBothPaths},

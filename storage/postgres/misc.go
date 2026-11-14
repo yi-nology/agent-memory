@@ -324,9 +324,12 @@ func (s *edgeStore) ListEdges(ctx context.Context, ns store.Namespace, f store.E
 		where = append(where, cond)
 		args = append(args, condArgs...)
 	}
+	// OFFSET 服务于「分页取全」的翻页（多跳遍历按页取尽单实体出边，
+	// issue #54；与 SQLite 侧逐字同语义）。
 	q := `SELECT ` + edgeCols + ` FROM entity_edges WHERE ` + strings.Join(where, " AND ") +
-		` ORDER BY created_at ASC, id ASC LIMIT $` + fmt.Sprint(len(args)+1)
-	args = append(args, limitOf(f.Limit, 100))
+		` ORDER BY created_at ASC, id ASC LIMIT $` + fmt.Sprint(len(args)+1) +
+		` OFFSET $` + fmt.Sprint(len(args)+2)
+	args = append(args, limitOf(f.Limit, 100), max(f.Offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {

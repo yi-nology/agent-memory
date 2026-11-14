@@ -394,6 +394,12 @@ type EdgeFilter struct {
 	At time.Time
 	// Limit 条数上限（0=后端默认）。
 	Limit int
+	// Offset 跳过的条数（0=从头；分页取全的翻页用）。
+	//
+	// 语义同 AtomFilter.Offset：单实体的出边可以远超后端缺省上限
+	// （关系投影常见），「取全」类消费方（多跳遍历）按页翻到取尽，
+	// 不能拿缺省 100 冒充全量（issue #54）。
+	Offset int
 }
 
 // EpisodeStore 情节与周期摘要存取。
