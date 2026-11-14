@@ -171,3 +171,51 @@ func GlobalRawReaderOf(v any) (GlobalRawReader, bool) {
 	g, ok := v.(GlobalRawReader)
 	return g, ok
 }
+
+// PagedLister 分页取全能力（issue #61）：按 (offset, limit) 逐页取数，
+// 供「全量扫描」类动作翻到取尽。
+//
+// # 它是什么
+//
+// 四个取数方法的过滤条件与 store.go 里对应方法**逐字一致**，差别只在
+// 翻页参数：offset 从 0 起，limit 是单页条数，返回**恰好这一页**——
+// 不足一页即取尽，offset 越过末尾返回空集（不是错误）。
+//
+// # 为什么是可选能力
+//
+// 全量导出不能用写死的大 Limit 冒充：超过上限的行按取数序静默截断，
+// 而迁移包残缺是**零信号**的（octop 导出曾以 Limit:1000000 冒充全量，
+// issue #61）。翻页参数本该进各取数方法的签名，但那四个签名都在
+// **冻结面**上（仓外宿主实现着，加参数 = 隐式 breaking）——
+// 故按可选能力三要件单独立面：
+//
+//  1. 独立小接口（本面）：下游不实现也能编译；
+//  2. 运行时探测（PagedListerOf）：消费方在入口探一次；
+//  3. 明确的降级路径：写在消费方——导出面对缺失是**响亮报错**
+//     （导出完整性是前提不是增强；见 operations/portable.paging.go）。
+//
+// in-repo 两个后端（sqlite / postgres）都实现它；
+// 仓外自造存储的宿主补 4 个方法即可。
+//
+// ⚠️ **包装会吃掉能力**：任何内嵌 store.Store 接口的装饰器
+// （如 application 的 vectorStore）都会把内层的这一面藏在外层类型断言
+// 之外——装饰器必须**逐方法转发**本面，否则能力静默消失。
+type PagedLister interface {
+	// ListCandidatesPaged 按页取候选（语义同 CandidateStore.ListCandidates）。
+	ListCandidatesPaged(ctx context.Context, ns Namespace, f CandidateFilter, offset, limit int) ([]*types.Candidate, error)
+	// ListEntitiesPaged 按页取实体（语义同 EntityStore.ListEntities）。
+	ListEntitiesPaged(ctx context.Context, ns Namespace, entityType types.EntityType, offset, limit int) ([]*types.Entity, error)
+	// ListEntityPagesPaged 按页取实体页面（语义同 PageStore.ListEntityPages）。
+	ListEntityPagesPaged(ctx context.Context, ns Namespace, offset, limit int) ([]*types.EntityPage, error)
+	// ListJournalPaged 按页取审计条目（语义同 JournalStore.ListJournal）。
+	ListJournalPaged(ctx context.Context, ns Namespace, subject string, offset, limit int) ([]*types.JournalEntry, error)
+}
+
+// PagedListerOf 探测一个实现有没有分页取全能力（语义同 LooseSearcher）。
+//
+// 返回 ok=false 时，导出类消费方**必须**响亮报错（不许拿单次大 Limit
+// 硬取当降级——那会静默截断）；其它消费方按各自的前提处理。
+func PagedListerOf(v any) (PagedLister, bool) {
+	p, ok := v.(PagedLister)
+	return p, ok
+}

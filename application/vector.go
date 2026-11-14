@@ -64,6 +64,63 @@ func (v vectorStore) DeprecateAtom(ctx context.Context, ns store.Namespace, id s
 	return nil
 }
 
+// ── 可选能力转发 ──
+//
+// ⚠️ 本类型内嵌的是 store.Store **接口**：接口没长出分页取全方法
+// （store.PagedLister，issue #61），于是内层存储实现了这个能力，
+// 经本包装后从外层也**探测不到**——而导出面（portable.ExportOctop）
+// 探测的恰是最外层。不转发 ⇒ 能力静默消失，宿主拿着能分页取全的后端
+// 却被「未实现」挡在完整导出之外。故四个方法逐一手动转发；
+// 内层真没有该能力时返回错误（包装不替内层背书，也不静默假装成功）。
+
+func (v vectorStore) paged() (store.PagedLister, error) {
+	ps, ok := store.PagedListerOf(v.Store)
+	if !ok {
+		return nil, fmt.Errorf("application: 底层存储 %T 未实现 store.PagedLister 分页取全，导出面拿不到完整集合（见 store/optional.go）", v.Store)
+	}
+	return ps, nil
+}
+
+// ListCandidatesPaged 分页取候选（转发内层，见上）。
+func (v vectorStore) ListCandidatesPaged(ctx context.Context, ns store.Namespace,
+	f store.CandidateFilter, offset, limit int) ([]*types.Candidate, error) {
+	ps, err := v.paged()
+	if err != nil {
+		return nil, err
+	}
+	return ps.ListCandidatesPaged(ctx, ns, f, offset, limit)
+}
+
+// ListEntitiesPaged 分页取实体（转发内层，见上）。
+func (v vectorStore) ListEntitiesPaged(ctx context.Context, ns store.Namespace,
+	entityType types.EntityType, offset, limit int) ([]*types.Entity, error) {
+	ps, err := v.paged()
+	if err != nil {
+		return nil, err
+	}
+	return ps.ListEntitiesPaged(ctx, ns, entityType, offset, limit)
+}
+
+// ListEntityPagesPaged 分页取实体页面（转发内层，见上）。
+func (v vectorStore) ListEntityPagesPaged(ctx context.Context, ns store.Namespace,
+	offset, limit int) ([]*types.EntityPage, error) {
+	ps, err := v.paged()
+	if err != nil {
+		return nil, err
+	}
+	return ps.ListEntityPagesPaged(ctx, ns, offset, limit)
+}
+
+// ListJournalPaged 分页取审计条目（转发内层，见上）。
+func (v vectorStore) ListJournalPaged(ctx context.Context, ns store.Namespace,
+	subject string, offset, limit int) ([]*types.JournalEntry, error) {
+	ps, err := v.paged()
+	if err != nil {
+		return nil, err
+	}
+	return ps.ListJournalPaged(ctx, ns, subject, offset, limit)
+}
+
 // indexVector 把事实卡的向量写进索引。
 //
 // # 向量化的是**断言正文**

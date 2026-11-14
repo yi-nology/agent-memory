@@ -122,9 +122,19 @@ func (s *pageStore) ListDirtyEntityPages(ctx context.Context, ns store.Namespace
 // 导包要的是这个命名空间的全部记忆：只导一个视角等于导出时把别家的画像
 // 悄悄丢了，而导入方看不出来（包是完整的，只是少了几页）。
 func (s *Store) ListEntityPages(ctx context.Context, ns store.Namespace, limit int) ([]*types.EntityPage, error) {
+	return s.ListEntityPagesPaged(ctx, ns, 0, limit)
+}
+
+// ListEntityPagesPaged 按页取实体页面：offset 跳过的条数，limit 单页条数（0=后端默认）。
+//
+// 语义同 ListEntityPages（跨视角全列，逐字一致），差别只在翻页参数——
+// 服务于「分页取全」的翻页（operations/portable 的 PagedSource，issue #61）：
+// 全量导出不能用一个大 Limit 冒充，超限的行会按取数序静默截断。
+// 取数序 (entity_id, scope) 是全序，翻页不重不漏。
+func (s *Store) ListEntityPagesPaged(ctx context.Context, ns store.Namespace, offset, limit int) ([]*types.EntityPage, error) {
 	rows, err := s.query(ctx,
-		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? ORDER BY entity_id ASC, scope ASC LIMIT ?`,
-		nsOf(ns), limitOf(limit, 1000))
+		`SELECT `+pageCols+` FROM entity_pages WHERE namespace = ? ORDER BY entity_id ASC, scope ASC LIMIT ? OFFSET ?`,
+		nsOf(ns), limitOf(limit, 1000), max(offset, 0))
 	if err != nil {
 		return nil, err
 	}
@@ -564,14 +574,24 @@ func (s *journalStore) AppendJournal(ctx context.Context, ns store.Namespace, e 
 }
 
 func (s *journalStore) ListJournal(ctx context.Context, ns store.Namespace, subject string, limit int) ([]*types.JournalEntry, error) {
+	return s.ListJournalPaged(ctx, ns, subject, 0, limit)
+}
+
+// ListJournalPaged 按页取审计条目：offset 跳过的条数，limit 单页条数（0=后端默认）。
+//
+// 语义同 ListJournal（过滤条件逐字一致），差别只在翻页参数——
+// 服务于「分页取全」的翻页（operations/portable 的 PagedSource，issue #61）：
+// 全量导出不能用一个大 Limit 冒充，超限的行会按取数序静默截断。
+// 取数序带 id 全序兜底键（与 ListRaw 同款），翻页不重不漏。
+func (s *journalStore) ListJournalPaged(ctx context.Context, ns store.Namespace, subject string, offset, limit int) ([]*types.JournalEntry, error) {
 	q := `SELECT id, at, kind, subject, actor, summary, detail FROM journal WHERE namespace = ?`
 	args := []any{nsOf(ns)}
 	if subject != "" {
 		q += ` AND subject = ?`
 		args = append(args, subject)
 	}
-	q += ` ORDER BY at DESC, id DESC LIMIT ?`
-	args = append(args, limitOf(limit, defaultFetchLimit))
+	q += ` ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`
+	args = append(args, limitOf(limit, defaultFetchLimit), max(offset, 0))
 
 	rows, err := s.query(ctx, q, args...)
 	if err != nil {
