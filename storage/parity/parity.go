@@ -76,6 +76,7 @@ func Run(t *testing.T, open OpenFn) {
 		{"事实卡：软退役两态都排除出召回", tAtomRetiredExcluded},
 		{"事实卡：签名去重", tAtomSignature},
 		{"事实卡：全文检索只命中相关事实", tAtomSearch},
+		{"事实卡：词面检索 TopK 集合跨后端同口径", tAtomSearchTopKSet},
 		{"事实卡：检索路与列表路的缺省条数同源", tAtomSearchDefaultLimitMatchesList},
 		{"事实卡：中文子串检索命中真实形态中文", tAtomSearchChineseSubstring},
 		{"事实卡：形状校验拦无出处", tAtomValidation},

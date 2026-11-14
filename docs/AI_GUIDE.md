@@ -145,6 +145,12 @@ adapters/{cli,bridge,llm}  →  cmd/memory
 > **parity 断言是产品契约，不是实现细节。** 断言里**不许**断言 bm25 名次——
 > 「哪条该进 prompt」是召回层重排的职责。把名次钉进跨后端断言，换个后端就假红。
 >
+> **词面检索的相关度排序是已声明的方言差异**（2026-11-14 起，issue #58）：
+> SQLite 用 FTS5 内建 rank（bm25 口径），PG 用 `ts_rank(body_tsv, ...) DESC`。
+> 名次不进契约，**命中集合**进契约（`tAtomSearchTopKSet`：同一夹具同一查询，
+> 两后端吐出同一批标识）。`LIMIT` 截断面因此只断言「结果 ⊆ 命中集」——
+> 谁被截掉取决于方言名次，属已知差异，排查「换库后召回变了几条」时先看这里。
+>
 > PG 后端必须对着**真实服务器**跑（`BQ_MEMORY_TEST_POSTGRES_DSN`）。
 > 没配这个变量时它**显式 skip** 并说明「PG 行为一致性未验证」——
 > **skipped 的用例不证明兼容**。CI 里配了 `postgres` service，别让它 skip。

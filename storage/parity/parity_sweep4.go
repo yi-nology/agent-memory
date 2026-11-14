@@ -381,3 +381,59 @@ func tEdgePaginationToExhaustion(t *testing.T, s store.Store) {
 		t.Fatalf("分页取全应得 %d 条，实得 %d", total, len(all))
 	}
 }
+
+// ── 词面检索：TopK 的**集合**口径跨后端一致（#58）──
+
+// 词面检索的相关度函数是**方言**（SQLite FTS5 rank/bm25，PG ts_rank），
+// 名次不进 parity 断言（AGENTS.md「排序不是存储层的承诺」：
+// 「哪条该进 prompt」是召回层重排的职责）。但**命中集合**是产品契约：
+// 同一夹具、同一查询，两个后端必须吐出同一批标识（limit ≥ 命中数时
+// 集合逐字相等）。截断面（limit < 命中数）因名次方言只能断言
+// 「结果 ⊆ 命中集」——这一放宽是**已声明的方言差异**，不是疏忽
+// （声明见 docs/AI_GUIDE.md 与两后端 searchFTS 的注释）。
+func tAtomSearchTopKSet(t *testing.T, s store.Store) {
+	hits := []string{"tk-1", "tk-2", "tk-3", "tk-4"}
+	for i, id := range hits {
+		a := atom(id, "e1", fmt.Sprintf("磁盘巡检结论第 %d 号：状态正常", i+1), "ev-"+id, types.ImportanceMed)
+		if err := s.SaveAtom(bg(), nsA, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 不命中的一条：集合断言要能看见「多出来的」。
+	if err := s.SaveAtom(bg(), nsA, atom("tk-x", "e1", "内存占用偏高", "ev-x", types.ImportanceMed)); err != nil {
+		t.Fatal(err)
+	}
+
+	// limit ≥ 命中数：集合逐字相等（跨后端同一份断言 ⇒ 集合同一口径）。
+	got, err := s.SearchAtoms(bg(), nsA, "磁盘", store.AtomFilter{Limit: len(hits) + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := atomIDs(got)
+	if len(ids) != len(hits) {
+		t.Fatalf("词面检索应命中 %d 条，实得 %v", len(hits), ids)
+	}
+	for _, id := range hits {
+		if !hasAtom(ids, id) {
+			t.Fatalf("词面检索漏命中 %s（实得 %v）", id, ids)
+		}
+	}
+	if hasAtom(ids, "tk-x") {
+		t.Fatalf("不相关的卡混进了命中集: %v", ids)
+	}
+
+	// 截断面（limit < 命中数）：只断言「结果 ⊆ 命中集」。
+	// 名次跨后端是方言（bm25 vs ts_rank），谁被截掉不进契约。
+	top2, err := s.SearchAtoms(bg(), nsA, "磁盘", store.AtomFilter{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(top2) != 2 {
+		t.Fatalf("TopK=2 应得 2 条，实得 %v", atomIDs(top2))
+	}
+	for _, a := range top2 {
+		if !hasAtom(hits, a.ID) {
+			t.Fatalf("截断面出现了命中集之外的卡: %v", atomIDs(top2))
+		}
+	}
+}

@@ -633,6 +633,11 @@ func (s *Store) searchFTS(ctx context.Context, table, namespace, query string, l
 		where += " AND " + extra
 		args = append(args, extraArgs...)
 	}
+	// 排序方言（issue #58）：本侧用 FTS5 内建的 rank（bm25 口径）；
+	// PG 侧同一条检索语义用 ts_rank(body_tsv, ...) DESC。**相对名次是
+	// 已声明的方言差异**，不进跨后端断言（「哪条该进 prompt」是召回层
+	// 重排的职责，见 AGENTS.md「排序不是存储层的承诺」）；parity 钉的是
+	// **命中集合**同一口径（tAtomSearchTopKSet）。
 	rows, err := s.query(ctx,
 		`SELECT `+refCol(table)+` FROM `+table+`
 		 WHERE `+where+` ORDER BY rank LIMIT ?`,
